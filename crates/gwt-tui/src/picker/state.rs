@@ -84,7 +84,7 @@ impl<'a> App<'a> {
                 })
             })
             .collect();
-        scored.sort_by(|a, b| b.score.cmp(&a.score));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.score));
         self.filtered_wt = scored;
         self.clamp_wt_cursor();
     }
@@ -154,7 +154,7 @@ impl<'a> App<'a> {
                 })
             })
             .collect();
-        scored.sort_by(|a, b| b.score.cmp(&a.score));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.score));
         self.filtered_branches = scored;
         if self.branch_cursor >= self.filtered_branches.len() {
             self.branch_cursor = self.filtered_branches.len().saturating_sub(1);
