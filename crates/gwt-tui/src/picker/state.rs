@@ -11,12 +11,19 @@ use crate::fuzzy;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchPurpose {
     NewBase,
+    NewBaseWithPath,
     Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameStage {
+    Branch,
+    Dir,
 }
 
 pub enum Mode {
     List,
-    ConfirmDelete(PathBuf),
+    ConfirmDelete { path: PathBuf, force: bool },
     Branch {
         purpose: BranchPurpose,
         all: Vec<BranchRef>,
@@ -24,6 +31,9 @@ pub enum Mode {
     NewName {
         base: String,
         buf: String,
+        dir_buf: String,
+        customize_dir: bool,
+        stage: NameStage,
     },
     Message {
         text: String,
@@ -155,7 +165,7 @@ impl<'a> App<'a> {
                 all.retain(|b| matches!(b.kind, BranchKind::Remote { .. }));
                 all.retain(|b| !b.is_checked_out());
             }
-            BranchPurpose::NewBase => {
+            BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => {
                 // The user can branch off anything that resolves (local or remote).
             }
         }
@@ -174,35 +184,91 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    pub fn enter_name_input(&mut self, base: String) {
+    pub fn enter_name_input(&mut self, base: String, customize_dir: bool) {
         self.mode = Mode::NewName {
             base,
             buf: String::new(),
+            dir_buf: String::new(),
+            customize_dir,
+            stage: NameStage::Branch,
         };
     }
 
+    /// Returns Ok(true) on completion, Ok(false) on no-op (empty input or
+    /// advanced from branch to dir stage).
     pub fn commit_new_name(&mut self) -> Result<bool> {
-        let (base, name) = match &self.mode {
-            Mode::NewName { base, buf } => (base.clone(), buf.trim().to_string()),
+        let (base, branch, dir, customize, stage) = match &self.mode {
+            Mode::NewName {
+                base,
+                buf,
+                dir_buf,
+                customize_dir,
+                stage,
+            } => (
+                base.clone(),
+                buf.trim().to_string(),
+                dir_buf.trim().to_string(),
+                *customize_dir,
+                *stage,
+            ),
             _ => return Ok(false),
         };
-        if name.is_empty() {
+        if branch.is_empty() {
             return Ok(false);
         }
-        if let Some(layout) = &self.layout {
-            ops::new(layout, &base, &name, &name)?;
+        // Two-step flow: first Enter advances to dir stage; default dir = branch.
+        if customize && stage == NameStage::Branch {
+            if let Mode::NewName {
+                stage, dir_buf, ..
+            } = &mut self.mode
+            {
+                if dir_buf.is_empty() {
+                    *dir_buf = branch.clone();
+                }
+                *stage = NameStage::Dir;
+            }
+            return Ok(false);
+        }
+        let dir = if customize && !dir.is_empty() {
+            dir
         } else {
-            let path = self.repo.worktree_root().join(&name);
-            self.repo.add_worktree(&path, &name, true)?;
+            branch.clone()
+        };
+        if let Some(layout) = &self.layout {
+            ops::new(layout, &base, &branch, &dir)?;
+        } else {
+            let path = self.repo.worktree_root().join(&dir);
+            self.repo.add_worktree(&path, &branch, true)?;
         }
         self.refresh_worktrees()?;
         self.mode = Mode::List;
         Ok(true)
     }
 
+    pub fn back_or_cancel_new_name(&mut self) {
+        if let Mode::NewName {
+            customize_dir,
+            stage,
+            ..
+        } = &mut self.mode
+        {
+            if *customize_dir && *stage == NameStage::Dir {
+                *stage = NameStage::Branch;
+                return;
+            }
+        }
+        self.mode = Mode::List;
+    }
+
     pub fn edit_new_name(&mut self, f: impl FnOnce(&mut String)) {
-        if let Mode::NewName { buf, .. } = &mut self.mode {
-            f(buf);
+        if let Mode::NewName {
+            buf, dir_buf, stage, ..
+        } = &mut self.mode
+        {
+            match stage {
+                NameStage::Branch => f(buf),
+                NameStage::Dir => f(dir_buf),
+            }
         }
     }
 
@@ -287,7 +353,11 @@ impl<'a> App<'a> {
         match purpose {
             BranchPurpose::NewBase => {
                 // Step 1 done — store base, advance to name input. ops::new runs on commit.
-                self.enter_name_input(b.short.clone());
+                self.enter_name_input(b.short.clone(), false);
+                Ok(true)
+            }
+            BranchPurpose::NewBaseWithPath => {
+                self.enter_name_input(b.short.clone(), true);
                 Ok(true)
             }
             BranchPurpose::Review => {

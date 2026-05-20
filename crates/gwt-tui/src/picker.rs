@@ -41,7 +41,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match &mut app.mode {
         Mode::List => handle_list(app, key, ctrl),
-        Mode::ConfirmDelete(_) => {
+        Mode::ConfirmDelete { .. } => {
             handle_confirm_delete(app, key);
             Ok(None)
         }
@@ -115,10 +115,18 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
         KeyCode::Char('G') => app.go_bottom(),
         KeyCode::Char('d') => {
             if let Some(wt) = app.selected_worktree() {
-                app.mode = Mode::ConfirmDelete(wt.path.clone());
+                app.mode = Mode::ConfirmDelete { path: wt.path.clone(), force: false };
             }
         }
-        KeyCode::Char('e') => app.enter_branch_mode(BranchPurpose::NewBase)?,
+        KeyCode::Char('D') => {
+            if let Some(wt) = app.selected_worktree() {
+                app.mode = Mode::ConfirmDelete { path: wt.path.clone(), force: true };
+            }
+        }
+        KeyCode::Char('e') | KeyCode::Char('n') => app.enter_branch_mode(BranchPurpose::NewBase)?,
+        KeyCode::Char('E') | KeyCode::Char('N') => {
+            app.enter_branch_mode(BranchPurpose::NewBaseWithPath)?
+        }
         KeyCode::Char('r') => app.enter_branch_mode(BranchPurpose::Review)?,
         KeyCode::Char('f') | KeyCode::Char('/') => {
             app.filter_active = true;
@@ -129,12 +137,13 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
 }
 
 fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
-    let Mode::ConfirmDelete(path) = &app.mode else {
+    let Mode::ConfirmDelete { path, force } = &app.mode else {
         return;
     };
     let path = path.clone();
+    let force = *force;
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => match app.repo.remove_worktree(&path, false) {
+        KeyCode::Char('y') | KeyCode::Char('Y') => match app.repo.remove_worktree(&path, force) {
             Ok(()) => {
                 let _ = app.refresh_worktrees();
                 app.mode = Mode::List;
@@ -176,7 +185,7 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
 
 fn handle_new_name(app: &mut App, key: KeyEvent, ctrl: bool) {
     match key.code {
-        KeyCode::Esc => app.mode = Mode::List,
+        KeyCode::Esc => app.back_or_cancel_new_name(),
         KeyCode::Char('c') if ctrl => app.mode = Mode::List,
         KeyCode::Enter => match app.commit_new_name() {
             Ok(true) => {}

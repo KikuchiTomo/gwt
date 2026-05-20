@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::state::{
-    dirty_plain, remote_plain, App, BranchPurpose, ColWidths, Mode, H_BRANCH, H_DIRTY, H_NAME,
-    H_PATH, H_REMOTE, H_STASH,
+    dirty_plain, remote_plain, App, BranchPurpose, ColWidths, Mode, NameStage, H_BRANCH, H_DIRTY,
+    H_NAME, H_PATH, H_REMOTE, H_STASH,
 };
 
 const POINTER: &str = "▌ ";
@@ -42,7 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(inner);
 
     match &app.mode {
-        Mode::List | Mode::ConfirmDelete(_) | Mode::Message { .. } => {
+        Mode::List | Mode::ConfirmDelete { .. } | Mode::Message { .. } => {
             let list_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -55,14 +55,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_branches(f, chunks[0], app);
             draw_prompt_branch(f, chunks[1], app);
         }
-        Mode::NewName { base, buf } => {
-            draw_new_name(f, chunks[0], base, buf);
-            draw_prompt_new_name(f, chunks[1], buf);
+        Mode::NewName {
+            base,
+            buf,
+            dir_buf,
+            customize_dir,
+            stage,
+        } => {
+            draw_new_name(f, chunks[0], base, buf, dir_buf, *customize_dir, *stage);
+            draw_prompt_new_name(f, chunks[1], buf, dir_buf, *stage);
         }
     }
 }
 
-fn draw_new_name(f: &mut Frame, area: Rect, base: &str, _buf: &str) {
+fn draw_new_name(
+    f: &mut Frame,
+    area: Rect,
+    base: &str,
+    _buf: &str,
+    _dir_buf: &str,
+    customize_dir: bool,
+    _stage: NameStage,
+) {
+    let hint = if customize_dir {
+        "  → enter branch name, then worktree dir name"
+    } else {
+        "  → new branch name will also be the worktree dir name"
+    };
     let line = Line::from(vec![
         Span::raw(PAD),
         Span::styled("branching from ", Style::default().fg(C_DIM)),
@@ -70,22 +89,23 @@ fn draw_new_name(f: &mut Frame, area: Rect, base: &str, _buf: &str) {
             base.to_string(),
             Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "  → new branch name will also be the worktree dir name",
-            Style::default().fg(C_DIM),
-        ),
+        Span::styled(hint, Style::default().fg(C_DIM)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_prompt_new_name(f: &mut Frame, area: Rect, buf: &str) {
+fn draw_prompt_new_name(f: &mut Frame, area: Rect, buf: &str, dir_buf: &str, stage: NameStage) {
+    let (label, value) = match stage {
+        NameStage::Branch => (" branch ", buf),
+        NameStage::Dir => (" dir ", dir_buf),
+    };
     let line = Line::from(vec![
         Span::styled(
-            " name ",
+            label,
             Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
         ),
         Span::raw("› "),
-        Span::raw(buf.to_string()),
+        Span::raw(value.to_string()),
         Span::styled("▏", Style::default().fg(C_POINTER)),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -129,6 +149,7 @@ fn title_line(app: &App) -> Line<'static> {
         Mode::Branch { purpose, all } => {
             let name = match purpose {
                 BranchPurpose::NewBase => "new · pick base branch",
+                BranchPurpose::NewBaseWithPath => "new+dir · pick base branch",
                 BranchPurpose::Review => "review",
             };
             (
@@ -158,17 +179,34 @@ fn help_line(app: &App) -> Line<'static> {
             if app.filter_active {
                 " type:filter  esc:exit filter  ↑↓/^p^n:nav  enter:cd "
             } else {
-                " j/k ↑↓:nav  enter:cd  d:del  e:new  r:review  f //:filter  q:quit "
+                " j/k ↑↓:nav  enter:cd  d:del  D:force-del  e/n:new  E/N:new+dir  r:review  f //:filter  q:quit "
             }
         }
-        Mode::ConfirmDelete(_) => " y: confirm   any: cancel ",
+        Mode::ConfirmDelete { force, .. } => {
+            if *force {
+                " y: FORCE confirm   any: cancel "
+            } else {
+                " y: confirm   any: cancel "
+            }
+        }
         Mode::Branch { purpose, .. } => match purpose {
             BranchPurpose::NewBase => {
                 " type:filter  ↑↓/^p^n:nav  enter:choose base → name  esc:back "
             }
+            BranchPurpose::NewBaseWithPath => {
+                " type:filter  ↑↓/^p^n:nav  enter:choose base → name → dir  esc:back "
+            }
             BranchPurpose::Review => " type:filter  ↑↓/^p^n:nav  enter:create wt  esc:back ",
         },
-        Mode::NewName { .. } => " type:name  enter:create worktree  esc:cancel ",
+        Mode::NewName {
+            customize_dir,
+            stage,
+            ..
+        } => match (*customize_dir, *stage) {
+            (true, NameStage::Branch) => " type:branch name  enter:next (dir)  esc:cancel ",
+            (true, NameStage::Dir) => " type:dir name  enter:create worktree  esc:cancel ",
+            _ => " type:name  enter:create worktree  esc:cancel ",
+        },
         Mode::Message { .. } => " press any key ",
     };
     Line::from(Span::styled(s, Style::default().fg(C_DIM)))
@@ -287,9 +325,9 @@ fn color_for_status(s: WorktreeStatus) -> Style {
 
 fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
     let line = match &app.mode {
-        Mode::ConfirmDelete(p) => Line::from(vec![
+        Mode::ConfirmDelete { path: p, force } => Line::from(vec![
             Span::styled(
-                " delete ",
+                if *force { " FORCE delete " } else { " delete " },
                 Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
@@ -437,7 +475,7 @@ fn kind_label(k: &BranchKind) -> String {
 fn draw_prompt_branch(f: &mut Frame, area: Rect, app: &App) {
     let label = match &app.mode {
         Mode::Branch { purpose, .. } => match purpose {
-            BranchPurpose::NewBase => "base",
+            BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => "base",
             BranchPurpose::Review => "review",
         },
         _ => return,
