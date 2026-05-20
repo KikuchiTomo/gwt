@@ -81,6 +81,10 @@ impl Repo {
         Ok(())
     }
 
+    pub fn branches(&self) -> Result<Vec<crate::branch::BranchRef>> {
+        crate::branch::list(&self.cwd)
+    }
+
     pub fn remote_branches(&self) -> Result<Vec<String>> {
         let raw = git::run(
             &self.cwd,

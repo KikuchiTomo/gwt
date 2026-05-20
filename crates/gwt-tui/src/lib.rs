@@ -1,4 +1,5 @@
 pub mod display;
+pub mod fuzzy;
 pub mod picker;
 mod term;
 
