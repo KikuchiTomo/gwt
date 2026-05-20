@@ -86,7 +86,7 @@ fn header_span<'a>(label: &'a str, width: usize) -> Span<'a> {
     Span::styled(
         text,
         Style::default()
-            .fg(C_DIM)
+            .fg(Color::White)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )
 }
