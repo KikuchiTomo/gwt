@@ -1,14 +1,17 @@
+use gwt_core::status::WorktreeMetrics;
 use gwt_core::{BranchKind, BranchRef, Worktree, WorktreeStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::state::{App, BranchPurpose, Mode};
 
 const POINTER: &str = "▌ ";
 const PAD: &str = "  ";
+const C_BORDER: Color = Color::DarkGray;
+const C_TITLE: Color = Color::Magenta;
 const C_POINTER: Color = Color::Magenta;
 const C_MATCH: Color = Color::LightYellow;
 const C_BRANCH: Color = Color::Yellow;
@@ -21,14 +24,19 @@ const C_ERR: Color = Color::Red;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .title(title_line(app))
+        .title_bottom(help_line(app));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
 
     match &app.mode {
         Mode::List | Mode::ConfirmDelete(_) | Mode::Message { .. } => {
@@ -40,7 +48,52 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_prompt_branch(f, chunks[1], app);
         }
     }
-    draw_help(f, chunks[2], app);
+}
+
+fn title_line(app: &App) -> Line<'static> {
+    let (label, detail) = match &app.mode {
+        Mode::Branch { purpose, all } => {
+            let name = match purpose {
+                BranchPurpose::New => "new worktree",
+                BranchPurpose::Review => "review",
+            };
+            (
+                name.to_string(),
+                format!("{}/{}", app.filtered_branches.len(), all.len()),
+            )
+        }
+        _ => (
+            "git wt".to_string(),
+            format!("{}/{}", app.filtered_wt.len(), app.worktrees.len()),
+        ),
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            label,
+            Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {} ", detail), Style::default().fg(C_DIM)),
+    ])
+}
+
+fn help_line(app: &App) -> Line<'static> {
+    let s = match &app.mode {
+        Mode::List => {
+            if app.filter_active {
+                " type:filter  esc:exit filter  ↑↓/^p^n:nav  enter:cd "
+            } else {
+                " j/k ↑↓:nav  enter:cd  d:del  e:new  r:review  f //:filter  q:quit "
+            }
+        }
+        Mode::ConfirmDelete(_) => " y: confirm   any: cancel ",
+        Mode::Branch { purpose, .. } => match purpose {
+            BranchPurpose::New => " type:filter  ↑↓/^p^n:nav  enter:checkout / create  esc:back ",
+            BranchPurpose::Review => " type:filter  ↑↓/^p^n:nav  enter:create wt  esc:back ",
+        },
+        Mode::Message { .. } => " press any key ",
+    };
+    Line::from(Span::styled(s, Style::default().fg(C_DIM)))
 }
 
 fn visible_window(len: usize, cursor: usize, capacity: usize) -> (usize, usize) {
@@ -59,41 +112,78 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
         .map(|i| {
             let scored = &app.filtered_wt[i];
             let w = &app.worktrees[scored.idx];
-            let selected = i == app.wt_cursor;
-            worktree_line(w, &scored.indices, selected)
+            let m = app.metrics.get(scored.idx).and_then(Option::as_ref);
+            worktree_line(w, m, i == app.wt_cursor)
         })
         .collect();
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(p, area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn worktree_line<'a>(w: &'a Worktree, _hit_idx: &[usize], selected: bool) -> Line<'a> {
-    let mut spans = Vec::with_capacity(8);
-    if selected {
-        spans.push(Span::styled(
+fn worktree_line<'a>(w: &'a Worktree, m: Option<&WorktreeMetrics>, selected: bool) -> Line<'a> {
+    let mut spans = Vec::with_capacity(12);
+    spans.push(if selected {
+        Span::styled(
             POINTER,
             Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
-        ));
+        )
     } else {
-        spans.push(Span::raw(PAD));
-    }
-    spans.push(Span::styled(pad(&w.name(), 18), color_for_status(w.status)));
+        Span::raw(PAD)
+    });
+    spans.push(Span::styled(pad(&w.name(), 16), color_for_status(w.status)));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        pad(&w.short_branch(), 24),
+        pad(&w.short_branch(), 22),
         Style::default().fg(C_BRANCH),
     ));
+    if let Some(m) = m {
+        spans.push(Span::raw(" "));
+        let (rt, rc) = remote_cell(m);
+        spans.push(Span::styled(pad(&rt, 9), Style::default().fg(rc)));
+        spans.push(Span::raw(" "));
+        let (dt, dc) = dirty_cell(m);
+        spans.push(Span::styled(pad(&dt, 4), Style::default().fg(dc)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            pad(&m.stash.to_string(), 3),
+            Style::default().fg(if m.stash == 0 { C_DIM } else { C_BRANCH }),
+        ));
+    }
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         w.path.display().to_string(),
         Style::default().fg(C_PATH),
     ));
-    let base = if selected {
+    Line::from(spans).style(if selected {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-    };
-    Line::from(spans).style(base)
+    })
+}
+
+fn remote_cell(m: &WorktreeMetrics) -> (String, Color) {
+    match m.ahead_behind {
+        None => ("—".into(), C_DIM),
+        Some(ab) if ab.ahead == 0 && ab.behind == 0 => ("=".into(), Color::Green),
+        Some(ab) => {
+            let txt = format!("↑{} ↓{}", ab.ahead, ab.behind);
+            let color = if ab.behind == 0 {
+                C_LOCAL
+            } else if ab.ahead == 0 {
+                C_BRANCH
+            } else {
+                C_POINTER
+            };
+            (txt, color)
+        }
+    }
+}
+
+fn dirty_cell(m: &WorktreeMetrics) -> (String, Color) {
+    match m.dirty {
+        None => ("?".into(), C_DIM),
+        Some(0) => ("0".into(), C_DIM),
+        Some(n) => (n.to_string(), C_ERR),
+    }
 }
 
 fn color_for_status(s: WorktreeStatus) -> Style {
@@ -106,38 +196,45 @@ fn color_for_status(s: WorktreeStatus) -> Style {
 }
 
 fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
-    let count = format!("{}/{}", app.filtered_wt.len(), app.worktrees.len());
-    let (label, query, style) = match &app.mode {
-        Mode::ConfirmDelete(p) => (
-            "delete".to_string(),
-            format!(
+    let line = match &app.mode {
+        Mode::ConfirmDelete(p) => Line::from(vec![
+            Span::styled(
+                " delete ",
+                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
                 "'{}' ? y/N",
                 p.file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
+            )),
+        ]),
+        Mode::Message { text, error } => Line::from(vec![
+            Span::styled(
+                if *error { " ! " } else { " · " },
+                Style::default().fg(if *error { C_ERR } else { C_DIM }),
             ),
-            Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
-        ),
-        Mode::Message { text, error } => (
-            if *error {
-                "!".to_string()
+            Span::raw(text.clone()),
+        ]),
+        _ => {
+            if app.filter_active {
+                Line::from(vec![
+                    Span::styled(
+                        " filter ",
+                        Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("› "),
+                    Span::raw(app.filter.clone()),
+                    Span::styled("▏", Style::default().fg(C_POINTER)),
+                ])
             } else {
-                "·".to_string()
-            },
-            text.clone(),
-            Style::default().fg(if *error { C_ERR } else { C_DIM }),
-        ),
-        _ => (
-            "filter".to_string(),
-            format!("{}{}", app.filter, "▏"),
-            Style::default().fg(C_POINTER),
-        ),
+                Line::from(Span::styled(
+                    " press f or / to filter ",
+                    Style::default().fg(C_DIM),
+                ))
+            }
+        }
     };
-    let line = Line::from(vec![
-        Span::styled(format!("{:>6} ", count), Style::default().fg(C_DIM)),
-        Span::styled(format!("{}: ", label), style),
-        Span::raw(query),
-    ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -175,12 +272,11 @@ fn branch_line<'a>(b: &'a BranchRef, hit: &[usize], selected: bool) -> Line<'a> 
         kind_label(&b.kind),
         Style::default().fg(C_DIM),
     ));
-    let base = if selected {
+    Line::from(spans).style(if selected {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-    };
-    Line::from(spans).style(base)
+    })
 }
 
 fn highlighted<'a>(text: &'a str, hit: &[usize], base: Color) -> Vec<Span<'a>> {
@@ -249,47 +345,23 @@ fn kind_label(k: &BranchKind) -> String {
 }
 
 fn draw_prompt_branch(f: &mut Frame, area: Rect, app: &App) {
-    let count = format!("{}/{}", app.filtered_branches.len(), branch_count(app));
-    let purpose = match &app.mode {
-        Mode::Branch { purpose, .. } => *purpose,
+    let label = match &app.mode {
+        Mode::Branch { purpose, .. } => match purpose {
+            BranchPurpose::New => "new branch",
+            BranchPurpose::Review => "review",
+        },
         _ => return,
     };
-    let label = match purpose {
-        BranchPurpose::New => "new branch",
-        BranchPurpose::Review => "review",
-    };
     let line = Line::from(vec![
-        Span::styled(format!("{:>6} ", count), Style::default().fg(C_DIM)),
         Span::styled(
-            format!("{label}: "),
+            format!(" {label} "),
             Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("{}{}", app.branch_filter, "▏")),
+        Span::raw("› "),
+        Span::raw(app.branch_filter.clone()),
+        Span::styled("▏", Style::default().fg(C_POINTER)),
     ]);
     f.render_widget(Paragraph::new(line), area);
-}
-
-fn branch_count(app: &App) -> usize {
-    match &app.mode {
-        Mode::Branch { all, .. } => all.len(),
-        _ => 0,
-    }
-}
-
-fn draw_help(f: &mut Frame, area: Rect, app: &App) {
-    let help = match &app.mode {
-        Mode::List => "↑/↓ ^p/^n   enter:cd   d:del   e:new   r:review   esc:quit",
-        Mode::ConfirmDelete(_) => "y: confirm   any: cancel",
-        Mode::Branch { purpose, .. } => match purpose {
-            BranchPurpose::New => "↑/↓ ^p/^n   enter:create wt   type to filter / new   esc:back",
-            BranchPurpose::Review => "↑/↓ ^p/^n   enter:checkout for review   esc:back",
-        },
-        Mode::Message { .. } => "press any key",
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(help, Style::default().fg(C_DIM))),
-        area,
-    );
 }
 
 fn pad(s: &str, n: usize) -> String {

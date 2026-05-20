@@ -1,13 +1,9 @@
 use anyhow::Result;
-use gwt_core::Repo;
+use gwt_core::layout::BareLayout;
+use gwt_core::ops;
 
-pub fn run(repo: &Repo, remote_branch: &str) -> Result<()> {
-    let local = remote_branch
-        .split_once('/')
-        .map(|(_, b)| b)
-        .unwrap_or(remote_branch);
-    let path = repo.worktree_root().join(local);
-    repo.add_worktree_from_remote(&path, remote_branch)?;
+pub fn run(layout: &BareLayout, branch: &str) -> Result<()> {
+    let path = ops::review(layout, branch)?;
     println!("{}", path.display());
     Ok(())
 }

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use gwt_core::{BranchKind, BranchRef, Repo, Worktree};
+use gwt_core::layout::BareLayout;
+use gwt_core::status::{self, WorktreeMetrics};
+use gwt_core::{ops, BranchKind, BranchRef, Repo, Worktree};
 
 use crate::fuzzy;
 
@@ -33,10 +36,13 @@ pub struct Scored {
 
 pub struct App<'a> {
     pub repo: &'a Repo,
+    pub layout: Option<BareLayout>,
     pub mode: Mode,
 
     pub worktrees: Vec<Worktree>,
+    pub metrics: Vec<Option<WorktreeMetrics>>,
     pub filter: String,
+    pub filter_active: bool,
     pub filtered_wt: Vec<Scored>,
     pub wt_cursor: usize,
 
@@ -48,11 +54,16 @@ pub struct App<'a> {
 impl<'a> App<'a> {
     pub fn new(repo: &'a Repo) -> Result<Self> {
         let worktrees = repo.list_worktrees()?;
+        let layout = BareLayout::require(&repo.cwd).ok();
+        let metrics = compute_metrics(layout.as_ref(), &worktrees);
         let mut s = Self {
             repo,
+            layout,
             mode: Mode::List,
             worktrees,
+            metrics,
             filter: String::new(),
+            filter_active: false,
             filtered_wt: Vec::new(),
             wt_cursor: 0,
             branch_filter: String::new(),
@@ -65,6 +76,7 @@ impl<'a> App<'a> {
 
     pub fn refresh_worktrees(&mut self) -> Result<()> {
         self.worktrees = self.repo.list_worktrees()?;
+        self.metrics = compute_metrics(self.layout.as_ref(), &self.worktrees);
         self.refilter_worktrees();
         Ok(())
     }
@@ -161,7 +173,17 @@ impl<'a> App<'a> {
         }
     }
 
-    pub fn branch_cursor(&mut self, delta: isize) {
+    pub fn go_top(&mut self) {
+        self.wt_cursor = 0;
+    }
+
+    pub fn go_bottom(&mut self) {
+        if !self.filtered_wt.is_empty() {
+            self.wt_cursor = self.filtered_wt.len() - 1;
+        }
+    }
+
+    pub fn branch_move(&mut self, delta: isize) {
         // The "+1" accounts for the virtual "[+ create]" entry rendered after the list.
         let total = self.branch_total();
         if total == 0 {
@@ -207,8 +229,7 @@ impl<'a> App<'a> {
 
         if pick_create {
             let q = self.branch_filter.trim().to_string();
-            let path = self.repo.worktree_root().join(&q);
-            self.repo.add_worktree(&path, &q, true)?;
+            self.create_new_branch(&q)?;
             self.refresh_worktrees()?;
             self.mode = Mode::List;
             return Ok(true);
@@ -223,23 +244,75 @@ impl<'a> App<'a> {
         };
         let b = all[s.idx].clone();
 
-        match (&b.kind, purpose) {
-            (BranchKind::Local, _) => {
-                let path = self.repo.worktree_root().join(&b.short);
-                self.repo.add_worktree(&path, &b.short, false)?;
-            }
-            (BranchKind::Remote { .. }, _) => {
-                let local_short = b.short.split_once('/').map(|(_, s)| s).unwrap_or(&b.short);
-                let path = self.repo.worktree_root().join(local_short);
-                self.repo.add_worktree_from_remote(&path, &b.short)?;
+        match &b.kind {
+            BranchKind::Local => self.adopt_branch(&b.short, &b.short)?,
+            BranchKind::Remote { .. } => {
+                let local_short = b
+                    .short
+                    .split_once('/')
+                    .map(|(_, s)| s.to_string())
+                    .unwrap_or_else(|| b.short.clone());
+                self.adopt_branch(&b.short, &local_short)?
             }
         }
+        let _ = purpose;
         self.refresh_worktrees()?;
         self.mode = Mode::List;
         Ok(true)
     }
 
+    fn create_new_branch(&self, branch: &str) -> Result<()> {
+        if let Some(layout) = &self.layout {
+            // Use ops::new so secrets + relativize run, matching the CLI's `git wt new` behavior.
+            let base = layout
+                .default_branch()
+                .unwrap_or_else(|_| "HEAD".to_string());
+            ops::new(layout, &base, branch, branch)?;
+        } else {
+            let path = self.repo.worktree_root().join(branch);
+            self.repo.add_worktree(&path, branch, true)?;
+        }
+        Ok(())
+    }
+
+    fn adopt_branch(&self, branch_ref: &str, name: &str) -> Result<()> {
+        if let Some(layout) = &self.layout {
+            // `ops::add` handles both local and remote-tracking adoption + secrets.
+            let plain = branch_ref.strip_prefix("origin/").unwrap_or(branch_ref);
+            ops::add(layout, plain, name)?;
+        } else if branch_ref.contains('/') {
+            let path = self.repo.worktree_root().join(name);
+            self.repo.add_worktree_from_remote(&path, branch_ref)?;
+        } else {
+            let path = self.repo.worktree_root().join(name);
+            self.repo.add_worktree(&path, branch_ref, false)?;
+        }
+        Ok(())
+    }
+
     pub fn set_error(&mut self, text: String) {
         self.mode = Mode::Message { text, error: true };
     }
+}
+
+fn compute_metrics(
+    layout: Option<&BareLayout>,
+    worktrees: &[Worktree],
+) -> Vec<Option<WorktreeMetrics>> {
+    let Some(layout) = layout else {
+        return vec![None; worktrees.len()];
+    };
+    let stashes: HashMap<String, u32> = status::stash_map(layout).unwrap_or_default();
+    worktrees
+        .iter()
+        .map(|w| {
+            let branch = w.short_branch();
+            let b = if branch.starts_with('(') {
+                None
+            } else {
+                Some(branch.as_str())
+            };
+            Some(status::collect(layout, &w.path, b, &stashes))
+        })
+        .collect()
 }
