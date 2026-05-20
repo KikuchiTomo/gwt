@@ -46,6 +46,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             Ok(None)
         }
         Mode::Branch { .. } => handle_branch(app, key, ctrl),
+        Mode::NewName { .. } => {
+            handle_new_name(app, key, ctrl);
+            Ok(None)
+        }
         Mode::Message { .. } => {
             app.mode = Mode::List;
             Ok(None)
@@ -114,7 +118,7 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
                 app.mode = Mode::ConfirmDelete(wt.path.clone());
             }
         }
-        KeyCode::Char('e') => app.enter_branch_mode(BranchPurpose::New)?,
+        KeyCode::Char('e') => app.enter_branch_mode(BranchPurpose::NewBase)?,
         KeyCode::Char('r') => app.enter_branch_mode(BranchPurpose::Review)?,
         KeyCode::Char('f') | KeyCode::Char('/') => {
             app.filter_active = true;
@@ -168,4 +172,21 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
         _ => {}
     }
     Ok(None)
+}
+
+fn handle_new_name(app: &mut App, key: KeyEvent, ctrl: bool) {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::List,
+        KeyCode::Char('c') if ctrl => app.mode = Mode::List,
+        KeyCode::Enter => match app.commit_new_name() {
+            Ok(true) => {}
+            Ok(false) => app.set_error("name is required".into()),
+            Err(e) => app.set_error(e.to_string()),
+        },
+        KeyCode::Backspace => app.edit_new_name(|s| {
+            s.pop();
+        }),
+        KeyCode::Char(c) => app.edit_new_name(|s| s.push(c)),
+        _ => {}
+    }
 }

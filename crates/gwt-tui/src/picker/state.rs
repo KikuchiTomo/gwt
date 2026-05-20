@@ -10,7 +10,7 @@ use crate::fuzzy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchPurpose {
-    New,
+    NewBase,
     Review,
 }
 
@@ -20,6 +20,10 @@ pub enum Mode {
     Branch {
         purpose: BranchPurpose,
         all: Vec<BranchRef>,
+    },
+    NewName {
+        base: String,
+        buf: String,
     },
     Message {
         text: String,
@@ -145,13 +149,18 @@ impl<'a> App<'a> {
 
     pub fn enter_branch_mode(&mut self, purpose: BranchPurpose) -> Result<()> {
         let mut all = self.repo.branches()?;
-        if purpose == BranchPurpose::Review {
-            all.retain(|b| matches!(b.kind, BranchKind::Remote { .. }));
+        match purpose {
+            BranchPurpose::Review => {
+                // Review picks remote PR branches; hide already-checked-out ones.
+                all.retain(|b| matches!(b.kind, BranchKind::Remote { .. }));
+                all.retain(|b| !b.is_checked_out());
+            }
+            BranchPurpose::NewBase => {
+                // The user can branch off anything that resolves (local or remote).
+            }
         }
-        // Hide branches already checked out somewhere else — git would refuse anyway.
-        all.retain(|b| !b.is_checked_out());
 
-        // Local first, then alphabetical.
+        // Local first, then alphabetical so `develop`/`main` sit at the top.
         all.sort_by(|a, b| match (&a.kind, &b.kind) {
             (BranchKind::Local, BranchKind::Remote { .. }) => std::cmp::Ordering::Less,
             (BranchKind::Remote { .. }, BranchKind::Local) => std::cmp::Ordering::Greater,
@@ -163,6 +172,38 @@ impl<'a> App<'a> {
         self.mode = Mode::Branch { purpose, all };
         self.refilter_branches();
         Ok(())
+    }
+
+    pub fn enter_name_input(&mut self, base: String) {
+        self.mode = Mode::NewName {
+            base,
+            buf: String::new(),
+        };
+    }
+
+    pub fn commit_new_name(&mut self) -> Result<bool> {
+        let (base, name) = match &self.mode {
+            Mode::NewName { base, buf } => (base.clone(), buf.trim().to_string()),
+            _ => return Ok(false),
+        };
+        if name.is_empty() {
+            return Ok(false);
+        }
+        if let Some(layout) = &self.layout {
+            ops::new(layout, &base, &name, &name)?;
+        } else {
+            let path = self.repo.worktree_root().join(&name);
+            self.repo.add_worktree(&path, &name, true)?;
+        }
+        self.refresh_worktrees()?;
+        self.mode = Mode::List;
+        Ok(true)
+    }
+
+    pub fn edit_new_name(&mut self, f: impl FnOnce(&mut String)) {
+        if let Mode::NewName { buf, .. } = &mut self.mode {
+            f(buf);
+        }
     }
 
     pub fn edit_branch_filter(&mut self, f: impl FnOnce(&mut String)) {
@@ -224,19 +265,9 @@ impl<'a> App<'a> {
     }
 
     pub fn show_create_entry(&self) -> bool {
-        let Mode::Branch { purpose, all } = &self.mode else {
-            return false;
-        };
-        if *purpose != BranchPurpose::New {
-            return false;
-        }
-        let q = self.branch_filter.trim();
-        if q.is_empty() {
-            return false;
-        }
-        // Don't offer to "create" a name that already exists as a local branch.
-        !all.iter()
-            .any(|b| b.short == q && matches!(b.kind, BranchKind::Local))
+        // The `[+ create]` synthetic entry is gone; new branches now flow through
+        // an explicit "pick base → type name" two-step.
+        false
     }
 
     pub fn commit_branch_selection(&mut self) -> Result<bool> {
@@ -244,17 +275,6 @@ impl<'a> App<'a> {
             Mode::Branch { purpose, .. } => *purpose,
             _ => return Ok(false),
         };
-        let n = self.filtered_branches.len();
-        let pick_create = self.show_create_entry() && self.branch_cursor == n;
-
-        if pick_create {
-            let q = self.branch_filter.trim().to_string();
-            self.create_new_branch(&q)?;
-            self.refresh_worktrees()?;
-            self.mode = Mode::List;
-            return Ok(true);
-        }
-
         let s = match self.filtered_branches.get(self.branch_cursor) {
             Some(s) => s.clone(),
             None => return Ok(false),
@@ -264,50 +284,29 @@ impl<'a> App<'a> {
         };
         let b = all[s.idx].clone();
 
-        match &b.kind {
-            BranchKind::Local => self.adopt_branch(&b.short, &b.short)?,
-            BranchKind::Remote { .. } => {
-                let local_short = b
+        match purpose {
+            BranchPurpose::NewBase => {
+                // Step 1 done — store base, advance to name input. ops::new runs on commit.
+                self.enter_name_input(b.short.clone());
+                Ok(true)
+            }
+            BranchPurpose::Review => {
+                let plain = b
                     .short
-                    .split_once('/')
-                    .map(|(_, s)| s.to_string())
-                    .unwrap_or_else(|| b.short.clone());
-                self.adopt_branch(&b.short, &local_short)?
+                    .strip_prefix("origin/")
+                    .unwrap_or(&b.short)
+                    .to_string();
+                if let Some(layout) = &self.layout {
+                    ops::add(layout, &plain, &plain)?;
+                } else {
+                    let path = self.repo.worktree_root().join(&plain);
+                    self.repo.add_worktree_from_remote(&path, &b.short)?;
+                }
+                self.refresh_worktrees()?;
+                self.mode = Mode::List;
+                Ok(true)
             }
         }
-        let _ = purpose;
-        self.refresh_worktrees()?;
-        self.mode = Mode::List;
-        Ok(true)
-    }
-
-    fn create_new_branch(&self, branch: &str) -> Result<()> {
-        if let Some(layout) = &self.layout {
-            // Use ops::new so secrets + relativize run, matching the CLI's `git wt new` behavior.
-            let base = layout
-                .default_branch()
-                .unwrap_or_else(|_| "HEAD".to_string());
-            ops::new(layout, &base, branch, branch)?;
-        } else {
-            let path = self.repo.worktree_root().join(branch);
-            self.repo.add_worktree(&path, branch, true)?;
-        }
-        Ok(())
-    }
-
-    fn adopt_branch(&self, branch_ref: &str, name: &str) -> Result<()> {
-        if let Some(layout) = &self.layout {
-            // `ops::add` handles both local and remote-tracking adoption + secrets.
-            let plain = branch_ref.strip_prefix("origin/").unwrap_or(branch_ref);
-            ops::add(layout, plain, name)?;
-        } else if branch_ref.contains('/') {
-            let path = self.repo.worktree_root().join(name);
-            self.repo.add_worktree_from_remote(&path, branch_ref)?;
-        } else {
-            let path = self.repo.worktree_root().join(name);
-            self.repo.add_worktree(&path, branch_ref, false)?;
-        }
-        Ok(())
     }
 
     pub fn set_error(&mut self, text: String) {

@@ -55,7 +55,40 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_branches(f, chunks[0], app);
             draw_prompt_branch(f, chunks[1], app);
         }
+        Mode::NewName { base, buf } => {
+            draw_new_name(f, chunks[0], base, buf);
+            draw_prompt_new_name(f, chunks[1], buf);
+        }
     }
+}
+
+fn draw_new_name(f: &mut Frame, area: Rect, base: &str, _buf: &str) {
+    let line = Line::from(vec![
+        Span::raw(PAD),
+        Span::styled("branching from ", Style::default().fg(C_DIM)),
+        Span::styled(
+            base.to_string(),
+            Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  → new branch name will also be the worktree dir name",
+            Style::default().fg(C_DIM),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_prompt_new_name(f: &mut Frame, area: Rect, buf: &str) {
+    let line = Line::from(vec![
+        Span::styled(
+            " name ",
+            Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("› "),
+        Span::raw(buf.to_string()),
+        Span::styled("▏", Style::default().fg(C_POINTER)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_worktree_header(f: &mut Frame, area: Rect, cols: &ColWidths) {
@@ -95,7 +128,7 @@ fn title_line(app: &App) -> Line<'static> {
     let (label, detail) = match &app.mode {
         Mode::Branch { purpose, all } => {
             let name = match purpose {
-                BranchPurpose::New => "new worktree",
+                BranchPurpose::NewBase => "new · pick base branch",
                 BranchPurpose::Review => "review",
             };
             (
@@ -103,6 +136,7 @@ fn title_line(app: &App) -> Line<'static> {
                 format!("{}/{}", app.filtered_branches.len(), all.len()),
             )
         }
+        Mode::NewName { base, .. } => (format!("new · from {base}"), String::new()),
         _ => (
             "git wt".to_string(),
             format!("{}/{}", app.filtered_wt.len(), app.worktrees.len()),
@@ -129,9 +163,12 @@ fn help_line(app: &App) -> Line<'static> {
         }
         Mode::ConfirmDelete(_) => " y: confirm   any: cancel ",
         Mode::Branch { purpose, .. } => match purpose {
-            BranchPurpose::New => " type:filter  ↑↓/^p^n:nav  enter:checkout / create  esc:back ",
+            BranchPurpose::NewBase => {
+                " type:filter  ↑↓/^p^n:nav  enter:choose base → name  esc:back "
+            }
             BranchPurpose::Review => " type:filter  ↑↓/^p^n:nav  enter:create wt  esc:back ",
         },
+        Mode::NewName { .. } => " type:name  enter:create worktree  esc:cancel ",
         Mode::Message { .. } => " press any key ",
     };
     Line::from(Span::styled(s, Style::default().fg(C_DIM)))
@@ -400,7 +437,7 @@ fn kind_label(k: &BranchKind) -> String {
 fn draw_prompt_branch(f: &mut Frame, area: Rect, app: &App) {
     let label = match &app.mode {
         Mode::Branch { purpose, .. } => match purpose {
-            BranchPurpose::New => "new branch",
+            BranchPurpose::NewBase => "base",
             BranchPurpose::Review => "review",
         },
         _ => return,
