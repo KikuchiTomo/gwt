@@ -12,8 +12,11 @@ worktree management:
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh | sh
+curl -fsSL "https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh?cb=$(date +%s)" | sh
 ```
+
+The `?cb=...` busts `raw.githubusercontent.com`'s CDN cache; drop it once you
+trust the cache state (default TTL is ~5 minutes).
 
 The installer:
 

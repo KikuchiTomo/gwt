@@ -202,12 +202,12 @@ if [ -z "$VERSION" ]; then
 fi
 case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
 
-# Existing install detection. We only treat the on-PATH `git-wt` as ours if
-# its `--version` matches `git-wt X.Y.Z` — there are unrelated tools with the
-# same name and we must not prompt to "update" them.
+# Existing install detection — probe ONLY the binary at our own install path,
+# never whatever happens to be on $PATH. Other tools share the name `git-wt`
+# and their --version output is noisy (and may even open /dev/tty).
 EXISTING=""
-if command -v "$BIN" >/dev/null 2>&1; then
-    ver_line=$("$BIN" --version 2>/dev/null | head -n1 || true)
+if [ -x "$PREFIX/$BIN" ]; then
+    ver_line=$("$PREFIX/$BIN" --version </dev/null 2>/dev/null | head -n1 || true)
     case "$ver_line" in
         "git-wt "[0-9]*.[0-9]*.[0-9]*)
             EXISTING=$(printf '%s\n' "$ver_line" | awk '{print $2}')
