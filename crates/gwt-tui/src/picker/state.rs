@@ -34,6 +34,22 @@ pub struct Scored {
     pub indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ColWidths {
+    pub name: usize,
+    pub branch: usize,
+    pub remote: usize,
+    pub dirty: usize,
+    pub stash: usize,
+}
+
+impl ColWidths {
+    pub fn show_metrics(&self) -> bool {
+        // 0 is the sentinel meaning "no metrics available for any row".
+        self.remote > 0 || self.dirty > 0 || self.stash > 0
+    }
+}
+
 pub struct App<'a> {
     pub repo: &'a Repo,
     pub layout: Option<BareLayout>,
@@ -41,6 +57,7 @@ pub struct App<'a> {
 
     pub worktrees: Vec<Worktree>,
     pub metrics: Vec<Option<WorktreeMetrics>>,
+    pub cols: ColWidths,
     pub filter: String,
     pub filter_active: bool,
     pub filtered_wt: Vec<Scored>,
@@ -56,12 +73,14 @@ impl<'a> App<'a> {
         let worktrees = repo.list_worktrees()?;
         let layout = BareLayout::require(&repo.cwd).ok();
         let metrics = compute_metrics(layout.as_ref(), &worktrees);
+        let cols = compute_col_widths(&worktrees, &metrics);
         let mut s = Self {
             repo,
             layout,
             mode: Mode::List,
             worktrees,
             metrics,
+            cols,
             filter: String::new(),
             filter_active: false,
             filtered_wt: Vec::new(),
@@ -77,6 +96,7 @@ impl<'a> App<'a> {
     pub fn refresh_worktrees(&mut self) -> Result<()> {
         self.worktrees = self.repo.list_worktrees()?;
         self.metrics = compute_metrics(self.layout.as_ref(), &self.worktrees);
+        self.cols = compute_col_widths(&self.worktrees, &self.metrics);
         self.refilter_worktrees();
         Ok(())
     }
@@ -292,6 +312,66 @@ impl<'a> App<'a> {
 
     pub fn set_error(&mut self, text: String) {
         self.mode = Mode::Message { text, error: true };
+    }
+}
+
+pub const H_NAME: &str = "NAME";
+pub const H_BRANCH: &str = "BRANCH";
+pub const H_REMOTE: &str = "REMOTE";
+pub const H_DIRTY: &str = "DIRTY";
+pub const H_STASH: &str = "STASH";
+pub const H_PATH: &str = "PATH";
+
+// Per-column caps keep one screaming-long branch name from blowing out the
+// whole row; values longer than this get truncated with `…` at render time.
+pub const MAX_NAME: usize = 22;
+pub const MAX_BRANCH: usize = 30;
+pub const MAX_REMOTE: usize = 9; // "↑99 ↓99"
+pub const MAX_DIRTY: usize = 5;
+pub const MAX_STASH: usize = 4;
+
+fn compute_col_widths(worktrees: &[Worktree], metrics: &[Option<WorktreeMetrics>]) -> ColWidths {
+    let mut name = H_NAME.chars().count();
+    let mut branch = H_BRANCH.chars().count();
+    let mut remote = 0usize;
+    let mut dirty = 0usize;
+    let mut stash = 0usize;
+    let any_metrics = metrics.iter().any(|m| m.is_some());
+    if any_metrics {
+        remote = H_REMOTE.chars().count();
+        dirty = H_DIRTY.chars().count();
+        stash = H_STASH.chars().count();
+    }
+    for (w, m) in worktrees.iter().zip(metrics.iter()) {
+        name = name.max(w.name().chars().count());
+        branch = branch.max(w.short_branch().chars().count());
+        if let Some(m) = m {
+            remote = remote.max(remote_plain(m).chars().count());
+            dirty = dirty.max(dirty_plain(m).chars().count());
+            stash = stash.max(m.stash.to_string().chars().count());
+        }
+    }
+    ColWidths {
+        name: name.min(MAX_NAME),
+        branch: branch.min(MAX_BRANCH),
+        remote: remote.min(MAX_REMOTE),
+        dirty: dirty.min(MAX_DIRTY),
+        stash: stash.min(MAX_STASH),
+    }
+}
+
+pub fn remote_plain(m: &WorktreeMetrics) -> String {
+    match m.ahead_behind {
+        None => "—".into(),
+        Some(ab) if ab.ahead == 0 && ab.behind == 0 => "=".into(),
+        Some(ab) => format!("↑{} ↓{}", ab.ahead, ab.behind),
+    }
+}
+
+pub fn dirty_plain(m: &WorktreeMetrics) -> String {
+    match m.dirty {
+        None => "?".into(),
+        Some(n) => n.to_string(),
     }
 }
 

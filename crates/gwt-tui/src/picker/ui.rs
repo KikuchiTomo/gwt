@@ -6,7 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::state::{App, BranchPurpose, Mode};
+use super::state::{
+    dirty_plain, remote_plain, App, BranchPurpose, ColWidths, Mode, H_BRANCH, H_DIRTY, H_NAME,
+    H_PATH, H_REMOTE, H_STASH,
+};
 
 const POINTER: &str = "▌ ";
 const PAD: &str = "  ";
@@ -40,7 +43,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match &app.mode {
         Mode::List | Mode::ConfirmDelete(_) | Mode::Message { .. } => {
-            draw_worktrees(f, chunks[0], app);
+            let list_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(chunks[0]);
+            draw_worktree_header(f, list_chunks[0], &app.cols);
+            draw_worktrees(f, list_chunks[1], app);
             draw_prompt_list(f, chunks[1], app);
         }
         Mode::Branch { .. } => {
@@ -48,6 +56,39 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_prompt_branch(f, chunks[1], app);
         }
     }
+}
+
+fn draw_worktree_header(f: &mut Frame, area: Rect, cols: &ColWidths) {
+    let mut spans = Vec::with_capacity(12);
+    spans.push(Span::raw(PAD));
+    spans.push(header_span(H_NAME, cols.name));
+    spans.push(Span::raw(" "));
+    spans.push(header_span(H_BRANCH, cols.branch));
+    if cols.show_metrics() {
+        spans.push(Span::raw(" "));
+        spans.push(header_span(H_REMOTE, cols.remote));
+        spans.push(Span::raw(" "));
+        spans.push(header_span(H_DIRTY, cols.dirty));
+        spans.push(Span::raw(" "));
+        spans.push(header_span(H_STASH, cols.stash));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(header_span(H_PATH, 0));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn header_span<'a>(label: &'a str, width: usize) -> Span<'a> {
+    let text = if width == 0 {
+        label.to_string()
+    } else {
+        pad(label, width)
+    };
+    Span::styled(
+        text,
+        Style::default()
+            .fg(C_DIM)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )
 }
 
 fn title_line(app: &App) -> Line<'static> {
@@ -108,19 +149,27 @@ fn visible_window(len: usize, cursor: usize, capacity: usize) -> (usize, usize) 
 fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
     let cap = area.height as usize;
     let (start, end) = visible_window(app.filtered_wt.len(), app.wt_cursor, cap);
+    let path_budget = path_budget(area.width as usize, &app.cols);
     let lines: Vec<Line> = (start..end)
         .map(|i| {
             let scored = &app.filtered_wt[i];
             let w = &app.worktrees[scored.idx];
             let m = app.metrics.get(scored.idx).and_then(Option::as_ref);
-            worktree_line(w, m, i == app.wt_cursor)
+            worktree_line(w, m, &app.cols, path_budget, i == app.wt_cursor)
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    // No wrap — overflow gets clipped, alignment stays intact.
+    f.render_widget(Paragraph::new(lines), area);
 }
 
-fn worktree_line<'a>(w: &'a Worktree, m: Option<&WorktreeMetrics>, selected: bool) -> Line<'a> {
-    let mut spans = Vec::with_capacity(12);
+fn worktree_line(
+    w: &Worktree,
+    m: Option<&WorktreeMetrics>,
+    cols: &ColWidths,
+    path_budget: usize,
+    selected: bool,
+) -> Line<'static> {
+    let mut spans = Vec::with_capacity(14);
     spans.push(if selected {
         Span::styled(
             POINTER,
@@ -129,30 +178,32 @@ fn worktree_line<'a>(w: &'a Worktree, m: Option<&WorktreeMetrics>, selected: boo
     } else {
         Span::raw(PAD)
     });
-    spans.push(Span::styled(pad(&w.name(), 16), color_for_status(w.status)));
+    spans.push(Span::styled(
+        fit(&w.name(), cols.name),
+        color_for_status(w.status),
+    ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        pad(&w.short_branch(), 22),
+        fit(&w.short_branch(), cols.branch),
         Style::default().fg(C_BRANCH),
     ));
-    if let Some(m) = m {
+    if cols.show_metrics() {
         spans.push(Span::raw(" "));
         let (rt, rc) = remote_cell(m);
-        spans.push(Span::styled(pad(&rt, 9), Style::default().fg(rc)));
+        spans.push(Span::styled(fit(&rt, cols.remote), Style::default().fg(rc)));
         spans.push(Span::raw(" "));
         let (dt, dc) = dirty_cell(m);
-        spans.push(Span::styled(pad(&dt, 4), Style::default().fg(dc)));
+        spans.push(Span::styled(fit(&dt, cols.dirty), Style::default().fg(dc)));
         spans.push(Span::raw(" "));
+        let stash = m.map(|m| m.stash).unwrap_or(0);
         spans.push(Span::styled(
-            pad(&m.stash.to_string(), 3),
-            Style::default().fg(if m.stash == 0 { C_DIM } else { C_BRANCH }),
+            fit(&stash.to_string(), cols.stash),
+            Style::default().fg(if stash == 0 { C_DIM } else { C_BRANCH }),
         ));
     }
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        w.path.display().to_string(),
-        Style::default().fg(C_PATH),
-    ));
+    let path_str = trunc_left(&w.path.display().to_string(), path_budget);
+    spans.push(Span::styled(path_str, Style::default().fg(C_PATH)));
     Line::from(spans).style(if selected {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -160,30 +211,32 @@ fn worktree_line<'a>(w: &'a Worktree, m: Option<&WorktreeMetrics>, selected: boo
     })
 }
 
-fn remote_cell(m: &WorktreeMetrics) -> (String, Color) {
-    match m.ahead_behind {
-        None => ("—".into(), C_DIM),
-        Some(ab) if ab.ahead == 0 && ab.behind == 0 => ("=".into(), Color::Green),
-        Some(ab) => {
-            let txt = format!("↑{} ↓{}", ab.ahead, ab.behind);
-            let color = if ab.behind == 0 {
-                C_LOCAL
-            } else if ab.ahead == 0 {
-                C_BRANCH
-            } else {
-                C_POINTER
-            };
-            (txt, color)
-        }
-    }
+fn remote_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
+    let Some(m) = m else {
+        return ("—".into(), C_DIM);
+    };
+    let text = remote_plain(m);
+    let color = match m.ahead_behind {
+        None => C_DIM,
+        Some(ab) if ab.ahead == 0 && ab.behind == 0 => Color::Green,
+        Some(ab) if ab.behind == 0 => C_LOCAL,
+        Some(ab) if ab.ahead == 0 => C_BRANCH,
+        Some(_) => C_POINTER,
+    };
+    (text, color)
 }
 
-fn dirty_cell(m: &WorktreeMetrics) -> (String, Color) {
-    match m.dirty {
-        None => ("?".into(), C_DIM),
-        Some(0) => ("0".into(), C_DIM),
-        Some(n) => (n.to_string(), C_ERR),
-    }
+fn dirty_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
+    let Some(m) = m else {
+        return ("?".into(), C_DIM);
+    };
+    let text = dirty_plain(m);
+    let color = match m.dirty {
+        None => C_DIM,
+        Some(0) => C_DIM,
+        Some(_) => C_ERR,
+    };
+    (text, color)
 }
 
 fn color_for_status(s: WorktreeStatus) -> Style {
@@ -376,4 +429,52 @@ fn pad(s: &str, n: usize) -> String {
         }
         out
     }
+}
+
+/// Width-aware: truncate `s` to `n` chars with a trailing ellipsis, then right-pad.
+fn fit(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let w = s.chars().count();
+    if w == n {
+        return s.to_string();
+    }
+    if w < n {
+        return pad(s, n);
+    }
+    if n == 1 {
+        return "…".into();
+    }
+    let mut out: String = s.chars().take(n - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Truncate from the **left**, prepending `…` when material was dropped.
+fn trunc_left(s: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        return s.to_string();
+    }
+    if n == 1 {
+        return "…".into();
+    }
+    let start = chars.len() - (n - 1);
+    let mut out = String::with_capacity(n);
+    out.push('…');
+    out.extend(&chars[start..]);
+    out
+}
+
+fn path_budget(area_width: usize, cols: &ColWidths) -> usize {
+    // pointer (2) + name + " " + branch + (metrics? + " " each) + " " before path.
+    let mut used = 2 + cols.name + 1 + cols.branch + 1;
+    if cols.show_metrics() {
+        used += cols.remote + 1 + cols.dirty + 1 + cols.stash + 1;
+    }
+    area_width.saturating_sub(used).max(8)
 }
