@@ -21,9 +21,18 @@ pub enum PickerOutcome {
 enum Mode {
     List,
     ConfirmDelete(usize),
-    CreateInput { buf: String },
-    ReviewSelect { branches: Vec<String>, index: usize, list_state: ListState },
-    Message { text: String, error: bool },
+    CreateInput {
+        buf: String,
+    },
+    ReviewSelect {
+        branches: Vec<String>,
+        index: usize,
+        list_state: ListState,
+    },
+    Message {
+        text: String,
+        error: bool,
+    },
 }
 
 struct App<'a> {
@@ -40,7 +49,12 @@ impl<'a> App<'a> {
         if !items.is_empty() {
             state.select(Some(0));
         }
-        Ok(Self { repo, items, state, mode: Mode::List })
+        Ok(Self {
+            repo,
+            items,
+            state,
+            mode: Mode::List,
+        })
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -115,7 +129,11 @@ fn handle_key(app: &mut App, key: KeyEvent, _term: &mut Tui) -> Result<Option<Pi
                     if !branches.is_empty() {
                         list_state.select(Some(0));
                     }
-                    app.mode = Mode::ReviewSelect { branches, index: 0, list_state };
+                    app.mode = Mode::ReviewSelect {
+                        branches,
+                        index: 0,
+                        list_state,
+                    };
                 }
                 Err(e) => app.mode = msg_err(e.to_string()),
             },
@@ -158,7 +176,11 @@ fn handle_key(app: &mut App, key: KeyEvent, _term: &mut Tui) -> Result<Option<Pi
             KeyCode::Char(c) => buf.push(c),
             _ => {}
         },
-        Mode::ReviewSelect { branches, index, list_state } => match key.code {
+        Mode::ReviewSelect {
+            branches,
+            index,
+            list_state,
+        } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::List,
             KeyCode::Down | KeyCode::Char('j') => {
                 if !branches.is_empty() {
@@ -220,9 +242,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             draw_list(f, chunks[0], app);
         }
         Mode::CreateInput { buf } => draw_input(f, chunks[0], "new branch", buf),
-        Mode::ReviewSelect { branches, list_state, .. } => {
-            draw_branches(f, chunks[0], branches, &mut list_state.clone())
-        }
+        Mode::ReviewSelect {
+            branches,
+            list_state,
+            ..
+        } => draw_branches(f, chunks[0], branches, &mut list_state.clone()),
     }
 
     draw_status(f, chunks[1], app);
@@ -236,9 +260,15 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
             let branch = w.short_branch();
             let path = w.path.display().to_string();
             let line = Line::from(vec![
-                Span::styled(format!("{:<20}", w.name()), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{:<20}", w.name()),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(" "),
-                Span::styled(format!("{:<24}", branch), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:<24}", branch),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw(" "),
                 Span::styled(path, Style::default().fg(Color::DarkGray)),
             ]);
@@ -252,7 +282,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
             app.items.get(*i).map(|w| w.name()).unwrap_or_default()
         ),
         Mode::Message { text, error } => {
-            if *error { format!(" ! {} (any key) ", text) } else { format!(" {} ", text) }
+            if *error {
+                format!(" ! {} (any key) ", text)
+            } else {
+                format!(" {} ", text)
+            }
         }
         _ => " worktrees ".to_string(),
     };

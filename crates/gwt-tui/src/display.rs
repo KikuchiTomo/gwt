@@ -47,7 +47,11 @@ fn draw(f: &mut Frame, repo: &Repo, worktrees: &[Worktree], error: Option<&str>)
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let header = Paragraph::new(vec![
@@ -68,7 +72,11 @@ fn draw(f: &mut Frame, repo: &Repo, worktrees: &[Worktree], error: Option<&str>)
             ),
         ]),
     ])
-    .block(Block::default().borders(Borders::ALL).title(" git wt ─ display "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" git wt ─ display "),
+    );
     f.render_widget(header, chunks[0]);
 
     let rows = worktrees.iter().map(|w| {

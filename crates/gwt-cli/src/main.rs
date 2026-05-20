@@ -81,7 +81,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     let repo = Repo::discover(&cwd)?;
 
     if cli.display {
-        return run_display(&repo, Duration::from_millis(1500)).map_err(Into::into);
+        return run_display(&repo, Duration::from_millis(1500));
     }
 
     match cli.command {
@@ -93,9 +93,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         },
         Some(Cmd::List) => commands::list::run(&repo)?,
-        Some(Cmd::Add { branch, path, existing }) => {
-            commands::add::run(&repo, &branch, path.as_deref(), !existing)?
-        }
+        Some(Cmd::Add {
+            branch,
+            path,
+            existing,
+        }) => commands::add::run(&repo, &branch, path.as_deref(), !existing)?,
         Some(Cmd::Remove { path, force }) => repo.remove_worktree(&path, force)?,
         Some(Cmd::Review { remote_branch }) => commands::review::run(&repo, &remote_branch)?,
         Some(Cmd::Shellinit { .. }) => unreachable!("handled above"),

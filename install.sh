@@ -104,7 +104,12 @@ latest_tag() {
               | awk '/Location:/ {print $2}' | tail -1)
     fi
     [ -n "${url:-}" ] || err "failed to resolve latest release"
-    printf '%s\n' "${url##*/}"
+    tag="${url##*/}"
+    # When no releases exist, GitHub redirects to /releases (no tag) instead.
+    case "$tag" in
+        v[0-9]*) printf '%s\n' "$tag" ;;
+        *) err "no published releases found for $REPO" ;;
+    esac
 }
 
 prompt_yes_no() {
@@ -197,10 +202,17 @@ if [ -z "$VERSION" ]; then
 fi
 case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
 
-# Existing install detection (prompt to update unless --yes or --force).
+# Existing install detection. We only treat the on-PATH `git-wt` as ours if
+# its `--version` matches `git-wt X.Y.Z` — there are unrelated tools with the
+# same name and we must not prompt to "update" them.
 EXISTING=""
 if command -v "$BIN" >/dev/null 2>&1; then
-    EXISTING=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || true)
+    ver_line=$("$BIN" --version 2>/dev/null | head -n1 || true)
+    case "$ver_line" in
+        "git-wt "[0-9]*.[0-9]*.[0-9]*)
+            EXISTING=$(printf '%s\n' "$ver_line" | awk '{print $2}')
+            ;;
+    esac
 fi
 if [ -n "$EXISTING" ] && [ "$FORCE" -ne 1 ]; then
     target_ver="${VERSION#v}"
@@ -219,18 +231,20 @@ case "$TARGET" in
 esac
 
 ASSET="${BIN}-${VERSION}-${TARGET}.${EXT}"
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
-SUM_URL="${URL}.sha256"
+BASE="https://github.com/${REPO}/releases/download/${VERSION}"
+URL="${BASE}/${ASSET}"
+SUM_URL="${BASE}/SHA256SUMS"
 
 TMP=$(mktemp -d 2>/dev/null || mktemp -d -t gwt-install)
 trap 'rm -rf "$TMP"' EXIT
 
 info "downloading $ASSET"
 ( cd "$TMP" && $DL "$URL"     > "$ASSET" )
-( cd "$TMP" && $DL "$SUM_URL" > "$ASSET.sha256" )
+( cd "$TMP" && $DL "$SUM_URL" > "SHA256SUMS" )
 
-expected=$(awk '{print $1}' "$TMP/$ASSET.sha256")
-[ -n "$expected" ] || err "empty checksum file"
+# SHA256SUMS lines look like: `<sha>  <filename>` — match by filename.
+expected=$(awk -v f="$ASSET" '$2 == f || $2 ~ ("/"f"$") {print $1; exit}' "$TMP/SHA256SUMS")
+[ -n "$expected" ] || err "no checksum entry for $ASSET in SHA256SUMS"
 sha256_check "$TMP/$ASSET" "$expected"
 info "checksum ok"
 
