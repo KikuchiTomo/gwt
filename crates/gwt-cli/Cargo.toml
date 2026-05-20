@@ -1,0 +1,15 @@
+[package]
+name = "gwt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "git-wt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gwt-core.workspace = true
+gwt-tui.workspace = true
