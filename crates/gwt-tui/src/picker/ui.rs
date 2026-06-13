@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use gwt_core::status::WorktreeMetrics;
 use gwt_core::{BranchKind, BranchRef, Worktree, WorktreeStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -7,12 +9,25 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::state::{
-    dirty_plain, remote_plain, App, BranchPurpose, ColWidths, Mode, NameStage, H_BRANCH, H_DIRTY,
-    H_NAME, H_PATH, H_REMOTE, H_STASH,
+    dirty_plain, path_name, remote_plain, App, BranchPurpose, ColWidths, Mode, NameStage, H_BRANCH,
+    H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
 };
 
 const POINTER: &str = "▌ ";
 const PAD: &str = "  ";
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner(frame: usize) -> &'static str {
+    SPINNER[frame % SPINNER.len()]
+}
+
+/// Per-row state while a delete batch is running, for styling the list.
+#[derive(Clone, Copy)]
+enum DelMark {
+    Done,
+    Active,
+    Pending,
+}
 const C_BORDER: Color = Color::DarkGray;
 const C_TITLE: Color = Color::Magenta;
 const C_POINTER: Color = Color::Magenta;
@@ -42,7 +57,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(inner);
 
     match &app.mode {
-        Mode::List | Mode::ConfirmDelete { .. } | Mode::Message { .. } => {
+        Mode::List | Mode::ConfirmDelete { .. } | Mode::Deleting { .. } | Mode::Message { .. } => {
             let list_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -177,18 +192,20 @@ fn help_line(app: &App) -> Line<'static> {
     let s = match &app.mode {
         Mode::List => {
             if app.filter_active {
-                " type:filter  esc:exit filter  ↑↓/^p^n:nav  enter:cd "
+                " type:filter  esc:exit  ↑↓/^p^n/^j^k:nav  tab:select  enter:cd "
+            } else if !app.selected.is_empty() {
+                " tab/space:select  a:all  d:del  D:force-del  esc:clear  enter:cd "
             } else {
-                " j/k ↑↓:nav  enter:cd  d:del  D:force-del  e/n:new  E/N:new+dir  r:review  f //:filter  q:quit "
+                " j/k ↑↓ ^j^k:nav  tab:select  a:all  enter:cd  d:del  D:force-del  e/n:new  r:review  f:filter  q:quit "
             }
         }
-        Mode::ConfirmDelete { force, .. } => {
-            if *force {
-                " y: FORCE confirm   any: cancel "
-            } else {
-                " y: confirm   any: cancel "
-            }
-        }
+        Mode::ConfirmDelete { paths, force } => match (paths.len() > 1, *force) {
+            (true, true) => " y: FORCE delete ALL selected   any: cancel ",
+            (true, false) => " y: delete ALL selected   any: cancel ",
+            (false, true) => " y: FORCE confirm   any: cancel ",
+            (false, false) => " y: confirm   any: cancel ",
+        },
+        Mode::Deleting { .. } => " deleting… ",
         Mode::Branch { purpose, .. } => match purpose {
             BranchPurpose::NewBase => {
                 " type:filter  ↑↓/^p^n:nav  enter:choose base → name  esc:back "
@@ -225,34 +242,64 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
     let cap = area.height as usize;
     let (start, end) = visible_window(app.filtered_wt.len(), app.wt_cursor, cap);
     let path_budget = path_budget(area.width as usize, &app.cols);
+    // During a delete batch, rows are styled by progress rather than cursor.
+    let del = match &app.mode {
+        Mode::Deleting {
+            paths, index, frame, ..
+        } => Some((paths.as_slice(), *index, *frame)),
+        _ => None,
+    };
     let lines: Vec<Line> = (start..end)
         .map(|i| {
             let scored = &app.filtered_wt[i];
             let w = &app.worktrees[scored.idx];
             let m = app.metrics.get(scored.idx).and_then(Option::as_ref);
-            worktree_line(w, m, &app.cols, path_budget, i == app.wt_cursor)
+            let mark = del.and_then(|(paths, idx, _)| del_mark(&w.path, paths, idx));
+            let frame = del.map(|(_, _, fr)| fr).unwrap_or(0);
+            worktree_line(
+                w,
+                m,
+                &app.cols,
+                path_budget,
+                i == app.wt_cursor && del.is_none(),
+                app.is_selected(scored.idx),
+                mark,
+                frame,
+            )
         })
         .collect();
     // No wrap — overflow gets clipped, alignment stays intact.
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Where `path` sits relative to the delete cursor, or `None` if not a target.
+fn del_mark(path: &Path, paths: &[PathBuf], index: usize) -> Option<DelMark> {
+    let pos = paths.iter().position(|p| p == path)?;
+    Some(if pos < index {
+        DelMark::Done
+    } else if pos == index {
+        DelMark::Active
+    } else {
+        DelMark::Pending
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn worktree_line(
     w: &Worktree,
     m: Option<&WorktreeMetrics>,
     cols: &ColWidths,
     path_budget: usize,
-    selected: bool,
+    cursor: bool,
+    checked: bool,
+    del: Option<DelMark>,
+    frame: usize,
 ) -> Line<'static> {
     let mut spans = Vec::with_capacity(14);
-    spans.push(if selected {
-        Span::styled(
-            POINTER,
-            Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::raw(PAD)
-    });
+    // Two 1-char lead columns: cursor pointer + select/delete marker.
+    let (ptr, ptr_style, mark, mark_style) = lead_glyphs(cursor, checked, del, frame);
+    spans.push(Span::styled(ptr, ptr_style));
+    spans.push(Span::styled(mark, mark_style));
     spans.push(Span::styled(
         fit(&w.name(), cols.name),
         color_for_status(w.status),
@@ -279,11 +326,43 @@ fn worktree_line(
     spans.push(Span::raw(" "));
     let path_str = trunc_left(&w.path.display().to_string(), path_budget);
     spans.push(Span::styled(path_str, Style::default().fg(C_PATH)));
-    Line::from(spans).style(if selected {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    })
+    let line_style = match del {
+        Some(DelMark::Done) => Style::default()
+            .fg(C_DIM)
+            .add_modifier(Modifier::CROSSED_OUT),
+        Some(DelMark::Active) => Style::default().add_modifier(Modifier::BOLD),
+        Some(DelMark::Pending) => Style::default().fg(C_DIM),
+        None if cursor => Style::default().add_modifier(Modifier::BOLD),
+        None => Style::default(),
+    };
+    Line::from(spans).style(line_style)
+}
+
+/// The two leading glyphs: cursor pointer column, then a select/delete marker.
+fn lead_glyphs(
+    cursor: bool,
+    checked: bool,
+    del: Option<DelMark>,
+    frame: usize,
+) -> (&'static str, Style, &'static str, Style) {
+    if let Some(mark) = del {
+        let dim = Style::default().fg(C_DIM);
+        return match mark {
+            DelMark::Done => (" ", dim, "✓", Style::default().fg(C_CREATE)),
+            DelMark::Active => (
+                " ",
+                dim,
+                spinner(frame),
+                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+            ),
+            DelMark::Pending => (" ", dim, "·", dim),
+        };
+    }
+    let ptr = if cursor { "▌" } else { " " };
+    let ptr_style = Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD);
+    let mark = if checked { "●" } else { " " };
+    let mark_style = Style::default().fg(C_CREATE).add_modifier(Modifier::BOLD);
+    (ptr, ptr_style, mark, mark_style)
 }
 
 fn remote_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
@@ -325,18 +404,46 @@ fn color_for_status(s: WorktreeStatus) -> Style {
 
 fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
     let line = match &app.mode {
-        Mode::ConfirmDelete { path: p, force } => Line::from(vec![
-            Span::styled(
-                if *force { " FORCE delete " } else { " delete " },
-                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "'{}' ? y/N",
-                p.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            )),
-        ]),
+        Mode::ConfirmDelete { paths, force } => {
+            let target = if paths.len() == 1 {
+                format!("'{}'", path_name(&paths[0]))
+            } else {
+                format!("{} worktrees", paths.len())
+            };
+            Line::from(vec![
+                Span::styled(
+                    if *force { " FORCE delete " } else { " delete " },
+                    Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{target} ? y/N")),
+            ])
+        }
+        Mode::Deleting {
+            paths,
+            force,
+            index,
+            frame,
+            ..
+        } => {
+            let total = paths.len();
+            let done = (*index).min(total);
+            let cur = paths.get(*index).or_else(|| paths.last());
+            let name = cur.map(|p| path_name(p)).unwrap_or_default();
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", spinner(*frame)),
+                    Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if *force { "FORCE deleting " } else { "deleting " },
+                    Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{done}/{total}  ")),
+                Span::styled(name, Style::default().fg(C_DIM)),
+                Span::raw("  "),
+                Span::styled(progress_bar(done, total, 12), Style::default().fg(C_CREATE)),
+            ])
+        }
         Mode::Message { text, error } => Line::from(vec![
             Span::styled(
                 if *error { " ! " } else { " · " },
@@ -490,6 +597,21 @@ fn draw_prompt_branch(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("▏", Style::default().fg(C_POINTER)),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        (done * width) / total
+    };
+    let mut bar = String::with_capacity(width + 2);
+    bar.push('[');
+    for i in 0..width {
+        bar.push(if i < filled { '█' } else { '░' });
+    }
+    bar.push(']');
+    bar
 }
 
 fn pad(s: &str, n: usize) -> String {

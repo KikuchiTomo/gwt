@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use gwt_core::layout::BareLayout;
@@ -23,7 +23,20 @@ pub enum NameStage {
 
 pub enum Mode {
     List,
-    ConfirmDelete { path: PathBuf, force: bool },
+    ConfirmDelete {
+        paths: Vec<PathBuf>,
+        force: bool,
+    },
+    /// In-progress bulk delete: one worktree is removed every `DELETE_STEPS`
+    /// ticks while a spinner animates, so the operation reads as live progress.
+    Deleting {
+        paths: Vec<PathBuf>,
+        force: bool,
+        index: usize,
+        frame: usize,
+        step: usize,
+        errors: Vec<String>,
+    },
     Branch {
         purpose: BranchPurpose,
         all: Vec<BranchRef>,
@@ -76,6 +89,8 @@ pub struct App<'a> {
     pub filter_active: bool,
     pub filtered_wt: Vec<Scored>,
     pub wt_cursor: usize,
+    /// Multi-select set, keyed by absolute index into `worktrees`.
+    pub selected: HashSet<usize>,
 
     pub branch_filter: String,
     pub filtered_branches: Vec<Scored>,
@@ -99,6 +114,7 @@ impl<'a> App<'a> {
             filter_active: false,
             filtered_wt: Vec::new(),
             wt_cursor: 0,
+            selected: HashSet::new(),
             branch_filter: String::new(),
             filtered_branches: Vec::new(),
             branch_cursor: 0,
@@ -111,6 +127,8 @@ impl<'a> App<'a> {
         self.worktrees = self.repo.list_worktrees()?;
         self.metrics = compute_metrics(self.layout.as_ref(), &self.worktrees);
         self.cols = compute_col_widths(&self.worktrees, &self.metrics);
+        // Indices are no longer valid after the list changes shape.
+        self.selected.clear();
         self.refilter_worktrees();
         Ok(())
     }
@@ -155,6 +173,131 @@ impl<'a> App<'a> {
     pub fn selected_worktree(&self) -> Option<&Worktree> {
         let s = self.filtered_wt.get(self.wt_cursor)?;
         self.worktrees.get(s.idx)
+    }
+
+    pub fn is_selected(&self, idx: usize) -> bool {
+        self.selected.contains(&idx)
+    }
+
+    /// Toggle multi-select for the row under the cursor.
+    pub fn toggle_select_current(&mut self) {
+        if let Some(s) = self.filtered_wt.get(self.wt_cursor) {
+            let idx = s.idx;
+            if !self.selected.remove(&idx) {
+                self.selected.insert(idx);
+            }
+        }
+    }
+
+    /// Select every currently-visible row, or clear them if all are already on.
+    pub fn toggle_select_all(&mut self) {
+        let visible: Vec<usize> = self.filtered_wt.iter().map(|s| s.idx).collect();
+        let all_on = !visible.is_empty() && visible.iter().all(|i| self.selected.contains(i));
+        if all_on {
+            for i in visible {
+                self.selected.remove(&i);
+            }
+        } else {
+            for i in visible {
+                self.selected.insert(i);
+            }
+        }
+    }
+
+    /// The worktrees a delete should act on: the multi-selection if any,
+    /// otherwise just the row under the cursor.
+    pub fn delete_targets(&self) -> Vec<PathBuf> {
+        if self.selected.is_empty() {
+            return self
+                .selected_worktree()
+                .map(|w| vec![w.path.clone()])
+                .unwrap_or_default();
+        }
+        // Keep worktree order so the progress display counts up tidily.
+        self.worktrees
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.selected.contains(i))
+            .map(|(_, w)| w.path.clone())
+            .collect()
+    }
+
+    pub fn start_delete(&mut self, paths: Vec<PathBuf>, force: bool) {
+        if paths.is_empty() {
+            self.mode = Mode::List;
+            return;
+        }
+        self.mode = Mode::Deleting {
+            paths,
+            force,
+            index: 0,
+            frame: 0,
+            step: 0,
+            errors: Vec::new(),
+        };
+    }
+
+    /// Advance the delete animation by one tick. Removes the next worktree once
+    /// its warm-up frames have elapsed. Returns `true` when the batch is done.
+    pub fn tick_delete(&mut self) -> bool {
+        // The spinner advances on every tick regardless of work done.
+        if let Mode::Deleting { frame, .. } = &mut self.mode {
+            *frame = frame.wrapping_add(1);
+        }
+        let (index, len, step) = match &self.mode {
+            Mode::Deleting {
+                paths, index, step, ..
+            } => (*index, paths.len(), *step),
+            _ => return true,
+        };
+        if index >= len {
+            return self.finish_delete();
+        }
+        // Show the spinner on the target for a few frames before acting.
+        if step + 1 < DELETE_STEPS {
+            if let Mode::Deleting { step, .. } = &mut self.mode {
+                *step += 1;
+            }
+            return false;
+        }
+        let (path, force) = match &self.mode {
+            Mode::Deleting { paths, force, .. } => (paths[index].clone(), *force),
+            _ => return true,
+        };
+        let res = self.repo.remove_worktree(&path, force);
+        if let Mode::Deleting {
+            index,
+            step,
+            errors,
+            ..
+        } = &mut self.mode
+        {
+            if let Err(e) = res {
+                errors.push(format!("{}: {}", path_name(&path), e));
+            }
+            *index += 1;
+            *step = 0;
+        }
+        false
+    }
+
+    fn finish_delete(&mut self) -> bool {
+        let errors = match &self.mode {
+            Mode::Deleting { errors, .. } => errors.clone(),
+            _ => Vec::new(),
+        };
+        // refresh_worktrees also drops the now-stale selection.
+        let _ = self.refresh_worktrees();
+        if errors.is_empty() {
+            self.mode = Mode::List;
+        } else {
+            self.set_error(format!(
+                "{} delete(s) failed — {}",
+                errors.len(),
+                errors.join("; ")
+            ));
+        }
+        true
     }
 
     pub fn enter_branch_mode(&mut self, purpose: BranchPurpose) -> Result<()> {
@@ -382,6 +525,17 @@ impl<'a> App<'a> {
     pub fn set_error(&mut self, text: String) {
         self.mode = Mode::Message { text, error: true };
     }
+}
+
+/// Ticks each worktree lingers on the spinner before it is actually removed.
+/// Gives the delete a visible, animated "working…" beat even when git is fast.
+pub const DELETE_STEPS: usize = 3;
+
+/// The trailing path component (the worktree dir name), for compact display.
+pub fn path_name(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
 }
 
 pub const H_NAME: &str = "NAME";

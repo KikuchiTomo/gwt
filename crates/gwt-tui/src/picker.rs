@@ -23,6 +23,13 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
         let mut app = App::new(repo)?;
         loop {
             term.draw(|f| ui::draw(f, &mut app))?;
+            // The delete animation is self-driven, not key-driven: keep ticking
+            // (and redrawing) on a timer until the batch finishes.
+            if matches!(app.mode, Mode::Deleting { .. }) {
+                app.tick_delete();
+                std::thread::sleep(Duration::from_millis(70));
+                continue;
+            }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
@@ -45,6 +52,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             handle_confirm_delete(app, key);
             Ok(None)
         }
+        // Deletion is animated from the main loop; swallow stray keypresses.
+        Mode::Deleting { .. } => Ok(None),
         Mode::Branch { .. } => handle_branch(app, key, ctrl),
         Mode::NewName { .. } => {
             handle_new_name(app, key, ctrl);
@@ -73,6 +82,25 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
             return Ok(None);
         }
         KeyCode::Char('p') if ctrl => {
+            app.move_cursor(-1);
+            return Ok(None);
+        }
+        KeyCode::Char('j') if ctrl => {
+            app.move_cursor(1);
+            return Ok(None);
+        }
+        KeyCode::Char('k') if ctrl => {
+            app.move_cursor(-1);
+            return Ok(None);
+        }
+        // Multi-select toggle — available even while filtering (Tab isn't text).
+        KeyCode::Tab => {
+            app.toggle_select_current();
+            app.move_cursor(1);
+            return Ok(None);
+        }
+        KeyCode::BackTab => {
+            app.toggle_select_current();
             app.move_cursor(-1);
             return Ok(None);
         }
@@ -108,19 +136,33 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
 
     // NAV mode: single-letter commands.
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => return Ok(Some(PickerOutcome::Cancelled)),
+        // Esc clears the multi-selection first, then quits on a second press.
+        KeyCode::Esc => {
+            if app.selected.is_empty() {
+                return Ok(Some(PickerOutcome::Cancelled));
+            }
+            app.selected.clear();
+        }
+        KeyCode::Char('q') => return Ok(Some(PickerOutcome::Cancelled)),
         KeyCode::Char('j') => app.move_cursor(1),
         KeyCode::Char('k') => app.move_cursor(-1),
+        KeyCode::Char(' ') => {
+            app.toggle_select_current();
+            app.move_cursor(1);
+        }
+        KeyCode::Char('a') => app.toggle_select_all(),
         KeyCode::Char('g') => app.go_top(),
         KeyCode::Char('G') => app.go_bottom(),
         KeyCode::Char('d') => {
-            if let Some(wt) = app.selected_worktree() {
-                app.mode = Mode::ConfirmDelete { path: wt.path.clone(), force: false };
+            let targets = app.delete_targets();
+            if !targets.is_empty() {
+                app.mode = Mode::ConfirmDelete { paths: targets, force: false };
             }
         }
         KeyCode::Char('D') => {
-            if let Some(wt) = app.selected_worktree() {
-                app.mode = Mode::ConfirmDelete { path: wt.path.clone(), force: true };
+            let targets = app.delete_targets();
+            if !targets.is_empty() {
+                app.mode = Mode::ConfirmDelete { paths: targets, force: true };
             }
         }
         KeyCode::Char('e') | KeyCode::Char('n') => app.enter_branch_mode(BranchPurpose::NewBase)?,
@@ -137,19 +179,13 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
 }
 
 fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
-    let Mode::ConfirmDelete { path, force } = &app.mode else {
+    let Mode::ConfirmDelete { paths, force } = &app.mode else {
         return;
     };
-    let path = path.clone();
+    let paths = paths.clone();
     let force = *force;
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => match app.repo.remove_worktree(&path, force) {
-            Ok(()) => {
-                let _ = app.refresh_worktrees();
-                app.mode = Mode::List;
-            }
-            Err(e) => app.set_error(e.to_string()),
-        },
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.start_delete(paths, force),
         _ => app.mode = Mode::List,
     }
 }
@@ -169,6 +205,8 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
         KeyCode::Up => app.branch_move(-1),
         KeyCode::Char('n') if ctrl => app.branch_move(1),
         KeyCode::Char('p') if ctrl => app.branch_move(-1),
+        KeyCode::Char('j') if ctrl => app.branch_move(1),
+        KeyCode::Char('k') if ctrl => app.branch_move(-1),
         KeyCode::Enter => match app.commit_branch_selection() {
             Ok(true) => {}
             Ok(false) => app.set_error("nothing to create".into()),
