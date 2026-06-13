@@ -156,13 +156,19 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
         KeyCode::Char('d') => {
             let targets = app.delete_targets();
             if !targets.is_empty() {
-                app.mode = Mode::ConfirmDelete { paths: targets, force: false };
+                app.mode = Mode::ConfirmDelete {
+                    paths: targets,
+                    force: false,
+                };
             }
         }
         KeyCode::Char('D') => {
             let targets = app.delete_targets();
             if !targets.is_empty() {
-                app.mode = Mode::ConfirmDelete { paths: targets, force: true };
+                app.mode = Mode::ConfirmDelete {
+                    paths: targets,
+                    force: true,
+                };
             }
         }
         KeyCode::Char('e') | KeyCode::Char('n') => app.enter_branch_mode(BranchPurpose::NewBase)?,

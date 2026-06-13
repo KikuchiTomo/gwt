@@ -361,10 +361,7 @@ impl<'a> App<'a> {
         }
         // Two-step flow: first Enter advances to dir stage; default dir = branch.
         if customize && stage == NameStage::Branch {
-            if let Mode::NewName {
-                stage, dir_buf, ..
-            } = &mut self.mode
-            {
+            if let Mode::NewName { stage, dir_buf, .. } = &mut self.mode {
                 if dir_buf.is_empty() {
                     *dir_buf = branch.clone();
                 }
@@ -405,7 +402,10 @@ impl<'a> App<'a> {
 
     pub fn edit_new_name(&mut self, f: impl FnOnce(&mut String)) {
         if let Mode::NewName {
-            buf, dir_buf, stage, ..
+            buf,
+            dir_buf,
+            stage,
+            ..
         } = &mut self.mode
         {
             match stage {

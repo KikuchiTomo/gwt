@@ -245,7 +245,10 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
     // During a delete batch, rows are styled by progress rather than cursor.
     let del = match &app.mode {
         Mode::Deleting {
-            paths, index, frame, ..
+            paths,
+            index,
+            frame,
+            ..
         } => Some((paths.as_slice(), *index, *frame)),
         _ => None,
     };
@@ -435,7 +438,11 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    if *force { "FORCE deleting " } else { "deleting " },
+                    if *force {
+                        "FORCE deleting "
+                    } else {
+                        "deleting "
+                    },
                     Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("{done}/{total}  ")),
@@ -600,11 +607,8 @@ fn draw_prompt_branch(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn progress_bar(done: usize, total: usize, width: usize) -> String {
-    let filled = if total == 0 {
-        width
-    } else {
-        (done * width) / total
-    };
+    // total == 0 (empty batch) divides to None → treat as a full bar.
+    let filled = (done * width).checked_div(total).unwrap_or(width);
     let mut bar = String::with_capacity(width + 2);
     bar.push('[');
     for i in 0..width {
