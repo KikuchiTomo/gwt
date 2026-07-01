@@ -97,6 +97,26 @@ fn main() -> ExitCode {
     }
 }
 
+/// Hand the chosen worktree path back to the shell wrapper.
+///
+/// We prefer a file channel (`GWT_CD_FILE`) over stdout so that stdout stays
+/// connected to the terminal. The inline picker's crossterm cursor-position
+/// probe (`ESC[6n`) is written to stdout; if the wrapper captured stdout via
+/// `$(...)`, that probe would go to the pipe instead of the terminal — failing
+/// (so the inline viewport falls back to the alt-screen) and leaking its escape
+/// bytes into the captured path (so the `cd` never happens). Writing the path to
+/// a file keeps stdout clean for the probe. Falls back to stdout when the env var
+/// is absent, so older shell wrappers keep working.
+fn emit_cd_target(path: &std::path::Path) -> Result<()> {
+    if let Some(file) = env::var_os("GWT_CD_FILE") {
+        std::fs::write(&file, path.to_string_lossy().as_bytes())
+            .with_context(|| format!("failed to write cd target to {}", file.to_string_lossy()))?;
+    } else {
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current dir")?;
 
@@ -119,7 +139,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         let repo = Repo::discover(&cwd)?;
         match run_picker(&repo, cli.height)? {
             PickerOutcome::Cancelled => {}
-            PickerOutcome::ChangeDir(p) => println!("{}", p.display()),
+            PickerOutcome::ChangeDir(p) => emit_cd_target(&p)?,
         }
         return Ok(());
     }
