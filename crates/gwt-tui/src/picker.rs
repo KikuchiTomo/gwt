@@ -70,6 +70,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             handle_new_name(app, key, ctrl);
             Ok(None)
         }
+        Mode::Keys { .. } => {
+            handle_keys_overlay(app, key);
+            Ok(None)
+        }
         Mode::Message { .. } => {
             app.mode = Mode::List;
             Ok(None)
@@ -193,6 +197,7 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
         KeyCode::Char('f') | KeyCode::Char('/') => {
             app.filter_active = true;
         }
+        KeyCode::Char('?') => app.mode = Mode::Keys { scroll: 0 },
         _ => {}
     }
     Ok(None)
@@ -206,6 +211,19 @@ fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
     let force = *force;
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => app.start_delete(paths, force),
+        _ => app.mode = Mode::List,
+    }
+}
+
+/// The `?` overlay is a read-only page: scroll it, or close it.
+fn handle_keys_overlay(app: &mut App, key: KeyEvent) {
+    let Mode::Keys { scroll } = &mut app.mode else {
+        return;
+    };
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+        KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
         _ => app.mode = Mode::List,
     }
 }
@@ -296,7 +314,7 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
         KeyCode::Char('k') if ctrl => app.branch_move(-1),
         KeyCode::Enter => match app.commit_branch_selection() {
             Ok(true) => {}
-            Ok(false) => app.set_error("nothing to create".into()),
+            Ok(false) => app.set_error(gwt_core::t::nothing_to_create().into()),
             Err(e) => app.set_error(e.to_string()),
         },
         KeyCode::Backspace => app.edit_branch_filter(|s| {
@@ -314,7 +332,7 @@ fn handle_new_name(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('c') if ctrl => app.mode = Mode::List,
         KeyCode::Enter => match app.commit_new_name() {
             Ok(true) => {}
-            Ok(false) => app.set_error("name is required".into()),
+            Ok(false) => app.set_error(gwt_core::t::name_required().into()),
             Err(e) => app.set_error(e.to_string()),
         },
         KeyCode::Backspace => app.edit_new_name(|s| {

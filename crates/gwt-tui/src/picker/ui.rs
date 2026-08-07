@@ -8,9 +8,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
+use gwt_core::t;
+
 use crate::theme::{
-    fit, frame, highlighted, pad, spinner, title_line as theme_title, trunc_left, visible_window,
-    C_BRANCH, C_CREATE, C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_REMOTE, C_TEXT, PAD, POINTER,
+    draw_keys, fit, frame, highlighted, pad, spinner, title_line as theme_title, trunc_left,
+    visible_window, C_BRANCH, C_CREATE, C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_REMOTE, C_TEXT,
+    PAD, POINTER,
 };
 
 use super::state::{
@@ -38,6 +41,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(inner);
 
     match &app.mode {
+        // The border already carries the close hint, so the overlay gets the
+        // whole body — one more line of keys before you have to scroll.
+        Mode::Keys { scroll } => draw_keys(f, inner, &App::key_help(), *scroll),
         Mode::Conflict {
             title,
             reason,
@@ -131,7 +137,7 @@ fn draw_conflict(
         ];
         if destructive {
             spans.push(Span::styled(
-                "  ⚠ destructive",
+                t::destructive(),
                 Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
             ));
         }
@@ -154,10 +160,7 @@ fn draw_prompt_conflict(f: &mut Frame, area: Rect) {
             " choose ",
             Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "› press the key in brackets, or ↑↓ + enter",
-            Style::default().fg(C_DIM),
-        ),
+        Span::styled(t::choose_hint(), Style::default().fg(C_DIM)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -170,7 +173,7 @@ fn draw_confirm_action(f: &mut Frame, area: Rect, prompt: &str) {
                 Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "this cannot be undone",
+                t::cannot_be_undone(),
                 Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -204,13 +207,13 @@ fn draw_new_name(
     _stage: NameStage,
 ) {
     let hint = if customize_dir {
-        "  → enter branch name, then worktree dir name"
+        t::name_two_step_hint()
     } else {
-        "  → new branch name will also be the worktree dir name"
+        t::name_is_dir_hint()
     };
     let line = Line::from(vec![
         Span::raw(PAD),
-        Span::styled("branching from ", Style::default().fg(C_DIM)),
+        Span::styled(t::branching_from(), Style::default().fg(C_DIM)),
         Span::styled(
             base.to_string(),
             Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
@@ -283,6 +286,7 @@ fn title_line(app: &App) -> Line<'static> {
                 format!("{}/{}", app.filtered_branches.len(), all.len()),
             )
         }
+        Mode::Keys { .. } => (t::help_title().to_string(), String::new()),
         Mode::NewName { base, .. } => (format!("new · from {base}"), String::new()),
         Mode::Conflict { title, .. } => (title.clone(), "choose".into()),
         Mode::ConfirmAction { .. } => ("confirm".to_string(), "y/N".into()),
@@ -301,19 +305,20 @@ fn help_line(app: &App) -> Line<'static> {
     let s = match &app.mode {
         Mode::List => {
             if app.filter_active {
-                " type:filter  esc:exit  ↑↓/^p^n/^j^k:nav  tab:select  enter:cd "
+                t::picker_help_filter()
             } else if !app.selected.is_empty() {
-                " tab/space:select  a:all  d:del  D:force-del  esc:clear  enter:cd "
+                t::picker_help_selected()
             } else {
-                " j/k ↑↓:nav  tab:select  enter:cd  p:pull  P:push  d:del  D:force-del  e/n:new  r:review  f:filter  q:quit "
+                t::picker_help()
             }
         }
-        Mode::Conflict { .. } => " [key]:choose  ↑↓:move  enter:pick  esc:cancel ",
-        Mode::ConfirmAction { .. } => " y: yes, do it   any other key: cancel ",
-        Mode::ConfirmSync { .. } => " y: push to remote   any other key: cancel ",
+        Mode::Keys { .. } => t::help_close(),
+        Mode::Conflict { .. } => t::conflict_help(),
+        Mode::ConfirmAction { .. } => t::confirm_yn(),
+        Mode::ConfirmSync { .. } => t::push_confirm_help(),
         Mode::Syncing { op, .. } => match op {
-            SyncOp::Pull => " pulling… ",
-            SyncOp::Push => " pushing… ",
+            SyncOp::Pull => t::pulling(),
+            SyncOp::Push => t::pushing(),
         },
         Mode::ConfirmDelete { paths, force } => match (paths.len() > 1, *force) {
             (true, true) => " y: FORCE delete ALL selected   any: cancel ",
@@ -321,26 +326,22 @@ fn help_line(app: &App) -> Line<'static> {
             (false, true) => " y: FORCE confirm   any: cancel ",
             (false, false) => " y: confirm   any: cancel ",
         },
-        Mode::Deleting { .. } => " deleting… ",
+        Mode::Deleting { .. } => t::deleting(),
         Mode::Branch { purpose, .. } => match purpose {
-            BranchPurpose::NewBase => {
-                " type:filter  ↑↓/^p^n:nav  enter:choose base → name  esc:back "
-            }
-            BranchPurpose::NewBaseWithPath => {
-                " type:filter  ↑↓/^p^n:nav  enter:choose base → name → dir  esc:back "
-            }
-            BranchPurpose::Review => " type:filter  ↑↓/^p^n:nav  enter:create wt  esc:back ",
+            BranchPurpose::NewBase => t::branch_help_new(),
+            BranchPurpose::NewBaseWithPath => t::branch_help_new_dir(),
+            BranchPurpose::Review => t::branch_help_review(),
         },
         Mode::NewName {
             customize_dir,
             stage,
             ..
         } => match (*customize_dir, *stage) {
-            (true, NameStage::Branch) => " type:branch name  enter:next (dir)  esc:cancel ",
-            (true, NameStage::Dir) => " type:dir name  enter:create worktree  esc:cancel ",
-            _ => " type:name  enter:create worktree  esc:cancel ",
+            (true, NameStage::Branch) => t::name_help_branch(),
+            (true, NameStage::Dir) => t::name_help_dir(),
+            _ => t::name_help(),
         },
-        Mode::Message { .. } => " press any key ",
+        Mode::Message { .. } => t::press_any_key(),
     };
     Line::from(Span::styled(s, Style::default().fg(C_DIM)))
 }
@@ -375,11 +376,21 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
                 app.is_selected(scored.idx),
                 mark,
                 frame,
+                &scored.indices,
+                &scored.branch_indices,
             )
         })
         .collect();
     // No wrap — overflow gets clipped, alignment stays intact.
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// `highlighted` borrows its input; rows are built from temporaries, so detach.
+fn owned(spans: Vec<Span<'_>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect()
 }
 
 /// Where `path` sits relative to the delete cursor, or `None` if not a target.
@@ -404,21 +415,27 @@ fn worktree_line(
     checked: bool,
     del: Option<DelMark>,
     frame: usize,
+    name_hit: &[usize],
+    branch_hit: &[usize],
 ) -> Line<'static> {
     let mut spans = Vec::with_capacity(14);
     // Two 1-char lead columns: cursor pointer + select/delete marker.
     let (ptr, ptr_style, mark, mark_style) = lead_glyphs(cursor, checked, del, frame);
     spans.push(Span::styled(ptr, ptr_style));
     spans.push(Span::styled(mark, mark_style));
-    spans.push(Span::styled(
-        fit(&w.name(), cols.name),
-        color_for_status(w.status),
-    ));
+    // Highlight where the query actually matched, per column — that is what
+    // explains why a row survived the filter.
+    spans.extend(owned(highlighted(
+        &fit(&w.name(), cols.name),
+        name_hit,
+        color_for_status(w.status).fg.unwrap_or(C_LOCAL),
+    )));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        fit(&w.short_branch(), cols.branch),
-        Style::default().fg(C_BRANCH),
-    ));
+    spans.extend(owned(highlighted(
+        &fit(&w.short_branch(), cols.branch),
+        branch_hit,
+        C_BRANCH,
+    )));
     if cols.show_metrics() {
         spans.push(Span::raw(" "));
         let (rt, rc) = remote_cell(m);
@@ -608,7 +625,7 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
                 ])
             } else {
                 Line::from(Span::styled(
-                    " press f or / to filter ",
+                    t::filter_prompt_hint(),
                     Style::default().fg(C_DIM),
                 ))
             }

@@ -13,3 +13,4 @@ anyhow.workspace = true
 clap.workspace = true
 gwt-core.workspace = true
 gwt-tui.workspace = true
+unicode-width.workspace = true

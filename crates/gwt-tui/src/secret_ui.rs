@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gwt_core::layout::BareLayout;
-use gwt_core::ops;
 use gwt_core::secrets::{self, SecretEntry};
+use gwt_core::{ops, t};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,8 +24,8 @@ use ratatui::Frame;
 use crate::fuzzy;
 use crate::term::{enter_inline, leave_inline};
 use crate::theme::{
-    fit, frame, highlighted, spinner, title_line, trunc_left, visible_window, C_BRANCH, C_CREATE,
-    C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_TEXT, PAD, POINTER,
+    fit, frame, highlighted, spinner, title_line, trunc_left, visible_window, KeyRow, KeySection,
+    C_BRANCH, C_CREATE, C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_TEXT, PAD, POINTER,
 };
 
 /// One manifest row plus the health information the list shows.
@@ -51,9 +51,14 @@ enum Mode {
         cursor: usize,
     },
     /// Step 2 of add: type where the link lands inside each worktree.
+    /// Also reached by `e`, which re-points an existing mapping.
     TypeDest {
         src: String,
         buf: String,
+    },
+    /// The `?` overlay.
+    Keys {
+        scroll: u16,
     },
     ConfirmRemove {
         entry: SecretEntry,
@@ -211,22 +216,16 @@ impl App {
                         .filter(|(_, o)| matches!(o, secrets::LinkOutcome::Linked))
                         .count();
                     if r.src_exists {
-                        format!(
-                            "{} → (worktree)/{}  · linked into {n}",
-                            r.entry.src, r.entry.dst
-                        )
+                        t::secret_linked_into(&r.entry.src, &r.entry.dst, n)
                     } else {
-                        format!(
-                            "{} registered, but the source does not exist yet",
-                            r.entry.src
-                        )
+                        t::secret_registered_no_src(&r.entry.src)
                     }
                 })
                 .map_err(|e| e.to_string()),
             Job::Remove { src } => ops::secret_remove(&self.layout, src)
                 .map_err(|e| e.to_string())
                 .and_then(|opt| match opt {
-                    None => Err(format!("no entry for {src}")),
+                    None => Err(t::secret_no_entry(src)),
                     Some(r) => {
                         let removed = r
                             .unlinked
@@ -239,16 +238,16 @@ impl App {
                             .filter(|(_, o)| matches!(o, secrets::UnlinkOutcome::Kept { .. }))
                             .map(|(p, _)| name_of(p))
                             .collect();
-                        let mut msg = format!("removed {} · unlinked {removed}", r.entry.src);
+                        let mut msg = t::secret_removed(&r.entry.src, removed);
                         if !kept.is_empty() {
                             // A real file where the link was is worth naming.
-                            msg.push_str(&format!("  · kept real file in {}", kept.join(", ")));
+                            msg.push_str(&t::secret_kept_real(&kept.join(", ")));
                         }
                         Ok(msg)
                     }
                 }),
             Job::Relink => ops::relink(&self.layout)
-                .map(|v| format!("relinked {} worktree(s)", v.len()))
+                .map(|v| t::relinked(v.len()))
                 .map_err(|e| e.to_string()),
         };
         let _ = self.reload();
@@ -280,10 +279,98 @@ impl App {
         out
     }
 
+    fn key_help() -> Vec<KeySection> {
+        vec![
+            KeySection {
+                title: t::help_sec_nav().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "j / k   ↑ / ↓",
+                        desc: t::k_updown().into(),
+                    },
+                    KeyRow {
+                        keys: "g / G",
+                        desc: t::k_topbottom().into(),
+                    },
+                    KeyRow {
+                        keys: "f  /",
+                        desc: t::k_filter().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_act().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "a",
+                        desc: t::k_sadd().into(),
+                    },
+                    KeyRow {
+                        keys: "e",
+                        desc: t::k_sedit().into(),
+                    },
+                    KeyRow {
+                        keys: "r",
+                        desc: t::k_srelink().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_danger().into(),
+                rows: vec![KeyRow {
+                    keys: "d",
+                    desc: t::k_sdel().into(),
+                }],
+            },
+            KeySection {
+                title: t::help_sec_other().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "?",
+                        desc: t::k_help().into(),
+                    },
+                    KeyRow {
+                        keys: "q  esc",
+                        desc: t::k_squit().into(),
+                    },
+                ],
+            },
+        ]
+    }
+
+    /// Which worktrees currently carry the selected mapping, and which don't.
+    fn detail(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let row = self.selected()?;
+        let src_abs = row.entry.src_abs(&self.layout);
+        let (mut have, mut missing) = (Vec::new(), Vec::new());
+        for wt in &self.worktrees {
+            let dst = row.entry.dst_abs(wt);
+            let linked = dst
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+                && std::fs::read_link(&dst).is_ok_and(|t| t == src_abs);
+            if linked {
+                have.push(name_of(wt));
+            } else {
+                missing.push(name_of(wt));
+            }
+        }
+        Some((have, missing))
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match &mut self.mode {
             Mode::Working { .. } => Ok(false),
+            Mode::Keys { scroll } => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                    _ => self.mode = Mode::List,
+                }
+                Ok(false)
+            }
             Mode::Message { .. } => {
                 self.mode = Mode::List;
                 Ok(false)
@@ -292,7 +379,10 @@ impl App {
                 let src = entry.src.clone();
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.start(format!("removing {src}"), Job::Remove { src });
+                        self.start(
+                            format!("{} {src}", t::label_removing()),
+                            Job::Remove { src },
+                        );
                     }
                     _ => self.mode = Mode::List,
                 }
@@ -306,11 +396,14 @@ impl App {
                         let (src, dst) = (src.clone(), buf.trim().to_string());
                         if dst.is_empty() {
                             self.mode = Mode::Message {
-                                text: "destination is required".into(),
+                                text: t::dest_required().into(),
                                 error: true,
                             };
                         } else {
-                            self.start(format!("linking {src}"), Job::Add { src, dst });
+                            self.start(
+                                format!("{} {src}", t::label_linking()),
+                                Job::Add { src, dst },
+                            );
                         }
                     }
                     KeyCode::Backspace => {
@@ -465,10 +558,7 @@ impl App {
                 let files = self.source_candidates();
                 if files.is_empty() {
                     self.mode = Mode::Message {
-                        text: format!(
-                            "no candidate files under {} (put the real file there first)",
-                            self.layout.root.display()
-                        ),
+                        text: t::no_candidates().into(),
                         error: true,
                     };
                 } else {
@@ -492,7 +582,18 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('r') => self.start("relinking".into(), Job::Relink),
+            KeyCode::Char('e') => {
+                // Re-point: same destination prompt, pre-filled with the current
+                // value, so a typo is a two-key fix rather than remove + re-add.
+                if let Some(row) = self.selected() {
+                    self.mode = Mode::TypeDest {
+                        src: row.entry.src.clone(),
+                        buf: row.entry.dst.clone(),
+                    };
+                }
+            }
+            KeyCode::Char('?') => self.mode = Mode::Keys { scroll: 0 },
+            KeyCode::Char('r') => self.start(t::label_relinking().into(), Job::Relink),
             KeyCode::Char('f') | KeyCode::Char('/') => self.filter_active = true,
             _ => {}
         }
@@ -557,10 +658,7 @@ fn draw(f: &mut Frame, app: &App) {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw(PAD),
-                    Span::styled(
-                        "pick the real file — paths are relative to ",
-                        Style::default().fg(C_DIM),
-                    ),
+                    Span::styled(t::pick_source_hint(), Style::default().fg(C_DIM)),
                     Span::styled(
                         app.layout.root.display().to_string(),
                         Style::default().fg(C_LOCAL),
@@ -569,15 +667,25 @@ fn draw(f: &mut Frame, app: &App) {
                 chunks[0],
             );
             draw_sources(f, chunks[1], files, filtered, *cursor);
-            draw_prompt(f, chunks[2], "source", filter, true);
+            draw_prompt(f, chunks[2], t::label_source(), filter, true);
         }
         Mode::TypeDest { src, buf } => {
             draw_dest_help(f, chunks[0], chunks[1], src, &app.layout.root);
-            draw_prompt(f, chunks[2], "dest (in each worktree)", buf, true);
+            draw_prompt(f, chunks[2], t::label_dest(), buf, true);
         }
+        Mode::Keys { scroll } => crate::theme::draw_keys(f, inner, &App::key_help(), *scroll),
         _ => {
             draw_header(f, chunks[0], app);
-            draw_rows(f, chunks[1], app);
+            // A detail strip under the list turns "2/3" into the actual names.
+            let detail_h = if app.rows.is_empty() { 0 } else { 2 };
+            let body = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(detail_h)])
+                .split(chunks[1]);
+            draw_rows(f, body[0], app);
+            if detail_h > 0 {
+                draw_detail(f, body[1], app);
+            }
             draw_status(f, chunks[2], app);
         }
     }
@@ -588,12 +696,12 @@ fn title(app: &App) -> Line<'static> {
         Mode::PickSource {
             filtered, files, ..
         } => title_line(
-            "secret · pick source",
+            t::secret_title_source(),
             &format!("{}/{}", filtered.len(), files.len()),
         ),
-        Mode::TypeDest { .. } => title_line("secret · destination", "in every worktree"),
+        Mode::TypeDest { .. } => title_line(t::secret_title_dest(), t::secret_dest_sub()),
         _ => title_line(
-            "git wt secret",
+            t::secret_title(),
             &format!("{}/{}", app.filtered.len(), app.rows.len()),
         ),
     }
@@ -601,13 +709,14 @@ fn title(app: &App) -> Line<'static> {
 
 fn help(app: &App) -> Line<'static> {
     let s = match &app.mode {
-        Mode::List if app.filter_active => " type:filter  esc:clear  ↑↓:nav  enter:done ",
-        Mode::List => " j/k ↑↓:nav  a:add  d:remove  r:relink  f:filter  q:quit ",
-        Mode::PickSource { .. } => " type:filter  ↑↓/^p^n:nav  enter:choose file  esc:back ",
-        Mode::TypeDest { .. } => " type:path inside each worktree  enter:link now  esc:cancel ",
-        Mode::ConfirmRemove { .. } => " y: remove mapping + its links   any other key: cancel ",
-        Mode::Working { .. } => " working… ",
-        Mode::Message { .. } => " press any key ",
+        Mode::List if app.filter_active => t::secret_help_filter(),
+        Mode::List => t::secret_help(),
+        Mode::PickSource { .. } => t::secret_help_source(),
+        Mode::TypeDest { .. } => t::secret_help_dest(),
+        Mode::ConfirmRemove { .. } => t::secret_help_remove(),
+        Mode::Working { .. } => t::working(),
+        Mode::Keys { .. } => t::help_close(),
+        Mode::Message { .. } => t::press_any_key(),
     };
     Line::from(Span::styled(s, Style::default().fg(C_DIM)))
 }
@@ -639,13 +748,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let spans = vec![
         Span::raw(PAD),
-        Span::styled(fit("SOURCE (<repo-root>/…)", sw), style),
+        Span::styled(fit(t::col_source(), sw), style),
         Span::raw(" "),
-        Span::styled(fit("DEST (<worktree>/…)", dw), style),
+        Span::styled(fit(t::col_dest(), dw), style),
         Span::raw(" "),
-        Span::styled(fit("SOURCE", 8), style),
+        Span::styled(fit(t::col_state(), 8), style),
         Span::raw(" "),
-        Span::styled("LINKED", style),
+        Span::styled(t::col_linked(), style),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -656,19 +765,16 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::raw("")),
             Line::from(vec![
                 Span::raw(PAD),
-                Span::styled("no secret mappings yet.", Style::default().fg(C_DIM)),
+                Span::styled(t::empty_title(), Style::default().fg(C_DIM)),
             ]),
             Line::from(vec![
                 Span::raw(PAD),
-                Span::styled("press ", Style::default().fg(C_DIM)),
+                Span::styled(t::empty_hint_pre(), Style::default().fg(C_DIM)),
                 Span::styled(
                     "a",
                     Style::default().fg(C_CREATE).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    " to pick a file and link it into every worktree.",
-                    Style::default().fg(C_DIM),
-                ),
+                Span::styled(t::empty_hint_post(), Style::default().fg(C_DIM)),
             ]),
         ];
         f.render_widget(Paragraph::new(lines), area);
@@ -683,9 +789,9 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
             let r = &app.rows[s.idx];
             let cursor = i == app.cursor;
             let (state, state_color) = if r.src_exists {
-                ("ok", C_CREATE)
+                (t::state_ok(), C_CREATE)
             } else {
-                ("MISSING", C_ERR)
+                (t::state_missing(), C_ERR)
             };
             let total = app.worktrees.len();
             let link_color = if r.linked == total && total > 0 {
@@ -730,6 +836,65 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Name the worktrees behind the LINKED count, and flag anything odd about the
+/// source — a count alone doesn't tell you which worktree to go fix.
+fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(row) = app.selected() else { return };
+    let Some((have, missing)) = app.detail() else {
+        return;
+    };
+    let label = format!("{} ", t::label_source());
+    // Keep the tail: the file name is the identifying part of a long path.
+    let budget = (area.width as usize).saturating_sub(crate::theme::width(&label) + 4);
+    let mut top = vec![
+        Span::raw(PAD),
+        Span::styled(label, Style::default().fg(C_DIM)),
+        Span::styled(
+            trunc_left(
+                &row.entry.src_abs(&app.layout).display().to_string(),
+                budget,
+            ),
+            Style::default().fg(if row.src_exists { C_LOCAL } else { C_ERR }),
+        ),
+    ];
+    if !row.src_exists {
+        top.push(Span::styled(
+            format!("  ({})", t::src_missing_note()),
+            Style::default().fg(C_ERR),
+        ));
+    }
+
+    let mut bottom = vec![Span::raw(PAD)];
+    if app.worktrees.is_empty() {
+        bottom.push(Span::styled(
+            t::detail_no_worktrees(),
+            Style::default().fg(C_DIM),
+        ));
+    } else {
+        if !have.is_empty() {
+            bottom.push(Span::styled("✓ ", Style::default().fg(C_CREATE)));
+            bottom.push(Span::styled(
+                format!("{} {}", t::detail_linked_in(), have.join(", ")),
+                Style::default().fg(C_TEXT),
+            ));
+        }
+        if !missing.is_empty() {
+            if !have.is_empty() {
+                bottom.push(Span::raw("   "));
+            }
+            bottom.push(Span::styled("✗ ", Style::default().fg(C_ERR)));
+            bottom.push(Span::styled(
+                format!("{} {}", t::detail_missing_in(), missing.join(", ")),
+                Style::default().fg(C_ERR),
+            ));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(vec![Line::from(top), Line::from(bottom)]),
+        area,
+    );
+}
+
 fn draw_sources(f: &mut Frame, area: Rect, files: &[String], filtered: &[Scored], cursor: usize) {
     let cap = area.height as usize;
     let (start, end) = visible_window(filtered.len(), cursor, cap);
@@ -756,7 +921,10 @@ fn draw_dest_help(f: &mut Frame, top: Rect, body: Rect, src: &str, root: &Path) 
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(PAD),
-            Span::styled("source ", Style::default().fg(C_DIM)),
+            Span::styled(
+                format!("{} ", t::label_source()),
+                Style::default().fg(C_DIM),
+            ),
             Span::styled(
                 root.join(src).display().to_string(),
                 Style::default().fg(C_LOCAL),
@@ -768,17 +936,11 @@ fn draw_dest_help(f: &mut Frame, top: Rect, body: Rect, src: &str, root: &Path) 
         Line::from(Span::raw("")),
         Line::from(vec![
             Span::raw(PAD),
-            Span::styled(
-                "where should the link appear inside each worktree?",
-                Style::default().fg(C_BRANCH),
-            ),
+            Span::styled(t::dest_question(), Style::default().fg(C_BRANCH)),
         ]),
         Line::from(vec![
             Span::raw(PAD),
-            Span::styled(
-                "the path is relative to that worktree's root, e.g. ",
-                Style::default().fg(C_DIM),
-            ),
+            Span::styled(t::dest_relative_hint(), Style::default().fg(C_DIM)),
             Span::styled(".env", Style::default().fg(C_CREATE)),
             Span::styled(" or ", Style::default().fg(C_DIM)),
             Span::styled("config/gcp.json", Style::default().fg(C_CREATE)),
@@ -832,10 +994,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         _ if app.filter_active => {
-            return draw_prompt(f, area, "filter", &app.filter, true);
+            return draw_prompt(f, area, t::label_filter(), &app.filter, true);
         }
         _ => Line::from(vec![
-            Span::styled(" manifest ", Style::default().fg(C_DIM)),
+            Span::styled(t::label_manifest(), Style::default().fg(C_DIM)),
             Span::styled(
                 trunc_left(
                     &app.layout.manifest.display().to_string(),

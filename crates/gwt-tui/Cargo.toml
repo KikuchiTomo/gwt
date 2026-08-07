@@ -9,3 +9,4 @@ anyhow.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 gwt-core.workspace = true
+unicode-width.workspace = true

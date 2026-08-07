@@ -240,17 +240,18 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "gwt-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
  "gwt-core",
  "gwt-tui",
+ "unicode-width",
 ]
 
 [[package]]
 name = "gwt-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "thiserror",
@@ -259,12 +260,13 @@ dependencies = [
 
 [[package]]
 name = "gwt-tui"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossterm",
  "gwt-core",
  "ratatui",
+ "unicode-width",
 ]
 
 [[package]]

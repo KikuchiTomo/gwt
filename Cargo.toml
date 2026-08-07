@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -21,6 +21,7 @@ ratatui = "0.28"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 which = "6"
+unicode-width = "0.1"
 
 gwt-core = { path = "crates/gwt-core" }
 gwt-tui  = { path = "crates/gwt-tui" }

@@ -31,7 +31,7 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.5.1 --yes
+  | sh -s -- --version v0.6.0 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (gnu / musl)**, **Windows x86_64**.
@@ -88,6 +88,8 @@ Notes:
 | `git wt secret add/rm/ls`            | same thing, non-interactively                           |
 | `git wt relink`                      | re-apply secret links to every worktree                 |
 | `git wt relativize [name]`           | convert worktree gitdir pointers to relative paths      |
+| `git wt config`                      | show the resolved language and where it came from        |
+| `git wt config lang <en\|ja>`         | set the interface language                              |
 | `git wt shellinit <shell>`           | emit the shell function for `cd` integration            |
 
 ### Picker key bindings
@@ -108,8 +110,21 @@ Notes:
 | `E` / `N`               | same, but also prompts for the directory name       |
 | `r`                     | review — pick a remote branch, create a worktree    |
 | `f` / `/`               | filter                                              |
+| `?`                     | show every key binding                              |
 | `Esc`                   | clear the selection, then close                     |
 | `q`                     | close                                               |
+
+`?` opens a full key list in the current language, so nothing depends on
+remembering the one-line footer.
+
+The list hides `.bare` and the repo root — neither is somewhere you can work —
+and puts `default` first, then the rest alphabetically.
+
+The filter matches the **worktree name and the branch independently**. A
+worktree `aaaa-bbbb` holding `fix/aaaa-bbbb` is found by typing either `aaaa`
+or `fix`, and the column that matched is the one highlighted. (Matching is not
+allowed to run across the two fields, so a query that exists in neither on its
+own will not produce a phantom hit.)
 
 ### Pull and push
 
@@ -219,9 +234,15 @@ picker:
 | `a` | add a mapping — **fuzzy-pick the real file**, then type the destination |
 | `d` | remove the mapping and unlink it everywhere (asks `y/N`) |
 | `r` | relink all worktrees |
+| `e` | re-point the selected mapping to a new destination |
 | `f` / `/` | filter |
+| `?` | show every key binding |
 | `j/k ↑↓`, `g`/`G` | navigate |
 | `q` / `Esc` | quit |
+
+Under the list, a detail strip names the worktrees behind the `LINKED` count —
+`✓ linked in api, default   ✗ missing in web` — so a partial count tells you
+which worktree to go fix, and the absolute source path is shown in full.
 
 `a` never asks you to type the source: it lists the real files under the repo
 root (worktrees and `.bare` excluded) and you pick one. Then it asks for the
@@ -255,6 +276,26 @@ SOURCE (<repo-root>/…)    DEST (<worktree>/…)    SOURCE    LINKED
 secrets/.env              .env                   ok        2/2
 secrets/gcp.json          config/gcp.json        MISSING   0/2
 ```
+
+## Language
+
+The interface speaks English and Japanese (日本語).
+
+```sh
+git wt config lang ja     # persist to ~/.config/gwt/config
+git wt config             # show what is in effect, and why
+git wt --lang en list     # one-off override
+```
+
+Resolution order, most specific first:
+
+```
+--lang  >  $GWT_LANG  >  ~/.config/gwt/config  >  $LC_ALL / $LC_MESSAGES / $LANG  >  English
+```
+
+If your locale is already `ja_JP.UTF-8`, Japanese is picked up with no
+configuration at all. Column alignment is computed in terminal cells, so
+double-width text lines up with ASCII paths.
 
 ## Building from source
 

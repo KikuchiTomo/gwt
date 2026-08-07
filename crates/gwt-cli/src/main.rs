@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long, default_value_t = 15, global = true)]
     height: u16,
 
+    /// Interface language: en or ja. Overrides $GWT_LANG and the stored config.
+    #[arg(long, global = true, value_name = "CODE")]
+    lang: Option<String>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -78,6 +82,11 @@ enum Cmd {
     Relink,
     /// Convert worktree gitdir pointers to relative paths.
     Relativize { name: Option<String> },
+    /// Show or change stored settings (currently: the interface language).
+    Config {
+        #[command(subcommand)]
+        op: Option<ConfigOp>,
+    },
     /// Print the shell function that gives `git wt` real `cd` support.
     Shellinit {
         #[arg(value_parser = ["bash", "zsh", "fish"], default_value = "bash")]
@@ -120,6 +129,15 @@ Example (run from the repo root):
   git wt secret add secrets/.env .env
     -> <repo-root>/default/.env   -> <repo-root>/secrets/.env
     -> <repo-root>/feature-a/.env -> <repo-root>/secrets/.env";
+
+#[derive(Subcommand, Debug)]
+enum ConfigOp {
+    /// Set the interface language (writes ~/.config/gwt/config).
+    Lang {
+        #[arg(value_parser = ["en", "ja"])]
+        code: String,
+    },
+}
 
 /// Non-interactive answers to the conflicts the picker resolves with a menu.
 #[derive(clap::Args, Debug, Clone, Copy)]
@@ -175,6 +193,8 @@ enum SecretOp {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Fix the locale before anything can render a string.
+    gwt_core::i18n::set(gwt_core::i18n::detect(cli.lang.as_deref()));
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -207,6 +227,10 @@ fn emit_cd_target(path: &std::path::Path) -> Result<()> {
 fn dispatch(cli: Cli) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current dir")?;
 
+    // config and shellinit need no repo context.
+    if let Some(Cmd::Config { op }) = cli.command.as_ref() {
+        return commands::config::run(op.as_ref().map(|ConfigOp::Lang { code }| code.as_str()));
+    }
     // shellinit needs no repo context.
     if let Some(Cmd::Shellinit { shell }) = cli.command.as_ref() {
         commands::shellinit::print(shell);
@@ -259,7 +283,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Relink => commands::relink::run(&layout)?,
         Cmd::Relativize { name } => commands::relativize::run(&layout, name.as_deref())?,
-        Cmd::Clone { .. } | Cmd::Shellinit { .. } => unreachable!("handled above"),
+        Cmd::Clone { .. } | Cmd::Shellinit { .. } | Cmd::Config { .. } => {
+            unreachable!("handled above")
+        }
     }
     Ok(())
 }

@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use anyhow::Result;
-use gwt_core::layout::BareLayout;
+use gwt_core::layout::{BareLayout, DEFAULT_WT_NAME};
 use gwt_core::status::{self, WorktreeMetrics};
-use gwt_core::{ops, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
+use gwt_core::{ops, t, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
 
 use crate::fuzzy;
+use crate::theme::{KeyRow, KeySection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchPurpose {
@@ -116,6 +117,10 @@ pub enum Mode {
         text: String,
         error: bool,
     },
+    /// The `?` overlay. Remembers where it was opened from so `?` toggles back.
+    Keys {
+        scroll: u16,
+    },
     /// A create request hit an existing branch or path — offer ways out instead
     /// of just failing.
     Conflict {
@@ -153,7 +158,10 @@ pub enum Mode {
 pub struct Scored {
     pub idx: usize,
     pub score: i32,
+    /// Match positions inside the primary field (worktree name / branch ref).
     pub indices: Vec<usize>,
+    /// Match positions inside the branch column, when the query hit there.
+    pub branch_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,8 +202,8 @@ pub struct App<'a> {
 
 impl<'a> App<'a> {
     pub fn new(repo: &'a Repo) -> Result<Self> {
-        let worktrees = repo.list_worktrees()?;
         let layout = BareLayout::require(&repo.cwd).ok();
+        let worktrees = visible_worktrees(repo, layout.as_ref())?;
         let metrics = compute_metrics(layout.as_ref(), &worktrees);
         let cols = compute_col_widths(&worktrees, &metrics);
         let mut s = Self {
@@ -219,7 +227,7 @@ impl<'a> App<'a> {
     }
 
     pub fn refresh_worktrees(&mut self) -> Result<()> {
-        self.worktrees = self.repo.list_worktrees()?;
+        self.worktrees = visible_worktrees(self.repo, self.layout.as_ref())?;
         self.metrics = compute_metrics(self.layout.as_ref(), &self.worktrees);
         self.cols = compute_col_widths(&self.worktrees, &self.metrics);
         // Indices are no longer valid after the list changes shape.
@@ -235,17 +243,30 @@ impl<'a> App<'a> {
             .iter()
             .enumerate()
             .filter_map(|(idx, w)| {
-                let hay = format!("{} {}", w.name(), w.short_branch());
-                fuzzy::score(q, &hay).map(|m| Scored {
+                let m = score_worktree(q, &w.name(), &w.short_branch())?;
+                Some(Scored {
                     idx,
-                    score: m.score,
-                    indices: m.indices,
+                    score: m.0,
+                    indices: m.1,
+                    branch_indices: m.2,
                 })
             })
             .collect();
-        scored.sort_by_key(|s| std::cmp::Reverse(s.score));
+        // Fuzzy score wins while filtering; with no query every score is equal,
+        // so the tiebreaker is what actually orders the list: `default` first
+        // (it is the one you return to), then alphabetical.
+        scored.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| self.rank(a.idx).cmp(&self.rank(b.idx)))
+        });
         self.filtered_wt = scored;
         self.clamp_wt_cursor();
+    }
+
+    fn rank(&self, idx: usize) -> (bool, String) {
+        let name = self.worktrees[idx].name();
+        (name != DEFAULT_WT_NAME, name)
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
@@ -545,6 +566,7 @@ impl<'a> App<'a> {
                     idx,
                     score: m.score,
                     indices: m.indices,
+                    ..Default::default()
                 })
             })
             .collect();
@@ -646,6 +668,102 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Keys the picker responds to, grouped for the `?` overlay.
+    pub fn key_help() -> Vec<KeySection> {
+        use gwt_core::t;
+        vec![
+            KeySection {
+                title: t::help_sec_nav().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "j / k   ↑ / ↓",
+                        desc: t::k_updown().into(),
+                    },
+                    KeyRow {
+                        keys: "^n / ^p  ^j / ^k",
+                        desc: t::k_updown().into(),
+                    },
+                    KeyRow {
+                        keys: "g / G",
+                        desc: t::k_topbottom().into(),
+                    },
+                    KeyRow {
+                        keys: "f  /",
+                        desc: t::k_filter().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_act().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "enter",
+                        desc: t::k_enter_cd().into(),
+                    },
+                    KeyRow {
+                        keys: "tab  space",
+                        desc: t::k_select().into(),
+                    },
+                    KeyRow {
+                        keys: "a",
+                        desc: t::k_select_all().into(),
+                    },
+                    KeyRow {
+                        keys: "e / n",
+                        desc: t::k_new().into(),
+                    },
+                    KeyRow {
+                        keys: "E / N",
+                        desc: t::k_new_dir().into(),
+                    },
+                    KeyRow {
+                        keys: "r",
+                        desc: t::k_review().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_sync().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "p",
+                        desc: t::k_pull().into(),
+                    },
+                    KeyRow {
+                        keys: "P",
+                        desc: t::k_push().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_danger().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "d",
+                        desc: t::k_del().into(),
+                    },
+                    KeyRow {
+                        keys: "D",
+                        desc: t::k_force_del().into(),
+                    },
+                ],
+            },
+            KeySection {
+                title: t::help_sec_other().into(),
+                rows: vec![
+                    KeyRow {
+                        keys: "?",
+                        desc: t::k_help().into(),
+                    },
+                    KeyRow {
+                        keys: "q  esc",
+                        desc: t::k_quit().into(),
+                    },
+                ],
+            },
+        ]
+    }
+
     pub fn set_error(&mut self, text: String) {
         self.mode = Mode::Message { text, error: true };
     }
@@ -663,7 +781,7 @@ impl<'a> App<'a> {
             return;
         };
         if wt.status == WorktreeStatus::Bare {
-            self.set_error("the bare repo has no branch to sync".into());
+            self.set_error(t::no_branch_bare().into());
             return;
         }
         let path = wt.path.clone();
@@ -769,12 +887,12 @@ impl<'a> App<'a> {
         });
         choices.push(ConflictChoice {
             key: 'c',
-            label: "cancel".into(),
-            detail: "leave everything as it is".into(),
+            label: t::cancel().into(),
+            detail: t::cancel_detail().into(),
             action: ConflictAction::Cancel,
         });
         Mode::Conflict {
-            title: "worktree already exists".into(),
+            title: t::title_worktree_exists().into(),
             reason: format!("{} already exists", pending.path.display()),
             pending,
             choices,
@@ -818,8 +936,8 @@ impl<'a> App<'a> {
         }
         choices.push(ConflictChoice {
             key: 'c',
-            label: "cancel".into(),
-            detail: "leave everything as it is".into(),
+            label: t::cancel().into(),
+            detail: t::cancel_detail().into(),
             action: ConflictAction::Cancel,
         });
 
@@ -839,7 +957,7 @@ impl<'a> App<'a> {
             ),
         };
         Mode::Conflict {
-            title: "branch already exists".into(),
+            title: t::title_branch_exists().into(),
             reason,
             pending,
             choices,
@@ -971,6 +1089,45 @@ impl<'a> App<'a> {
 /// Gives the delete a visible, animated "working…" beat even when git is fast.
 pub const DELETE_STEPS: usize = 3;
 
+/// Score a worktree row against the query.
+///
+/// The directory name and the branch are scored as **separate** targets. A
+/// single concatenated haystack would let a query match across the boundary
+/// (`aaaa-bbbb` + `fix/...` matching a query that exists in neither) and would
+/// make the hit positions meaningless for per-column highlighting. Matching
+/// either field is enough to keep the row; the better score decides the order.
+///
+/// Returns `(score, name_hits, branch_hits)`.
+pub fn score_worktree(q: &str, name: &str, branch: &str) -> Option<(i32, Vec<usize>, Vec<usize>)> {
+    let n = fuzzy::score(q, name);
+    let b = fuzzy::score(q, branch);
+    if n.is_none() && b.is_none() {
+        return None;
+    }
+    let score = n
+        .as_ref()
+        .map(|m| m.score)
+        .max(b.as_ref().map(|m| m.score))
+        .unwrap_or(0);
+    Some((
+        score,
+        n.map(|m| m.indices).unwrap_or_default(),
+        b.map(|m| m.indices).unwrap_or_default(),
+    ))
+}
+
+/// The worktrees worth showing: the bare dir and the root itself are neither
+/// somewhere you can `cd` to work, nor something you can pull, push, or delete —
+/// listing them only adds a row you must skip past.
+fn visible_worktrees(repo: &Repo, layout: Option<&BareLayout>) -> Result<Vec<Worktree>> {
+    Ok(repo
+        .list_worktrees()?
+        .into_iter()
+        .filter(|w| w.status != WorktreeStatus::Bare)
+        .filter(|w| layout.is_none_or(|l| !same_path(&w.path, &l.root)))
+        .collect())
+}
+
 /// Compare two paths for "same place on disk".
 ///
 /// Git reports fully-resolved worktree paths while we build ours by joining onto
@@ -1071,4 +1228,39 @@ fn compute_metrics(
             Some(status::collect(layout, &w.path, b, &stashes))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::score_worktree;
+
+    #[test]
+    fn matches_on_worktree_name_or_branch() {
+        // The motivating case: worktree `aaaa-bbbb` holding branch `fix/aaaa-bbbb`.
+        let (_, name_hits, branch_hits) = score_worktree("fix", "aaaa-bbbb", "fix/aaaa-bbbb")
+            .expect("branch match keeps the row");
+        assert!(name_hits.is_empty(), "the name has no `fix` to highlight");
+        assert_eq!(branch_hits, vec![0, 1, 2], "highlight `fix` in the branch");
+
+        let (_, name_hits, _) =
+            score_worktree("aaaa", "aaaa-bbbb", "fix/aaaa-bbbb").expect("name match keeps the row");
+        assert_eq!(name_hits, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn does_not_match_across_the_field_boundary() {
+        // "ax" is a subsequence of "aaaa-bbbb" + "fix/..." concatenated, but of
+        // neither field on its own, so the row must be filtered out.
+        assert!(score_worktree("bx", "aaaa-bbbb", "fix/aaaa-bbbb").is_none());
+    }
+
+    #[test]
+    fn unrelated_query_drops_the_row() {
+        assert!(score_worktree("chore", "aaaa-bbbb", "fix/aaaa-bbbb").is_none());
+    }
+
+    #[test]
+    fn empty_query_keeps_everything() {
+        assert!(score_worktree("", "zzz", "feat/zzz").is_some());
+    }
 }
