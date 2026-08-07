@@ -31,7 +31,7 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.4.0 --yes
+  | sh -s -- --version v0.5.0 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (gnu / musl)**, **Windows x86_64**.
@@ -84,7 +84,8 @@ Notes:
 | `git wt review <branch>`             | fetch `origin/<branch>` and make a tracking worktree    |
 | `git wt remove <name>` / `rm`        | remove worktree `<name>` and delete its local branch    |
 | `git wt check <branch> [--fetch]`    | compare local `<branch>` against `origin/<branch>`      |
-| `git wt secret …`                    | manage files symlinked into every worktree (see below)  |
+| `git wt secret`                      | **interactive** secrets manager (see below)             |
+| `git wt secret add/rm/ls`            | same thing, non-interactively                           |
 | `git wt relink`                      | re-apply secret links to every worktree                 |
 | `git wt relativize [name]`           | convert worktree gitdir pointers to relative paths      |
 | `git wt shellinit <shell>`           | emit the shell function for `cd` integration            |
@@ -152,6 +153,37 @@ deleted, so the picker offers to take you there instead.
 Every destructive choice goes through a second `y/N` confirmation before
 anything is removed.
 
+**On the command line**, the same answers are given up front as flags on
+`add` / `new` / `review`:
+
+| flag | what it does |
+| --- | --- |
+| `--reuse` | check out the existing local branch in the new worktree |
+| `--recreate` | **delete** the existing worktree/branch and build it again from the remote (or `<base>`) |
+| `--yes` / `-y` | skip the confirmation that `--recreate` would otherwise ask for |
+
+`--recreate` prints exactly what it is about to destroy and asks before doing
+it. The prompt is read from `/dev/tty`, so it still works when stdout is being
+captured; with no terminal at all it refuses rather than guessing:
+
+```
+$ git wt new main feature wip --recreate
+about to DELETE and re-create:
+  worktree  /repo/wip
+  branch    feature (local commits not on origin are lost)
+proceed? [y/N]
+```
+
+Without a flag, the error names the ways out instead of just failing:
+
+```
+$ git wt new main feature wip
+git wt: branch 'feature' already exists
+  · --reuse      check out the existing branch in wip
+  · --recreate   delete it and re-create from origin (asks first)
+  · or run `git wt` and choose interactively
+```
+
 ## Secrets
 
 The real file lives **once** in the repo root; every worktree gets a symlink to
@@ -167,6 +199,36 @@ DEST_IN_WORKTREE  relative to EACH WORKTREE ROOT (created in every worktree)
 ├── default/.env    -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
 └── feature-a/.env  -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
 ```
+
+### The interactive manager
+
+`git wt secret` with no subcommand opens a manager built like the worktree
+picker:
+
+```
+╭ git wt secret · 2/2 ──────────────────────────────────────────────╮
+│  SOURCE (<repo-root>/…)   DEST (<worktree>/…)   SOURCE   LINKED   │
+│▌ secrets/.env             .env                  ok       2/2      │
+│  secrets/gcp.json         config/gcp.json       ok       2/2      │
+│ manifest /repo/secrets/manifest                                   │
+╰ j/k ↑↓:nav  a:add  d:remove  r:relink  f:filter  q:quit ──────────╯
+```
+
+| key | action |
+| --- | --- |
+| `a` | add a mapping — **fuzzy-pick the real file**, then type the destination |
+| `d` | remove the mapping and unlink it everywhere (asks `y/N`) |
+| `r` | relink all worktrees |
+| `f` / `/` | filter |
+| `j/k ↑↓`, `g`/`G` | navigate |
+| `q` / `Esc` | quit |
+
+`a` never asks you to type the source: it lists the real files under the repo
+root (worktrees and `.bare` excluded) and you pick one. Then it asks for the
+destination with the other root spelled out — which is the whole src/dst
+confusion, removed rather than documented.
+
+### Non-interactively
 
 ```sh
 git wt secret add secrets/.env .env

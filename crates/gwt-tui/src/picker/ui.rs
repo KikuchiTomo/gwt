@@ -5,21 +5,18 @@ use gwt_core::{BranchKind, BranchRef, Worktree, WorktreeStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
+
+use crate::theme::{
+    fit, frame, highlighted, pad, spinner, title_line as theme_title, trunc_left, visible_window,
+    C_BRANCH, C_CREATE, C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_REMOTE, C_TEXT, PAD, POINTER,
+};
 
 use super::state::{
     dirty_plain, path_name, remote_plain, App, BranchPurpose, ColWidths, ConflictAction,
     ConflictChoice, Mode, NameStage, SyncOp, H_BRANCH, H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
 };
-
-const POINTER: &str = "▌ ";
-const PAD: &str = "  ";
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner(frame: usize) -> &'static str {
-    SPINNER[frame % SPINNER.len()]
-}
 
 /// Per-row state while a delete batch is running, for styling the list.
 #[derive(Clone, Copy)]
@@ -28,26 +25,10 @@ enum DelMark {
     Active,
     Pending,
 }
-const C_BORDER: Color = Color::DarkGray;
-const C_TITLE: Color = Color::Magenta;
-const C_POINTER: Color = Color::Magenta;
-const C_MATCH: Color = Color::LightYellow;
-const C_BRANCH: Color = Color::Yellow;
-const C_LOCAL: Color = Color::Cyan;
-const C_REMOTE: Color = Color::Blue;
-const C_PATH: Color = Color::DarkGray;
-const C_DIM: Color = Color::DarkGray;
-const C_CREATE: Color = Color::Green;
-const C_ERR: Color = Color::Red;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .title(title_line(app))
-        .title_bottom(help_line(app));
+    let block = frame(title_line(app), help_line(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -313,14 +294,7 @@ fn title_line(app: &App) -> Line<'static> {
             format!("{}/{}", app.filtered_wt.len(), app.worktrees.len()),
         ),
     };
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            label,
-            Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" · {} ", detail), Style::default().fg(C_DIM)),
-    ])
+    theme_title(&label, &detail)
 }
 
 fn help_line(app: &App) -> Line<'static> {
@@ -369,15 +343,6 @@ fn help_line(app: &App) -> Line<'static> {
         Mode::Message { .. } => " press any key ",
     };
     Line::from(Span::styled(s, Style::default().fg(C_DIM)))
-}
-
-fn visible_window(len: usize, cursor: usize, capacity: usize) -> (usize, usize) {
-    if len <= capacity {
-        return (0, len);
-    }
-    let half = capacity / 2;
-    let start = cursor.saturating_sub(half).min(len - capacity);
-    (start, start + capacity)
 }
 
 fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
@@ -618,12 +583,21 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(path_name(path)),
             Span::styled(format!("  {branch}"), Style::default().fg(C_DIM)),
         ]),
+        // Result messages are the payoff of an action — render them bright, not
+        // as dimmed chrome.
         Mode::Message { text, error } => Line::from(vec![
             Span::styled(
-                if *error { " ! " } else { " · " },
-                Style::default().fg(if *error { C_ERR } else { C_DIM }),
+                if *error { " ! " } else { " ✓ " },
+                Style::default()
+                    .fg(if *error { C_ERR } else { C_CREATE })
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(text.clone()),
+            Span::styled(
+                text.clone(),
+                Style::default()
+                    .fg(if *error { C_ERR } else { C_TEXT })
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         _ => {
             if app.filter_active {
@@ -688,42 +662,6 @@ fn branch_line<'a>(b: &'a BranchRef, hit: &[usize], selected: bool) -> Line<'a> 
     })
 }
 
-fn highlighted<'a>(text: &'a str, hit: &[usize], base: Color) -> Vec<Span<'a>> {
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut in_hit = false;
-    for (i, c) in text.chars().enumerate() {
-        let now = hit.contains(&i);
-        if now != in_hit && !buf.is_empty() {
-            spans.push(Span::styled(
-                std::mem::take(&mut buf),
-                if in_hit {
-                    Style::default()
-                        .fg(C_MATCH)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    Style::default().fg(base)
-                },
-            ));
-        }
-        in_hit = now;
-        buf.push(c);
-    }
-    if !buf.is_empty() {
-        spans.push(Span::styled(
-            buf,
-            if in_hit {
-                Style::default()
-                    .fg(C_MATCH)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(base)
-            },
-        ));
-    }
-    spans
-}
-
 fn create_line(query: &str, selected: bool) -> Line<'_> {
     Line::from(vec![
         Span::styled(
@@ -783,59 +721,6 @@ fn progress_bar(done: usize, total: usize, width: usize) -> String {
     }
     bar.push(']');
     bar
-}
-
-fn pad(s: &str, n: usize) -> String {
-    let w = s.chars().count();
-    if w >= n {
-        s.to_string()
-    } else {
-        let mut out = String::with_capacity(n);
-        out.push_str(s);
-        for _ in 0..(n - w) {
-            out.push(' ');
-        }
-        out
-    }
-}
-
-/// Width-aware: truncate `s` to `n` chars with a trailing ellipsis, then right-pad.
-fn fit(s: &str, n: usize) -> String {
-    if n == 0 {
-        return String::new();
-    }
-    let w = s.chars().count();
-    if w == n {
-        return s.to_string();
-    }
-    if w < n {
-        return pad(s, n);
-    }
-    if n == 1 {
-        return "…".into();
-    }
-    let mut out: String = s.chars().take(n - 1).collect();
-    out.push('…');
-    out
-}
-
-/// Truncate from the **left**, prepending `…` when material was dropped.
-fn trunc_left(s: &str, n: usize) -> String {
-    if n == 0 {
-        return String::new();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n {
-        return s.to_string();
-    }
-    if n == 1 {
-        return "…".into();
-    }
-    let start = chars.len() - (n - 1);
-    let mut out = String::with_capacity(n);
-    out.push('…');
-    out.extend(&chars[start..]);
-    out
 }
 
 fn path_budget(area_width: usize, cols: &ColWidths) -> usize {

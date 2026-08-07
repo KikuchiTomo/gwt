@@ -35,15 +35,26 @@ enum Cmd {
     /// Clone <url> into a bare-style worktree root, then add a `default` worktree.
     Clone { url: String, dir: Option<String> },
     /// Adopt an existing branch (local or origin) as a new worktree at <name>.
-    Add { branch: String, name: String },
+    Add {
+        branch: String,
+        name: String,
+        #[command(flatten)]
+        conflict: ConflictFlags,
+    },
     /// Create a brand-new branch from <base> in worktree directory <name>.
     New {
         base: String,
         branch: String,
         name: String,
+        #[command(flatten)]
+        conflict: ConflictFlags,
     },
     /// Fetch origin/<branch> and create a tracking worktree for review.
-    Review { branch: String },
+    Review {
+        branch: String,
+        #[command(flatten)]
+        conflict: ConflictFlags,
+    },
     /// Remove worktree directory <name> and delete the local branch.
     #[command(alias = "rm")]
     Remove { name: String },
@@ -57,10 +68,11 @@ enum Cmd {
         fetch: bool,
     },
     /// Manage secret files that are symlinked into every worktree.
+    /// With no subcommand, opens the interactive manager.
     #[command(long_about = SECRET_ABOUT)]
     Secret {
         #[command(subcommand)]
-        op: SecretOp,
+        op: Option<SecretOp>,
     },
     /// Re-apply secret links to every existing worktree.
     Relink,
@@ -108,6 +120,34 @@ Example (run from the repo root):
   git wt secret add secrets/.env .env
     -> <repo-root>/default/.env   -> <repo-root>/secrets/.env
     -> <repo-root>/feature-a/.env -> <repo-root>/secrets/.env";
+
+/// Non-interactive answers to the conflicts the picker resolves with a menu.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct ConflictFlags {
+    /// If the local branch already exists, check it out in the new worktree
+    /// instead of failing.
+    #[arg(long)]
+    reuse: bool,
+
+    /// If the worktree or branch already exists, DELETE it and build it again
+    /// from the remote (or <base>). Asks for confirmation unless --yes.
+    #[arg(long)]
+    recreate: bool,
+
+    /// Skip the confirmation prompt for --recreate. Destructive.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+impl From<ConflictFlags> for commands::conflict::Resolve {
+    fn from(f: ConflictFlags) -> Self {
+        Self {
+            reuse: f.reuse,
+            recreate: f.recreate,
+            yes: f.yes,
+        }
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum SecretOp {
@@ -194,16 +234,28 @@ fn dispatch(cli: Cli) -> Result<()> {
     // Everything else requires the bare-style layout.
     let layout = BareLayout::require(&cwd)?;
     match cli.command.unwrap() {
-        Cmd::Add { branch, name } => commands::add::run(&layout, &branch, &name)?,
-        Cmd::New { base, branch, name } => commands::new::run(&layout, &base, &branch, &name)?,
-        Cmd::Review { branch } => commands::review::run(&layout, &branch)?,
+        Cmd::Add {
+            branch,
+            name,
+            conflict,
+        } => commands::add::run(&layout, &branch, &name, conflict.into())?,
+        Cmd::New {
+            base,
+            branch,
+            name,
+            conflict,
+        } => commands::new::run(&layout, &base, &branch, &name, conflict.into())?,
+        Cmd::Review { branch, conflict } => {
+            commands::review::run(&layout, &branch, conflict.into())?
+        }
         Cmd::Remove { name } => commands::remove::run(&layout, &name)?,
         Cmd::List => commands::list::run(&layout)?,
         Cmd::Check { branch, fetch } => commands::check::run(&layout, &branch, fetch)?,
         Cmd::Secret { op } => match op {
-            SecretOp::Add { src, dst } => commands::secret::add(&layout, &src, &dst)?,
-            SecretOp::Remove { src } => commands::secret::remove(&layout, &src)?,
-            SecretOp::Ls => commands::secret::ls(&layout)?,
+            None => gwt_tui::run_secrets(&layout)?,
+            Some(SecretOp::Add { src, dst }) => commands::secret::add(&layout, &src, &dst)?,
+            Some(SecretOp::Remove { src }) => commands::secret::remove(&layout, &src)?,
+            Some(SecretOp::Ls) => commands::secret::ls(&layout)?,
         },
         Cmd::Relink => commands::relink::run(&layout)?,
         Cmd::Relativize { name } => commands::relativize::run(&layout, name.as_deref())?,

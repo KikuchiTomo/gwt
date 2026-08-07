@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use anyhow::Result;
 use gwt_core::layout::BareLayout;
@@ -136,13 +137,15 @@ pub enum Mode {
         path: PathBuf,
         branch: String,
     },
-    /// pull/push in flight — animated, then replaced by a result message.
+    /// pull/push in flight on a worker thread. git talks to the network here, so
+    /// running it on the UI thread would freeze the spinner for the whole
+    /// round-trip — the result arrives over `rx` while the frame keeps ticking.
     Syncing {
         op: SyncOp,
         path: PathBuf,
         branch: String,
         frame: usize,
-        step: usize,
+        rx: Receiver<std::result::Result<String, String>>,
     },
 }
 
@@ -678,41 +681,54 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Kick off the git call on a worker thread and switch to the spinner.
     pub fn start_sync(&mut self, op: SyncOp, path: PathBuf, branch: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let work_path = path.clone();
+        std::thread::spawn(move || {
+            let res = match op {
+                SyncOp::Pull => ops::pull(&work_path),
+                SyncOp::Push => ops::push(&work_path),
+            };
+            // The error type isn't Send-friendly to keep around; a string is all
+            // the UI needs. A closed channel means the picker moved on.
+            let _ = tx.send(res.map_err(|e| e.to_string()));
+        });
         self.mode = Mode::Syncing {
             op,
             path,
             branch,
             frame: 0,
-            step: 0,
+            rx,
         };
     }
 
-    /// Advance the sync animation; runs the git call once the spinner has had a
-    /// beat. Returns `true` when the operation is finished.
+    /// Advance the spinner and pick up the worker's result if it has landed.
+    /// Returns `true` when the operation is finished.
     pub fn tick_sync(&mut self) -> bool {
-        if let Mode::Syncing { frame, .. } = &mut self.mode {
-            *frame = frame.wrapping_add(1);
-        }
-        let (op, path, branch, step) = match &self.mode {
+        let (op, path, branch, outcome) = match &mut self.mode {
             Mode::Syncing {
                 op,
                 path,
                 branch,
-                step,
-                ..
-            } => (*op, path.clone(), branch.clone(), *step),
+                frame,
+                rx,
+            } => {
+                *frame = frame.wrapping_add(1);
+                let outcome = match rx.try_recv() {
+                    Ok(res) => Some(res),
+                    Err(TryRecvError::Empty) => None,
+                    // The worker died without sending — don't spin forever.
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("sync task ended unexpectedly".to_string()))
+                    }
+                };
+                (*op, path.clone(), branch.clone(), outcome)
+            }
             _ => return true,
         };
-        if step + 1 < SYNC_STEPS {
-            if let Mode::Syncing { step, .. } = &mut self.mode {
-                *step += 1;
-            }
+        let Some(res) = outcome else {
             return false;
-        }
-        let res = match op {
-            SyncOp::Pull => ops::pull(&path),
-            SyncOp::Push => ops::push(&path),
         };
         let name = path_name(&path);
         match res {
@@ -954,10 +970,6 @@ impl<'a> App<'a> {
 /// Ticks each worktree lingers on the spinner before it is actually removed.
 /// Gives the delete a visible, animated "working…" beat even when git is fast.
 pub const DELETE_STEPS: usize = 3;
-
-/// Same idea for pull/push: show the spinner before blocking on git, so the
-/// operation never looks like a frozen UI.
-pub const SYNC_STEPS: usize = 2;
 
 /// Compare two paths for "same place on disk".
 ///

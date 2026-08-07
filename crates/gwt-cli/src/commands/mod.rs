@@ -1,6 +1,7 @@
 pub mod add;
 pub mod check;
 pub mod clone;
+pub mod conflict;
 pub mod list;
 pub mod new;
 pub mod relativize;
