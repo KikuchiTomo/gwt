@@ -31,10 +31,14 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.6.2 --yes
+  | sh -s -- --version v0.6.3 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (musl / gnu)**, **Windows x86_64**.
+
+Every release runs its Linux binaries on **Ubuntu 22.04, 24.04 and 26.04**
+before publishing — both the musl and the gnu build, and including a zsh
+startup check. A release that would not start on one of them cannot ship.
 
 On Linux the installer picks the **musl** build. It is statically linked, so it
 runs on any distro regardless of age. The `gnu` build is also published and can

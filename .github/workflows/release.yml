@@ -96,8 +96,48 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  publish:
+  # Prove the Linux artifacts actually start on the distros we claim to support,
+  # instead of trusting that the builder's glibc was old enough. This is the
+  # check that would have caught the GLIBC_2.39 breakage before it shipped.
+  linux-compat:
     needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04"]
+        target: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+
+      - name: run it
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "distro: $(cat /etc/os-release | grep PRETTY_NAME)"
+          echo "glibc:  $(ldd --version 2>&1 | head -1 || echo none)"
+          tar -C dist -xzf dist/*.tar.gz
+          bin="$(find dist -type f -name git-wt | head -1)"
+          chmod +x "$bin"
+          # --version is enough: a libc mismatch fails at exec, before main().
+          "$bin" --version
+          # The shell snippet has to survive a user who already has a `gwt`
+          # alias — that combination produced a parse error on every startup.
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq && apt-get install -y -qq zsh
+          "$bin" shellinit zsh > /snippet.zsh
+          printf 'alias gwt=OLD\nalias git=GITALIAS\neval "$(cat /snippet.zsh)"\n' > ~/.zshrc
+          out="$(zsh -i -c 'type gwt' 2>&1)"
+          echo "$out"
+          case "$out" in *"shell function"*) ;; *) echo "shellinit did not define gwt"; exit 1 ;; esac
+          echo "OK on ${{ matrix.image }} (${{ matrix.target }})"
+
+  publish:
+    needs: [build, linux-compat]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

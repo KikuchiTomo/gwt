@@ -15,7 +15,16 @@ pub fn print(shell: &str) {
     print!("{snippet}");
 }
 
-const BASH: &str = r#"gwt() {
+const BASH: &str = r#"# `gwt` and `git` are ordinary words, so either may already be an alias. In zsh
+# an existing alias turns `name() {` into "defining function based on alias" and
+# a parse error, which lands in the middle of shell startup. The `function`
+# keyword suppresses that alias expansion in both bash and zsh, and the unalias
+# stops a leftover `gwt` alias from shadowing the function once it is defined.
+# `git` is left alone: overriding someone else's git alias is not ours to do,
+# and `gwt` keeps working either way.
+unalias gwt 2>/dev/null || true
+
+function gwt {
   # Do NOT capture stdout: the picker keeps it attached to the terminal for its
   # cursor probe and writes the chosen path to $GWT_CD_FILE instead.
   local __gwt_cd
@@ -31,7 +40,7 @@ const BASH: &str = r#"gwt() {
   return "$__gwt_rc"
 }
 
-git() {
+function git {
   # Only the bare `git wt` form (the picker) needs cd integration; everything
   # else — including `git wt list`, `git wt new …`, plain `git status`, etc. —
   # falls straight through to the real binary so we don't surprise users.
@@ -65,3 +74,40 @@ function git
   command git $argv
 end
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{BASH, FISH};
+
+    /// A `gwt` or `git` alias in the user's rc turns `name() {` into a parse
+    /// error in zsh ("defining function based on alias"), which lands in the
+    /// middle of shell startup. The `function` keyword is immune in both bash
+    /// and zsh, so the POSIX form must never come back.
+    #[test]
+    fn defines_functions_with_the_function_keyword() {
+        for name in ["gwt", "git"] {
+            assert!(
+                BASH.contains(&format!("function {name} {{")),
+                "{name} must be defined with the `function` keyword"
+            );
+            assert!(
+                !BASH.contains(&format!("\n{name}() {{")),
+                "{name}() {{ ... }} breaks when `{name}` is already an alias"
+            );
+        }
+    }
+
+    /// Defining the function is not enough: an alias still shadows it at call
+    /// time, so `gwt` would silently keep running the old alias.
+    #[test]
+    fn clears_a_stale_gwt_alias() {
+        assert!(BASH.contains("unalias gwt"));
+    }
+
+    #[test]
+    fn every_snippet_defines_gwt() {
+        assert!(FISH.contains("function gwt"));
+        assert!(BASH.contains("GWT_CD_FILE"));
+        assert!(FISH.contains("GWT_CD_FILE"));
+    }
+}
