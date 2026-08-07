@@ -31,7 +31,7 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.6.0 --yes
+  | sh -s -- --version v0.6.1 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (gnu / musl)**, **Windows x86_64**.

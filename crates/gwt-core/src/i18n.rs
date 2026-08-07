@@ -141,7 +141,7 @@ pub fn detect(explicit: Option<&str>) -> Lang {
 
 /// Declare a no-argument message in every supported language.
 macro_rules! msg {
-    ($($(#[$m:meta])* $name:ident => $en:expr, $ja:expr;)*) => {
+    ($group:ident { $($(#[$m:meta])* $name:ident => $en:expr, $ja:expr;)* }) => {
         $(
             $(#[$m])*
             pub fn $name() -> &'static str {
@@ -151,6 +151,10 @@ macro_rules! msg {
                 }
             }
         )*
+        /// Every entry in this group as `(name, en, ja)`, so tests can check
+        /// properties that hold across the whole catalog.
+        pub const $group: &[(&str, &str, &str)] =
+            &[$((stringify!($name), $en, $ja)),*];
     };
 }
 
@@ -166,7 +170,7 @@ pub mod t {
     //! The catalog. Keep entries grouped by the screen they belong to.
 
     // ---- shared -----------------------------------------------------------
-    msg! {
+    msg! { SHARED {
         cancel => "cancel", "キャンセル";
         cancel_detail => "leave everything as it is", "何も変更しない";
         press_any_key => " press any key ", " 任意のキーで戻る ";
@@ -178,16 +182,16 @@ pub mod t {
         choose_hint => "› press the key in brackets, or ↑↓ + enter",
                        "› [ ] 内のキー、または ↑↓ + Enter";
         help_hint => "  ?:help ", "  ?:ヘルプ ";
-    }
+    }}
 
     // ---- worktree picker --------------------------------------------------
-    msg! {
-        picker_help => " j/k ↑↓:nav  tab:select  enter:cd  p:pull  P:push  d:del  D:force-del  e/n:new  r:review  f:filter  ?:help  q:quit ",
-                       " j/k ↑↓:移動  tab:選択  enter:移動する  p:pull  P:push  d:削除  D:強制削除  e/n:新規  r:レビュー  f:絞込  ?:ヘルプ  q:終了 ";
+    msg! { PICKER {
+        picker_help => " ↑↓:nav  enter:cd  p/P:pull/push  d:del  n:new  r:review  f:filter  ?:keys  q:quit ",
+                       " ↑↓:移動  enter:移動  p/P:pull/push  d:削除  n:新規  r:レビュー  f:絞込  ?:キー  q:終了 ";
         picker_help_filter => " type:filter  esc:exit  ↑↓/^p^n/^j^k:nav  tab:select  enter:cd ",
                               " 入力:絞込  esc:解除  ↑↓/^p^n/^j^k:移動  tab:選択  enter:移動する ";
         picker_help_selected => " tab/space:select  a:all  d:del  D:force-del  esc:clear  enter:cd ",
-                                " tab/space:選択  a:全選択  d:削除  D:強制削除  esc:選択解除  enter:移動する ";
+                                " tab/space:選択  a:全選択  d:削除  D:強制削除  esc:解除  enter:移動 ";
         filter_prompt_hint => " press f or / to filter ", " f または / で絞り込み ";
         conflict_help => " [key]:choose  ↑↓:move  enter:pick  esc:cancel ",
                          " [キー]:選択  ↑↓:移動  enter:決定  esc:中止 ";
@@ -220,12 +224,12 @@ pub mod t {
                           "bare リポジトリには同期するブランチがありません";
         name_required => "name is required", "名前を入力してください";
         nothing_to_create => "nothing to create", "作成対象がありません";
-    }
+    }}
 
     // ---- secrets manager --------------------------------------------------
-    msg! {
-        secret_help => " j/k ↑↓:nav  a:add  e:re-point  d:remove  r:relink  f:filter  ?:help  q:quit ",
-                       " j/k ↑↓:移動  a:追加  e:変更  d:削除  r:再リンク  f:絞込  ?:ヘルプ  q:終了 ";
+    msg! { SECRET {
+        secret_help => " ↑↓:nav  a:add  e:re-point  d:remove  r:relink  f:filter  ?:keys  q:quit ",
+                       " ↑↓:移動  a:追加  e:変更  d:削除  r:再リンク  f:絞込  ?:キー  q:終了 ";
         secret_help_filter => " type:filter  esc:clear  ↑↓:nav  enter:done ",
                               " 入力:絞込  esc:解除  ↑↓:移動  enter:確定 ";
         secret_help_source => " type:filter  ↑↓/^p^n:nav  enter:choose file  esc:back ",
@@ -275,7 +279,7 @@ pub mod t {
                             "ソースファイルがまだ存在しません";
         src_untouched => "the source file itself is never deleted",
                          "ソースファイル自体は削除されません";
-    }
+    }}
 
     // ---- runtime-formatted messages ---------------------------------------
     use super::pick;
@@ -323,7 +327,7 @@ pub mod t {
     }
 
     // ---- help overlay -----------------------------------------------------
-    msg! {
+    msg! { HELP {
         help_title => "keys", "キー一覧";
         help_close => " ?/esc/q: close   ↑↓: scroll ", " ?/esc/q: 閉じる   ↑↓: スクロール ";
         help_sec_nav => "navigate", "移動";
@@ -356,5 +360,75 @@ pub mod t {
                   "対応付けを削除し全ワークツリーのリンクも解除";
         k_srelink => "re-apply every link", "全リンクを貼り直す";
         k_squit => "close the manager", "管理画面を閉じる";
+    }}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cols(s: &str) -> usize {
+        // Same rule the TUI uses: CJK is double-width.
+        s.chars()
+            .map(|c| {
+                let cp = c as u32;
+                let wide = (0x1100..=0x115F).contains(&cp)
+                    || (0x2E80..=0xA4CF).contains(&cp)
+                    || (0xAC00..=0xD7A3).contains(&cp)
+                    || (0xF900..=0xFAFF).contains(&cp)
+                    || (0xFF00..=0xFF60).contains(&cp)
+                    || (0xFFE0..=0xFFE6).contains(&cp);
+                if wide {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    /// Footer/help lines are rendered inside the window border. Japanese is
+    /// twice as wide per character, so a translation that reads fine in a
+    /// source file can silently run off the edge of a split pane.
+    #[test]
+    fn footer_lines_fit_a_narrow_terminal() {
+        const BUDGET: usize = 96;
+        for group in [t::SHARED, t::PICKER, t::SECRET, t::HELP] {
+            for (name, en, ja) in group {
+                // Convention: help/footer strings are padded with spaces.
+                if !(en.starts_with(' ') && en.ends_with(' ')) {
+                    continue;
+                }
+                for (lang, s) in [("en", en), ("ja", ja)] {
+                    assert!(
+                        cols(s) <= BUDGET,
+                        "{name} ({lang}) is {} columns, over the {BUDGET} budget: {s:?}",
+                        cols(s)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_entry_is_translated() {
+        for group in [t::SHARED, t::PICKER, t::SECRET, t::HELP] {
+            for (name, en, ja) in group {
+                assert!(!en.trim().is_empty(), "{name} has no English text");
+                // A handful are deliberately identical (product names, "ok").
+                let same_ok = ["secret_title", "state_ok", "empty_hint_pre"];
+                if !same_ok.contains(name) {
+                    assert_ne!(en, ja, "{name} was never translated");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parses_locale_strings() {
+        assert_eq!(Lang::parse("ja_JP.UTF-8"), Some(Lang::Ja));
+        assert_eq!(Lang::parse("en_US.UTF-8"), Some(Lang::En));
+        assert_eq!(Lang::parse("C"), Some(Lang::En));
+        assert_eq!(Lang::parse("fr_FR"), None);
     }
 }
