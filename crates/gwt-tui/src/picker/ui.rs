@@ -583,20 +583,16 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(path_name(path)),
             Span::styled(format!("  {branch}"), Style::default().fg(C_DIM)),
         ]),
-        // Result messages are the payoff of an action — render them bright, not
-        // as dimmed chrome.
+        // Result messages are meant to be read, so they get a legible color
+        // rather than the dim chrome treatment. Color only — no extra weight.
         Mode::Message { text, error } => Line::from(vec![
             Span::styled(
                 if *error { " ! " } else { " ✓ " },
-                Style::default()
-                    .fg(if *error { C_ERR } else { C_CREATE })
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(if *error { C_ERR } else { C_CREATE }),
             ),
             Span::styled(
                 text.clone(),
-                Style::default()
-                    .fg(if *error { C_ERR } else { C_TEXT })
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(if *error { C_ERR } else { C_TEXT }),
             ),
         ]),
         _ => {

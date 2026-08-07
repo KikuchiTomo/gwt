@@ -824,15 +824,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Message { text, error } => Line::from(vec![
             Span::styled(
                 if *error { " ! " } else { " ✓ " },
-                Style::default()
-                    .fg(if *error { C_ERR } else { C_CREATE })
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(if *error { C_ERR } else { C_CREATE }),
             ),
             Span::styled(
                 text.clone(),
-                Style::default()
-                    .fg(if *error { C_ERR } else { C_TEXT })
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(if *error { C_ERR } else { C_TEXT }),
             ),
         ]),
         _ if app.filter_active => {
