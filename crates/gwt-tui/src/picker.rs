@@ -9,7 +9,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gwt_core::Repo;
 
 use crate::term::{enter_inline, leave_inline};
-use state::{App, BranchPurpose, Mode};
+use state::{App, BranchPurpose, Mode, SyncOp};
 
 #[derive(Debug)]
 pub enum PickerOutcome {
@@ -23,10 +23,15 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
         let mut app = App::new(repo)?;
         loop {
             term.draw(|f| ui::draw(f, &mut app))?;
-            // The delete animation is self-driven, not key-driven: keep ticking
-            // (and redrawing) on a timer until the batch finishes.
+            // The delete/sync animations are self-driven, not key-driven: keep
+            // ticking (and redrawing) on a timer until the work finishes.
             if matches!(app.mode, Mode::Deleting { .. }) {
                 app.tick_delete();
+                std::thread::sleep(Duration::from_millis(70));
+                continue;
+            }
+            if matches!(app.mode, Mode::Syncing { .. }) {
+                app.tick_sync();
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
@@ -52,8 +57,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             handle_confirm_delete(app, key);
             Ok(None)
         }
-        // Deletion is animated from the main loop; swallow stray keypresses.
-        Mode::Deleting { .. } => Ok(None),
+        // Deletion and sync are animated from the main loop; swallow stray keys.
+        Mode::Deleting { .. } | Mode::Syncing { .. } => Ok(None),
+        Mode::ConfirmSync { .. } => {
+            handle_confirm_sync(app, key);
+            Ok(None)
+        }
+        Mode::Conflict { .. } => handle_conflict(app, key, ctrl),
+        Mode::ConfirmAction { .. } => handle_confirm_action(app, key),
         Mode::Branch { .. } => handle_branch(app, key, ctrl),
         Mode::NewName { .. } => {
             handle_new_name(app, key, ctrl);
@@ -176,6 +187,9 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
             app.enter_branch_mode(BranchPurpose::NewBaseWithPath)?
         }
         KeyCode::Char('r') => app.enter_branch_mode(BranchPurpose::Review)?,
+        // Ctrl-P is nav and was consumed above; a bare p/P is pull/push.
+        KeyCode::Char('p') => app.begin_sync(SyncOp::Pull),
+        KeyCode::Char('P') => app.begin_sync(SyncOp::Push),
         KeyCode::Char('f') | KeyCode::Char('/') => {
             app.filter_active = true;
         }
@@ -194,6 +208,73 @@ fn handle_confirm_delete(app: &mut App, key: KeyEvent) {
         KeyCode::Char('y') | KeyCode::Char('Y') => app.start_delete(paths, force),
         _ => app.mode = Mode::List,
     }
+}
+
+fn handle_confirm_sync(app: &mut App, key: KeyEvent) {
+    let Mode::ConfirmSync { op, path, branch } = &app.mode else {
+        return;
+    };
+    let (op, path, branch) = (*op, path.clone(), branch.clone());
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.start_sync(op, path, branch),
+        _ => app.mode = Mode::List,
+    }
+}
+
+fn handle_conflict(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<PickerOutcome>> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::List;
+            return Ok(None);
+        }
+        KeyCode::Char('c') if ctrl => {
+            app.mode = Mode::List;
+            return Ok(None);
+        }
+        KeyCode::Down | KeyCode::Tab => app.conflict_move(1),
+        KeyCode::Up | KeyCode::BackTab => app.conflict_move(-1),
+        KeyCode::Char('n') if ctrl => app.conflict_move(1),
+        KeyCode::Char('p') if ctrl => app.conflict_move(-1),
+        KeyCode::Char('j') if ctrl => app.conflict_move(1),
+        KeyCode::Char('k') if ctrl => app.conflict_move(-1),
+        KeyCode::Enter => return commit_conflict(app, None),
+        // Every choice also has a mnemonic key, so the menu is one keystroke.
+        KeyCode::Char(c) => return commit_conflict(app, Some(c)),
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn commit_conflict(app: &mut App, key: Option<char>) -> Result<Option<PickerOutcome>> {
+    match app.conflict_pick(key) {
+        Ok(Some(path)) => Ok(Some(PickerOutcome::ChangeDir(path))),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            app.set_error(e.to_string());
+            Ok(None)
+        }
+    }
+}
+
+fn handle_confirm_action(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
+    let Mode::ConfirmAction {
+        pending, action, ..
+    } = &app.mode
+    else {
+        return Ok(None);
+    };
+    let (pending, action) = (pending.clone(), *action);
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            match app.apply_conflict_action(&pending, action) {
+                Ok(Some(path)) => return Ok(Some(PickerOutcome::ChangeDir(path))),
+                Ok(None) => {}
+                Err(e) => app.set_error(e.to_string()),
+            }
+        }
+        _ => app.mode = Mode::List,
+    }
+    Ok(None)
 }
 
 fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<PickerOutcome>> {

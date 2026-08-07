@@ -56,7 +56,8 @@ enum Cmd {
         #[arg(long)]
         fetch: bool,
     },
-    /// Manage the secrets manifest (TSV of <src>\t<dst>).
+    /// Manage secret files that are symlinked into every worktree.
+    #[command(long_about = SECRET_ABOUT)]
     Secret {
         #[command(subcommand)]
         op: SecretOp,
@@ -72,16 +73,62 @@ enum Cmd {
     },
 }
 
+/// The two columns use different bases, and that is the whole confusion — spell
+/// it out wherever the user can see it.
+const SECRET_ABOUT: &str = "\
+Manage secret files that are symlinked into every worktree.
+
+The real file lives once in the repo root; each worktree gets a symlink to it.
+The two paths are relative to DIFFERENT places:
+
+  SOURCE            relative to the REPO ROOT      (where .git / .bare / secrets/ live)
+  DEST_IN_WORKTREE  relative to EACH WORKTREE ROOT (created in every worktree)
+
+  <repo-root>/
+  ├── secrets/.env                          <- SOURCE            = secrets/.env
+  ├── default/.env    -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
+  └── feature-a/.env  -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
+
+Example:
+  git wt secret add secrets/.env .env
+  git wt secret add secrets/gcp.json config/gcp.json
+
+`add` and `rm` take effect immediately in every existing worktree; `relink` is
+only needed after creating the source file later, or to repair links by hand.";
+
+const SECRET_ADD_ABOUT: &str = "\
+Register a secret and link it into every existing worktree right away.
+
+  SOURCE            path of the real file, relative to the REPO ROOT.
+                    An absolute path inside the root works too.
+  DEST_IN_WORKTREE  path the symlink takes inside EACH WORKTREE, relative to
+                    that worktree's root. Must be relative.
+
+Example (run from the repo root):
+  git wt secret add secrets/.env .env
+    -> <repo-root>/default/.env   -> <repo-root>/secrets/.env
+    -> <repo-root>/feature-a/.env -> <repo-root>/secrets/.env";
+
 #[derive(Subcommand, Debug)]
 enum SecretOp {
+    /// Register a secret and link it into every worktree now.
+    #[command(long_about = SECRET_ADD_ABOUT)]
     Add {
+        /// Real file, relative to the REPO ROOT (e.g. secrets/.env).
+        #[arg(value_name = "SOURCE")]
         src: String,
+        /// Where the link appears in EACH WORKTREE, relative to its root (e.g. .env).
+        #[arg(value_name = "DEST_IN_WORKTREE")]
         dst: String,
     },
+    /// Unregister a secret and remove its link from every worktree now.
     #[command(alias = "rm")]
     Remove {
+        /// Source path as shown in the SOURCE column of `git wt secret ls`.
+        #[arg(value_name = "SOURCE")]
         src: String,
     },
+    /// Show every mapping with both bases spelled out, plus link health.
     #[command(alias = "list")]
     Ls,
 }

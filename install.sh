@@ -9,7 +9,16 @@ BIN="git-wt"
 DEFAULT_PREFIX="${HOME}/.local/bin"
 
 VERSION=""
-PREFIX="${PREFIX:-$DEFAULT_PREFIX}"
+# GWT_PREFIX is the specific knob; a bare PREFIX is honored for compatibility but
+# it's a common ambient variable, so we say out loud when it's what we picked up.
+PREFIX_SRC="default"
+if [ -n "${GWT_PREFIX:-}" ]; then
+    PREFIX="$GWT_PREFIX"; PREFIX_SRC="\$GWT_PREFIX"
+elif [ -n "${PREFIX:-}" ]; then
+    PREFIX="$PREFIX"; PREFIX_SRC="\$PREFIX (inherited from your environment)"
+else
+    PREFIX="$DEFAULT_PREFIX"
+fi
 ASSUME_YES=0
 FORCE=0
 NO_SETUP=0
@@ -33,7 +42,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
-        --prefix)  PREFIX="$2";  shift 2 ;;
+        --prefix)  PREFIX="$2";  PREFIX_SRC="--prefix"; shift 2 ;;
         --yes|-y)  ASSUME_YES=1; shift ;;
         --force)   FORCE=1;      shift ;;
         --no-setup) NO_SETUP=1;  shift ;;
@@ -134,8 +143,12 @@ rc_path_for() {
         zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
         fish) echo "$HOME/.config/fish/config.fish" ;;
         bash)
-            # macOS bash uses .bash_profile, Linux conventionally .bashrc.
-            if [ "$(uname -s)" = "Darwin" ] && [ -f "$HOME/.bash_profile" ]; then
+            # On macOS every Terminal window is a LOGIN shell, and login bash reads
+            # .bash_profile — never .bashrc. Writing to .bashrc there means the
+            # block silently never runs, which looks exactly like "git-wt: command
+            # not found". So on Darwin always target .bash_profile, creating it if
+            # needed. Linux bash reads .bashrc for interactive shells.
+            if [ "$(uname -s)" = "Darwin" ]; then
                 echo "$HOME/.bash_profile"
             else
                 echo "$HOME/.bashrc"
@@ -157,17 +170,29 @@ write_setup_block() {
         !skip   { print }
     ' "$rc" > "$tmp"
 
+    # The eval is guarded on the binary actually resolving. Unguarded, a moved or
+    # removed git-wt makes EVERY new shell start with a "command not found" error
+    # — and the eval then silently produces nothing, so `gwt` is missing too.
     {
         cat "$tmp"
         printf '\n%s\n' "$MARKER"
         case "$shell" in
             fish)
-                printf 'set -gx PATH %s $PATH\n' "$PREFIX"
-                printf '%s shellinit fish | source\n' "$BIN"
+                printf 'if not contains %s $PATH\n' "$PREFIX"
+                printf '    set -gx PATH %s $PATH\n' "$PREFIX"
+                printf 'end\n'
+                printf 'if type -q %s\n' "$BIN"
+                printf '    %s shellinit fish | source\n' "$BIN"
+                printf 'end\n'
                 ;;
             *)
-                printf 'export PATH="%s:$PATH"\n' "$PREFIX"
-                printf 'eval "$(%s shellinit %s)"\n' "$BIN" "$shell"
+                printf 'case ":$PATH:" in\n'
+                printf '    *":%s:"*) ;;\n' "$PREFIX"
+                printf '    *) export PATH="%s:$PATH" ;;\n' "$PREFIX"
+                printf 'esac\n'
+                printf 'if command -v %s >/dev/null 2>&1; then\n' "$BIN"
+                printf '    eval "$(%s shellinit %s)"\n' "$BIN" "$shell"
+                printf 'fi\n'
                 ;;
         esac
         printf '%s\n' "$MARKER_END"
@@ -176,26 +201,61 @@ write_setup_block() {
     rm -f "$tmp"
 }
 
+manual_lines() {
+    case "$1" in
+        fish) info "  set -gx PATH $PREFIX \$PATH" ;
+              info "  type -q $BIN; and $BIN shellinit fish | source" ;;
+        *)    info "  export PATH=\"$PREFIX:\$PATH\"" ;
+              info "  command -v $BIN >/dev/null 2>&1 && eval \"\$($BIN shellinit $1)\"" ;;
+    esac
+}
+
 run_setup() {
-    [ "$NO_SETUP" = 1 ] && { info "skipped shell setup (--no-setup)"; return; }
+    [ "$NO_SETUP" = 1 ] && {
+        info "skipped shell setup (--no-setup) — add this to your shell rc:"
+        manual_lines "$(detect_shell)"
+        return
+    }
     shell=$(detect_shell)
     rc=$(rc_path_for "$shell")
     if ! prompt_yes_no "Set up $shell integration in $rc?"; then
         info "skipped shell setup — to enable later, add to $rc:"
-        case "$shell" in
-            fish) info "  set -gx PATH $PREFIX \$PATH" ;
-                  info "  $BIN shellinit fish | source" ;;
-            *)    info "  export PATH=\"$PREFIX:\$PATH\"" ;
-                  info "  eval \"\$($BIN shellinit $shell)\"" ;;
-        esac
+        manual_lines "$shell"
         return
     fi
     write_setup_block "$rc" "$shell"
     info "wrote setup block to $rc"
-    info "open a new shell or 'source $rc' to activate"
+    SETUP_RC="$rc"
+}
+
+# Prove the thing we just installed is actually reachable, and say exactly what
+# to do next. Guessing "it probably works" is how a broken PATH goes unnoticed.
+verify_install() {
+    if ! "$install_dst" --version >/dev/null 2>&1; then
+        err "installed binary at $install_dst does not run"
+    fi
+    printf '\n'
+    info "$BIN $VERSION is installed at $install_dst"
+
+    case ":$PATH:" in
+        *":$PREFIX:"*)
+            info "$PREFIX is already on your PATH."
+            ;;
+        *)
+            info "NOTE: $PREFIX is not on this shell's PATH yet."
+            ;;
+    esac
+
+    if [ -n "${SETUP_RC:-}" ]; then
+        info "Run this now (or just open a new terminal):"
+        printf '\n      source %s\n\n' "$SETUP_RC"
+    else
+        info "Then verify with:  $BIN --version  &&  git wt --help"
+    fi
 }
 
 TARGET=$(detect_target)
+info "install prefix: $PREFIX (from $PREFIX_SRC)"
 if [ -z "$VERSION" ]; then
     info "resolving latest release..."
     VERSION=$(latest_tag)
@@ -279,3 +339,4 @@ fi
 
 info "installed $install_dst ($VERSION)"
 run_setup
+verify_install

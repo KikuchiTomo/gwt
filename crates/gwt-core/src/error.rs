@@ -26,6 +26,9 @@ pub enum Error {
     #[error("remote branch 'origin/{0}' not found")]
     RemoteBranchMissing(String),
 
+    #[error("branch '{0}' has no upstream and there is no origin/{0} to track")]
+    NoUpstream(String),
+
     #[error("git command failed ({code}): {stderr}")]
     GitCommand { code: i32, stderr: String },
 
@@ -34,6 +37,14 @@ pub enum Error {
 
     #[error("worktree '{0}' not found")]
     WorktreeNotFound(String),
+
+    #[error("invalid secret source '{path}': {reason} (it must name a file inside the repo root)")]
+    SecretSrcInvalid { path: String, reason: &'static str },
+
+    #[error(
+        "invalid secret destination '{path}': {reason} (it is the path the link takes inside each worktree)"
+    )]
+    SecretDstInvalid { path: String, reason: &'static str },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

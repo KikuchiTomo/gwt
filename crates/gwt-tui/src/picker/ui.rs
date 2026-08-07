@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::state::{
-    dirty_plain, path_name, remote_plain, App, BranchPurpose, ColWidths, Mode, NameStage, H_BRANCH,
-    H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
+    dirty_plain, path_name, remote_plain, App, BranchPurpose, ColWidths, ConflictAction,
+    ConflictChoice, Mode, NameStage, SyncOp, H_BRANCH, H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
 };
 
 const POINTER: &str = "▌ ";
@@ -57,7 +57,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(inner);
 
     match &app.mode {
-        Mode::List | Mode::ConfirmDelete { .. } | Mode::Deleting { .. } | Mode::Message { .. } => {
+        Mode::Conflict {
+            title,
+            reason,
+            choices,
+            cursor,
+            ..
+        } => {
+            draw_conflict(f, chunks[0], title, reason, choices, *cursor);
+            draw_prompt_conflict(f, chunks[1]);
+        }
+        Mode::ConfirmAction { prompt, .. } => {
+            draw_confirm_action(f, chunks[0], prompt);
+            draw_prompt_confirm_action(f, chunks[1], prompt);
+        }
+        Mode::List
+        | Mode::ConfirmDelete { .. }
+        | Mode::Deleting { .. }
+        | Mode::Message { .. }
+        | Mode::ConfirmSync { .. }
+        | Mode::Syncing { .. } => {
             let list_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -81,6 +100,117 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_prompt_new_name(f, chunks[1], buf, dir_buf, *stage);
         }
     }
+}
+
+/// The conflict menu: why we stopped, then one line per way out. Destructive
+/// choices are colored red and marked so they can't be picked by accident.
+fn draw_conflict(
+    f: &mut Frame,
+    area: Rect,
+    _title: &str,
+    reason: &str,
+    choices: &[ConflictChoice],
+    cursor: usize,
+) {
+    let mut lines: Vec<Line> = Vec::with_capacity(choices.len() + 2);
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ! ",
+            Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(reason.to_string(), Style::default().fg(C_BRANCH)),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
+    for (i, c) in choices.iter().enumerate() {
+        let selected = i == cursor;
+        let destructive = c.action.is_destructive();
+        let label_color = match (destructive, c.action) {
+            (true, _) => C_ERR,
+            (_, ConflictAction::Cancel) => C_DIM,
+            _ => C_CREATE,
+        };
+        let mut spans = vec![
+            Span::styled(
+                if selected { POINTER } else { PAD },
+                Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{}] ", c.key),
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                c.label.clone(),
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if destructive {
+            spans.push(Span::styled(
+                "  ⚠ destructive",
+                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  — {}", c.detail),
+            Style::default().fg(C_DIM),
+        ));
+        lines.push(Line::from(spans).style(if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        }));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_prompt_conflict(f: &mut Frame, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " choose ",
+            Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "› press the key in brackets, or ↑↓ + enter",
+            Style::default().fg(C_DIM),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_confirm_action(f: &mut Frame, area: Rect, prompt: &str) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " ⚠ ",
+                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "this cannot be undone",
+                Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(prompt.to_string(), Style::default().fg(C_BRANCH)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_prompt_confirm_action(f: &mut Frame, area: Rect, prompt: &str) {
+    let line = Line::from(vec![
+        Span::styled(
+            " confirm ",
+            Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{prompt} ? y/N")),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_new_name(
@@ -173,6 +303,11 @@ fn title_line(app: &App) -> Line<'static> {
             )
         }
         Mode::NewName { base, .. } => (format!("new · from {base}"), String::new()),
+        Mode::Conflict { title, .. } => (title.clone(), "choose".into()),
+        Mode::ConfirmAction { .. } => ("confirm".to_string(), "y/N".into()),
+        Mode::ConfirmSync { op, branch, .. } | Mode::Syncing { op, branch, .. } => {
+            (op.verb().to_string(), branch.clone())
+        }
         _ => (
             "git wt".to_string(),
             format!("{}/{}", app.filtered_wt.len(), app.worktrees.len()),
@@ -196,9 +331,16 @@ fn help_line(app: &App) -> Line<'static> {
             } else if !app.selected.is_empty() {
                 " tab/space:select  a:all  d:del  D:force-del  esc:clear  enter:cd "
             } else {
-                " j/k ↑↓ ^j^k:nav  tab:select  a:all  enter:cd  d:del  D:force-del  e/n:new  r:review  f:filter  q:quit "
+                " j/k ↑↓:nav  tab:select  enter:cd  p:pull  P:push  d:del  D:force-del  e/n:new  r:review  f:filter  q:quit "
             }
         }
+        Mode::Conflict { .. } => " [key]:choose  ↑↓:move  enter:pick  esc:cancel ",
+        Mode::ConfirmAction { .. } => " y: yes, do it   any other key: cancel ",
+        Mode::ConfirmSync { .. } => " y: push to remote   any other key: cancel ",
+        Mode::Syncing { op, .. } => match op {
+            SyncOp::Pull => " pulling… ",
+            SyncOp::Push => " pushing… ",
+        },
         Mode::ConfirmDelete { paths, force } => match (paths.len() > 1, *force) {
             (true, true) => " y: FORCE delete ALL selected   any: cancel ",
             (true, false) => " y: delete ALL selected   any: cancel ",
@@ -451,6 +593,31 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(progress_bar(done, total, 12), Style::default().fg(C_CREATE)),
             ])
         }
+        Mode::ConfirmSync { op, path, branch } => Line::from(vec![
+            Span::styled(
+                format!(" {} ", op.verb()),
+                Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("'{}' ({branch}) to origin ? y/N", path_name(path))),
+        ]),
+        Mode::Syncing {
+            op,
+            path,
+            branch,
+            frame,
+            ..
+        } => Line::from(vec![
+            Span::styled(
+                format!(" {} ", spinner(*frame)),
+                Style::default().fg(C_CREATE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", op.gerund()),
+                Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(path_name(path)),
+            Span::styled(format!("  {branch}"), Style::default().fg(C_DIM)),
+        ]),
         Mode::Message { text, error } => Line::from(vec![
             Span::styled(
                 if *error { " ! " } else { " · " },

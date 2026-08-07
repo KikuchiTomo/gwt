@@ -24,54 +24,181 @@ The installer:
 2. Installs to `~/.local/bin/git-wt` (override with `--prefix`).
 3. Detects your shell and offers to add a managed block to your rc that
    wires up `PATH` and the `gwt` shell function (lets `Enter` actually `cd`).
+4. Verifies the binary runs and tells you exactly what to `source`.
 
 Re-running the installer detects an existing version and prompts to update.
 
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.1.0 --yes
+  | sh -s -- --version v0.4.0 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (gnu / musl)**, **Windows x86_64**.
 
+### After installing
+
+The rc block only takes effect in a **new** shell. In the shell you ran the
+installer from, either open a new terminal or `source` your rc — otherwise
+`git-wt` is genuinely not on `PATH` yet:
+
+```sh
+source ~/.zshrc      # or ~/.bashrc, ~/.bash_profile, ~/.config/fish/config.fish
+```
+
 ### Manual setup
 
-If you used `--no-setup`, add this to your rc by hand:
+If you used `--no-setup`, add this to your rc by hand. The `command -v` guard
+matters: without it, every new shell prints `git-wt: command not found` when the
+binary is missing or moved.
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
-eval "$(git-wt shellinit zsh)"   # or: bash / fish
+command -v git-wt >/dev/null 2>&1 && eval "$(git-wt shellinit zsh)"   # or: bash
 ```
+
+fish:
+
+```fish
+set -gx PATH $HOME/.local/bin $PATH
+type -q git-wt; and git-wt shellinit fish | source
+```
+
+Notes:
+
+- On macOS, bash reads `~/.bash_profile` (login shell), not `~/.bashrc`.
+- `PREFIX` / `GWT_PREFIX` in your environment override the install prefix. The
+  installer prints which one it used, so check that line if `git-wt` lands
+  somewhere unexpected.
 
 ## Usage
 
-| command                      | what it does                                          |
-| ---------------------------- | ----------------------------------------------------- |
-| `git wt`                     | inline picker (height ~15 lines, fzf-style)           |
-| `git wt --display`           | fullscreen live dashboard, auto-refresh               |
-| `git wt list`                | tab-separated plain list (for scripts)                |
-| `git wt add <branch>`        | create a worktree at `<repo-root>/<branch>`           |
-| `git wt remove <path>`       | remove a worktree                                     |
-| `git wt review <origin/br>`  | create a tracking worktree for code review            |
-| `git wt shellinit <shell>`   | emit shell function for `cd` integration              |
+| command                              | what it does                                            |
+| ------------------------------------ | ------------------------------------------------------- |
+| `git wt`                             | inline picker (height ~15 lines, fzf-style)             |
+| `git wt --display`                   | fullscreen live dashboard, auto-refresh                 |
+| `git wt clone <url> [dir]`           | clone into a bare-style root + a `default` worktree     |
+| `git wt list` / `ls`                 | rich table: branch, ahead/behind, dirty, stash          |
+| `git wt add <branch> <name>`         | adopt an existing branch as a worktree at `<name>`      |
+| `git wt new <base> <branch> <name>`  | create a new branch from `<base>` in worktree `<name>`  |
+| `git wt review <branch>`             | fetch `origin/<branch>` and make a tracking worktree    |
+| `git wt remove <name>` / `rm`        | remove worktree `<name>` and delete its local branch    |
+| `git wt check <branch> [--fetch]`    | compare local `<branch>` against `origin/<branch>`      |
+| `git wt secret …`                    | manage files symlinked into every worktree (see below)  |
+| `git wt relink`                      | re-apply secret links to every worktree                 |
+| `git wt relativize [name]`           | convert worktree gitdir pointers to relative paths      |
+| `git wt shellinit <shell>`           | emit the shell function for `cd` integration            |
 
 ### Picker key bindings
 
 | key                     | action                                              |
 | ----------------------- | --------------------------------------------------- |
-| `↑` / `k` / `Ctrl-P`    | move up                                             |
-| `↓` / `j` / `Ctrl-N`    | move down                                           |
+| `↑` / `k` / `Ctrl-P/K`  | move up                                             |
+| `↓` / `j` / `Ctrl-N/J`  | move down                                           |
+| `g` / `G`               | jump to top / bottom                                |
 | `Enter`                 | `cd` to the selected worktree                       |
-| `d`                     | delete (asks `y/N`)                                 |
-| `e`                     | new worktree from a branch name                     |
+| `Tab` / `Space`         | toggle multi-select                                 |
+| `a`                     | select all / clear all                              |
+| `p`                     | **pull** the selected worktree (fast-forward only)  |
+| `P`                     | **push** the selected worktree (asks first)         |
+| `d`                     | delete (asks `y/N`; acts on the multi-selection)    |
+| `D`                     | force delete (asks `y/N`)                           |
+| `e` / `n`               | new worktree: pick a base branch, then type a name  |
+| `E` / `N`               | same, but also prompts for the directory name       |
 | `r`                     | review — pick a remote branch, create a worktree    |
-| `q` / `Esc`             | close                                               |
+| `f` / `/`               | filter                                              |
+| `Esc`                   | clear the selection, then close                     |
+| `q`                     | close                                               |
+
+### Pull and push
+
+`p` runs `git pull --ff-only`. Fast-forward-only is deliberate: a merge or
+rebase could leave the worktree mid-conflict with no way to resolve it from the
+picker, so divergent history is reported as an error instead.
+
+A bare-style clone copies every origin head into `refs/heads`, so worktrees
+usually start with no upstream. The first `p` sets `origin/<branch>` as the
+upstream instead of failing with git's "no tracking information" hint.
+
+`P` publishes to the remote, so it always asks for confirmation first. A branch
+with no upstream is pushed with `-u`.
+
+### When something already exists
+
+Creating a worktree used to fail outright if the branch or the directory was
+already taken. Now the picker asks what you want to do:
+
+**The directory already exists**
+
+```
+! /repo/feat already exists
+▌ [g] go to 'feat'                      — cd into the worktree that is already there
+  [R] delete 'feat' and re-create it    ⚠ destructive — discards it, then re-pulls origin
+  [c] cancel                            — leave everything as it is
+```
+
+**The local branch already exists**
+
+```
+! local branch 'feature' already exists (origin/feature exists too)
+▌ [u] use the existing 'feature' branch      — checks it out in the new worktree
+  [R] delete 'feature' and re-pull from origin  ⚠ destructive — local-only commits are lost
+  [c] cancel
+```
+
+If the branch is checked out in another worktree it can be neither adopted nor
+deleted, so the picker offers to take you there instead.
+
+Every destructive choice goes through a second `y/N` confirmation before
+anything is removed.
+
+## Secrets
+
+The real file lives **once** in the repo root; every worktree gets a symlink to
+it. The two paths are relative to different places, which is the only fiddly
+part:
+
+```
+SOURCE            relative to the REPO ROOT      (where .git / .bare / secrets/ live)
+DEST_IN_WORKTREE  relative to EACH WORKTREE ROOT (created in every worktree)
+
+<repo-root>/
+├── secrets/.env                          <- SOURCE            = secrets/.env
+├── default/.env    -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
+└── feature-a/.env  -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
+```
+
+```sh
+git wt secret add secrets/.env .env
+git wt secret add secrets/gcp.json config/gcp.json
+git wt secret ls
+git wt secret rm secrets/.env
+```
+
+- `add` and `rm` take effect **immediately** in every existing worktree — no
+  `relink` needed. `relink` is only for repairing links, or after creating a
+  source file that didn't exist when you registered it.
+- `add` accepts an absolute path as long as it is inside the repo root, so shell
+  tab-completion works.
+- `rm` removes only symlinks that still point at that source. A real file
+  sitting at the destination is left alone and reported.
+- The source file itself is never deleted.
+
+`secret ls` shows both bases, whether the source exists, and how many worktrees
+currently carry the link:
+
+```
+SOURCE (<repo-root>/…)    DEST (<worktree>/…)    SOURCE    LINKED
+------------------------  ---------------------  --------  ------
+secrets/.env              .env                   ok        2/2
+secrets/gcp.json          config/gcp.json        MISSING   0/2
+```
 
 ## Building from source
 
 ```sh
 cargo build --release --locked --bin git-wt
+cargo test --workspace --locked
 ```
 
 ## License

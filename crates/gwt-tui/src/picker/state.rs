@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use gwt_core::layout::BareLayout;
 use gwt_core::status::{self, WorktreeMetrics};
-use gwt_core::{ops, BranchKind, BranchRef, Repo, Worktree};
+use gwt_core::{ops, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
 
 use crate::fuzzy;
 
@@ -19,6 +19,69 @@ pub enum BranchPurpose {
 pub enum NameStage {
     Branch,
     Dir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOp {
+    Pull,
+    Push,
+}
+
+impl SyncOp {
+    pub fn verb(self) -> &'static str {
+        match self {
+            SyncOp::Pull => "pull",
+            SyncOp::Push => "push",
+        }
+    }
+    pub fn gerund(self) -> &'static str {
+        match self {
+            SyncOp::Pull => "pulling",
+            SyncOp::Push => "pushing",
+        }
+    }
+}
+
+/// What the user was trying to create when a conflict interrupted them, kept
+/// whole so any resolution can pick the work back up.
+#[derive(Debug, Clone)]
+pub struct PendingCreate {
+    /// Base ref for a fresh branch; `None` when adopting `origin/<branch>`.
+    pub base: Option<String>,
+    pub branch: String,
+    pub dir: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    /// Put the existing local branch into the new worktree as-is.
+    UseExistingBranch,
+    /// Delete the local branch, re-create it from origin.
+    RecreateBranchFromRemote,
+    /// cd into whatever already occupies the path.
+    GoToWorktree,
+    /// Delete the existing worktree, build it again.
+    RecreateWorktree,
+    Cancel,
+}
+
+impl ConflictAction {
+    /// Anything that throws away commits or working-tree state must be confirmed.
+    pub fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            ConflictAction::RecreateBranchFromRemote | ConflictAction::RecreateWorktree
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictChoice {
+    pub key: char,
+    pub label: String,
+    pub detail: String,
+    pub action: ConflictAction,
 }
 
 pub enum Mode {
@@ -51,6 +114,35 @@ pub enum Mode {
     Message {
         text: String,
         error: bool,
+    },
+    /// A create request hit an existing branch or path — offer ways out instead
+    /// of just failing.
+    Conflict {
+        title: String,
+        reason: String,
+        pending: PendingCreate,
+        choices: Vec<ConflictChoice>,
+        cursor: usize,
+    },
+    /// The y/N gate in front of every destructive conflict resolution.
+    ConfirmAction {
+        pending: PendingCreate,
+        action: ConflictAction,
+        prompt: String,
+    },
+    /// The y/N gate in front of a push (it publishes to the remote).
+    ConfirmSync {
+        op: SyncOp,
+        path: PathBuf,
+        branch: String,
+    },
+    /// pull/push in flight — animated, then replaced by a result message.
+    Syncing {
+        op: SyncOp,
+        path: PathBuf,
+        branch: String,
+        frame: usize,
+        step: usize,
     },
 }
 
@@ -374,15 +466,32 @@ impl<'a> App<'a> {
         } else {
             branch.clone()
         };
+        let pending = PendingCreate {
+            base: Some(base.clone()),
+            branch: branch.clone(),
+            dir: dir.clone(),
+            path: self.root_dir().join(&dir),
+        };
+        // An existing branch or directory is a question, not a dead end.
+        if self.check_conflicts(&pending) {
+            return Ok(true);
+        }
         if let Some(layout) = &self.layout {
             ops::new(layout, &base, &branch, &dir)?;
         } else {
-            let path = self.repo.worktree_root().join(&dir);
-            self.repo.add_worktree(&path, &branch, true)?;
+            self.repo.add_worktree(&pending.path, &branch, true)?;
         }
         self.refresh_worktrees()?;
         self.mode = Mode::List;
         Ok(true)
+    }
+
+    /// Root the worktree directories hang off — the bare root when we have one.
+    pub fn root_dir(&self) -> PathBuf {
+        self.layout
+            .as_ref()
+            .map(|l| l.root.clone())
+            .unwrap_or_else(|| self.repo.worktree_root())
     }
 
     pub fn back_or_cancel_new_name(&mut self) {
@@ -509,11 +618,23 @@ impl<'a> App<'a> {
                     .strip_prefix("origin/")
                     .unwrap_or(&b.short)
                     .to_string();
+                let pending = PendingCreate {
+                    // No base ref: review adopts origin/<branch> as it stands.
+                    base: None,
+                    branch: plain.clone(),
+                    dir: plain.clone(),
+                    path: self.root_dir().join(&plain),
+                };
+                // `ops::add` already adopts an existing local branch, so only a
+                // taken path is a genuine conflict here.
+                if pending.path.exists() && self.check_conflicts(&pending) {
+                    return Ok(true);
+                }
                 if let Some(layout) = &self.layout {
                     ops::add(layout, &plain, &plain)?;
                 } else {
-                    let path = self.repo.worktree_root().join(&plain);
-                    self.repo.add_worktree_from_remote(&path, &b.short)?;
+                    self.repo
+                        .add_worktree_from_remote(&pending.path, &b.short)?;
                 }
                 self.refresh_worktrees()?;
                 self.mode = Mode::List;
@@ -525,11 +646,331 @@ impl<'a> App<'a> {
     pub fn set_error(&mut self, text: String) {
         self.mode = Mode::Message { text, error: true };
     }
+
+    pub fn set_info(&mut self, text: String) {
+        self.mode = Mode::Message { text, error: false };
+    }
+
+    // ---- pull / push -------------------------------------------------------
+
+    /// Start a sync on the worktree under the cursor. Pull is fast-forward-only
+    /// so it runs straight away; push leaves the machine and gets a confirm.
+    pub fn begin_sync(&mut self, op: SyncOp) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        if wt.status == WorktreeStatus::Bare {
+            self.set_error("the bare repo has no branch to sync".into());
+            return;
+        }
+        let path = wt.path.clone();
+        let branch = wt.short_branch();
+        if branch.starts_with('(') {
+            self.set_error(format!(
+                "{} is detached — nothing to sync",
+                path_name(&path)
+            ));
+            return;
+        }
+        match op {
+            SyncOp::Pull => self.start_sync(op, path, branch),
+            SyncOp::Push => self.mode = Mode::ConfirmSync { op, path, branch },
+        }
+    }
+
+    pub fn start_sync(&mut self, op: SyncOp, path: PathBuf, branch: String) {
+        self.mode = Mode::Syncing {
+            op,
+            path,
+            branch,
+            frame: 0,
+            step: 0,
+        };
+    }
+
+    /// Advance the sync animation; runs the git call once the spinner has had a
+    /// beat. Returns `true` when the operation is finished.
+    pub fn tick_sync(&mut self) -> bool {
+        if let Mode::Syncing { frame, .. } = &mut self.mode {
+            *frame = frame.wrapping_add(1);
+        }
+        let (op, path, branch, step) = match &self.mode {
+            Mode::Syncing {
+                op,
+                path,
+                branch,
+                step,
+                ..
+            } => (*op, path.clone(), branch.clone(), *step),
+            _ => return true,
+        };
+        if step + 1 < SYNC_STEPS {
+            if let Mode::Syncing { step, .. } = &mut self.mode {
+                *step += 1;
+            }
+            return false;
+        }
+        let res = match op {
+            SyncOp::Pull => ops::pull(&path),
+            SyncOp::Push => ops::push(&path),
+        };
+        let name = path_name(&path);
+        match res {
+            Ok(msg) => {
+                let _ = self.refresh_worktrees();
+                self.set_info(format!("{} {}: {msg}", op.verb(), name));
+            }
+            Err(e) => self.set_error(format!("{} {name} ({branch}) failed — {e}", op.verb())),
+        }
+        true
+    }
+
+    // ---- conflict resolution ----------------------------------------------
+
+    /// Build the "the path is already taken" menu.
+    fn path_conflict(&self, pending: PendingCreate) -> Mode {
+        let known_worktree = self
+            .worktrees
+            .iter()
+            .any(|w| same_path(&w.path, &pending.path));
+        let mut choices = Vec::new();
+        if known_worktree {
+            choices.push(ConflictChoice {
+                key: 'g',
+                label: format!("go to '{}'", pending.dir),
+                detail: "cd into the worktree that is already there".into(),
+                action: ConflictAction::GoToWorktree,
+            });
+        }
+        choices.push(ConflictChoice {
+            key: 'R',
+            label: format!("delete '{}' and re-create it", pending.dir),
+            detail: match &pending.base {
+                Some(base) => format!("discards it, then branches {} from {base}", pending.branch),
+                None => format!("discards it, then re-pulls origin/{}", pending.branch),
+            },
+            action: ConflictAction::RecreateWorktree,
+        });
+        choices.push(ConflictChoice {
+            key: 'c',
+            label: "cancel".into(),
+            detail: "leave everything as it is".into(),
+            action: ConflictAction::Cancel,
+        });
+        Mode::Conflict {
+            title: "worktree already exists".into(),
+            reason: format!("{} already exists", pending.path.display()),
+            pending,
+            choices,
+            cursor: 0,
+        }
+    }
+
+    /// Build the "that branch is already checked out / already exists" menu.
+    fn branch_conflict(&self, pending: PendingCreate, holder: Option<PathBuf>) -> Mode {
+        let has_remote = self
+            .layout
+            .as_ref()
+            .and_then(|l| ops::branch_exists_remote(l, &pending.branch).ok())
+            .unwrap_or(false);
+        let mut choices = Vec::new();
+
+        // A branch checked out elsewhere can be neither adopted nor deleted, so
+        // the only useful move is going to where it lives.
+        if let Some(holder) = &holder {
+            choices.push(ConflictChoice {
+                key: 'g',
+                label: format!("go to '{}'", path_name(holder)),
+                detail: "the worktree that currently has this branch".into(),
+                action: ConflictAction::GoToWorktree,
+            });
+        } else {
+            choices.push(ConflictChoice {
+                key: 'u',
+                label: format!("use the existing '{}' branch", pending.branch),
+                detail: format!("checks it out in the new worktree '{}'", pending.dir),
+                action: ConflictAction::UseExistingBranch,
+            });
+            if has_remote {
+                choices.push(ConflictChoice {
+                    key: 'R',
+                    label: format!("delete '{}' and re-pull from origin", pending.branch),
+                    detail: "local-only commits on that branch are lost".into(),
+                    action: ConflictAction::RecreateBranchFromRemote,
+                });
+            }
+        }
+        choices.push(ConflictChoice {
+            key: 'c',
+            label: "cancel".into(),
+            detail: "leave everything as it is".into(),
+            action: ConflictAction::Cancel,
+        });
+
+        let reason = match (&holder, has_remote) {
+            (Some(h), _) => format!(
+                "branch '{}' is already checked out in {}",
+                pending.branch,
+                h.display()
+            ),
+            (None, true) => format!(
+                "local branch '{}' already exists (origin/{} exists too)",
+                pending.branch, pending.branch
+            ),
+            (None, false) => format!(
+                "local branch '{}' already exists (no origin/{})",
+                pending.branch, pending.branch
+            ),
+        };
+        Mode::Conflict {
+            title: "branch already exists".into(),
+            reason,
+            pending,
+            choices,
+            cursor: 0,
+        }
+    }
+
+    /// Pre-flight a create request. Returns `true` when a conflict was found and
+    /// the app has switched into the resolution menu.
+    fn check_conflicts(&mut self, pending: &PendingCreate) -> bool {
+        // Only the bare-style layout has the machinery to resolve these; plain
+        // repos keep the old straight-to-error behavior.
+        let Some(layout) = self.layout.clone() else {
+            return false;
+        };
+        // The path check comes first: nothing can be created there either way.
+        if pending.path.exists() {
+            self.mode = self.path_conflict(pending.clone());
+            return true;
+        }
+        let exists_local = ops::branch_exists_local(&layout, &pending.branch).unwrap_or(false);
+        if exists_local {
+            let holder = ops::worktree_holding_branch(&layout, &pending.branch)
+                .ok()
+                .flatten();
+            self.mode = self.branch_conflict(pending.clone(), holder);
+            return true;
+        }
+        false
+    }
+
+    pub fn conflict_move(&mut self, delta: isize) {
+        if let Mode::Conflict {
+            choices, cursor, ..
+        } = &mut self.mode
+        {
+            if choices.is_empty() {
+                return;
+            }
+            let len = choices.len() as isize;
+            *cursor = ((*cursor as isize) + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    /// Take the choice under the cursor (or the one bound to `key`).
+    pub fn conflict_pick(&mut self, key: Option<char>) -> Result<Option<PathBuf>> {
+        let Mode::Conflict {
+            choices,
+            cursor,
+            pending,
+            ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        let choice = match key {
+            Some(k) => choices.iter().find(|c| c.key == k).cloned(),
+            None => choices.get(*cursor).cloned(),
+        };
+        let Some(choice) = choice else {
+            return Ok(None);
+        };
+        let pending = pending.clone();
+
+        if choice.action.is_destructive() {
+            self.mode = Mode::ConfirmAction {
+                prompt: choice.label.clone(),
+                pending,
+                action: choice.action,
+            };
+            return Ok(None);
+        }
+        self.apply_conflict_action(&pending, choice.action)
+    }
+
+    /// Run a resolution. Returns `Some(path)` when the picker should cd there.
+    pub fn apply_conflict_action(
+        &mut self,
+        pending: &PendingCreate,
+        action: ConflictAction,
+    ) -> Result<Option<PathBuf>> {
+        let Some(layout) = self.layout.clone() else {
+            self.mode = Mode::List;
+            return Ok(None);
+        };
+        match action {
+            ConflictAction::Cancel => {
+                self.mode = Mode::List;
+                Ok(None)
+            }
+            ConflictAction::GoToWorktree => {
+                // For a branch conflict the target is wherever the branch lives,
+                // which need not be the path the user asked for.
+                let target = ops::worktree_holding_branch(&layout, &pending.branch)
+                    .ok()
+                    .flatten()
+                    .filter(|_| !pending.path.exists())
+                    .unwrap_or_else(|| pending.path.clone());
+                Ok(Some(target))
+            }
+            ConflictAction::UseExistingBranch => {
+                ops::add_existing_branch(&layout, &pending.branch, &pending.dir)?;
+                self.refresh_worktrees()?;
+                self.mode = Mode::List;
+                Ok(None)
+            }
+            ConflictAction::RecreateBranchFromRemote => {
+                ops::recreate_branch_from_remote(&layout, &pending.branch, &pending.dir)?;
+                self.refresh_worktrees()?;
+                self.mode = Mode::List;
+                Ok(None)
+            }
+            ConflictAction::RecreateWorktree => {
+                ops::recreate_worktree(
+                    &layout,
+                    &pending.dir,
+                    &pending.branch,
+                    pending.base.as_deref(),
+                )?;
+                self.refresh_worktrees()?;
+                self.mode = Mode::List;
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Ticks each worktree lingers on the spinner before it is actually removed.
 /// Gives the delete a visible, animated "working…" beat even when git is fast.
 pub const DELETE_STEPS: usize = 3;
+
+/// Same idea for pull/push: show the spinner before blocking on git, so the
+/// operation never looks like a frozen UI.
+pub const SYNC_STEPS: usize = 2;
+
+/// Compare two paths for "same place on disk".
+///
+/// Git reports fully-resolved worktree paths while we build ours by joining onto
+/// the layout root, so a symlink anywhere above the repo (`/tmp` on macOS, a
+/// symlinked home) makes two spellings of one directory. Canonicalize when we
+/// can, fall back to a literal compare when the path doesn't exist.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
 
 /// The trailing path component (the worktree dir name), for compact display.
 pub fn path_name(p: &Path) -> String {
