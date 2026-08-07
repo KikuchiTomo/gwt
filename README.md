@@ -31,10 +31,22 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.6.1 --yes
+  | sh -s -- --version v0.6.2 --yes
 ```
 
-Supported targets: **macOS arm64**, **Linux x86_64 (gnu / musl)**, **Windows x86_64**.
+Supported targets: **macOS arm64**, **Linux x86_64 (musl / gnu)**, **Windows x86_64**.
+
+On Linux the installer picks the **musl** build. It is statically linked, so it
+runs on any distro regardless of age. The `gnu` build is also published and can
+be requested explicitly, but it inherits the glibc version of the machine that
+built it:
+
+```sh
+curl -fsSL .../install.sh | sh -s -- --target x86_64-unknown-linux-gnu
+```
+
+If you have an older `git-wt` that fails with ``version `GLIBC_2.xx' not
+found``, re-running the installer replaces it with the static build.
 
 ### After installing
 

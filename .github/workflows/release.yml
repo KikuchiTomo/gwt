@@ -27,8 +27,11 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
+          # Pinned deliberately: the gnu build inherits the builder's glibc
+          # version, and ubuntu-latest (24.04, glibc 2.39) produces a binary
+          # that will not start on older distros.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest

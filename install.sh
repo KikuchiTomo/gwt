@@ -9,6 +9,7 @@ BIN="git-wt"
 DEFAULT_PREFIX="${HOME}/.local/bin"
 
 VERSION=""
+TARGET_OVERRIDE=""
 # GWT_PREFIX is the specific knob; a bare PREFIX is honored for compatibility but
 # it's a common ambient variable, so we say out loud when it's what we picked up.
 PREFIX_SRC="default"
@@ -32,6 +33,8 @@ Usage: install.sh [options]
 Options:
   --version vX.Y.Z   install a specific release (default: latest)
   --prefix DIR       install destination (default: \$PREFIX or $DEFAULT_PREFIX)
+  --target TRIPLE    force a release target (default: auto-detected;
+                     Linux defaults to the static musl build)
   --yes              don't prompt; auto-update and auto-setup shell rc
   --force            reinstall even if the same version is already installed
   --no-setup         skip writing shell init / PATH lines into your rc file
@@ -43,6 +46,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
         --prefix)  PREFIX="$2";  PREFIX_SRC="--prefix"; shift 2 ;;
+        --target)  TARGET_OVERRIDE="$2"; shift 2 ;;
         --yes|-y)  ASSUME_YES=1; shift ;;
         --force)   FORCE=1;      shift ;;
         --no-setup) NO_SETUP=1;  shift ;;
@@ -88,12 +92,12 @@ detect_target() {
         Linux)
             [ "$arch" = "x86_64" ] || [ "$arch" = "amd64" ] \
                 || err "unsupported Linux arch: $arch (only x86_64)"
-            # Prefer musl when ldd suggests it; otherwise gnu.
-            if ldd --version 2>&1 | grep -qi musl; then
-                echo "x86_64-unknown-linux-musl"
-            else
-                echo "x86_64-unknown-linux-gnu"
-            fi
+            # Default to musl: it is statically linked, so it runs on any Linux.
+            # The gnu build carries the glibc version of whatever built it, and a
+            # newer glibc than the host's fails at exec time with
+            # "version `GLIBC_x.yz' not found" — a confusing failure to hand to
+            # someone who just ran an installer. Opt into gnu with --target.
+            echo "x86_64-unknown-linux-musl"
             ;;
         MINGW*|MSYS*|CYGWIN*)
             echo "x86_64-pc-windows-msvc"
@@ -170,9 +174,11 @@ write_setup_block() {
         !skip   { print }
     ' "$rc" > "$tmp"
 
-    # The eval is guarded on the binary actually resolving. Unguarded, a moved or
-    # removed git-wt makes EVERY new shell start with a "command not found" error
-    # — and the eval then silently produces nothing, so `gwt` is missing too.
+    # The eval is guarded twice: `command -v` for a missing binary, and a
+    # captured, stderr-silenced run for one that resolves but cannot exec (a
+    # glibc mismatch, a truncated download). Either way shell startup stays
+    # silent — anything printed here lands before the prompt and breaks tools
+    # like powerlevel10k's instant prompt.
     {
         cat "$tmp"
         printf '\n%s\n' "$MARKER"
@@ -182,7 +188,7 @@ write_setup_block() {
                 printf '    set -gx PATH %s $PATH\n' "$PREFIX"
                 printf 'end\n'
                 printf 'if type -q %s\n' "$BIN"
-                printf '    %s shellinit fish | source\n' "$BIN"
+                printf '    %s shellinit fish 2>/dev/null | source\n' "$BIN"
                 printf 'end\n'
                 ;;
             *)
@@ -191,7 +197,8 @@ write_setup_block() {
                 printf '    *) export PATH="%s:$PATH" ;;\n' "$PREFIX"
                 printf 'esac\n'
                 printf 'if command -v %s >/dev/null 2>&1; then\n' "$BIN"
-                printf '    eval "$(%s shellinit %s)"\n' "$BIN" "$shell"
+                printf '    __gwt_init="$(%s shellinit %s 2>/dev/null)" && eval "$__gwt_init"\n' "$BIN" "$shell"
+                printf '    unset __gwt_init\n'
                 printf 'fi\n'
                 ;;
         esac
@@ -231,8 +238,16 @@ run_setup() {
 # Prove the thing we just installed is actually reachable, and say exactly what
 # to do next. Guessing "it probably works" is how a broken PATH goes unnoticed.
 verify_install() {
-    if ! "$install_dst" --version >/dev/null 2>&1; then
-        err "installed binary at $install_dst does not run"
+    if ! run_err=$("$install_dst" --version 2>&1 >/dev/null); then
+        printf 'install: the binary at %s does not run:\n' "$install_dst" >&2
+        printf '  %s\n' "$run_err" >&2
+        case "$run_err" in
+            *GLIBC*|*libc*)
+                printf 'install: that is a glibc mismatch. Re-run with the static build:\n' >&2
+                printf '  ... | sh -s -- --target x86_64-unknown-linux-musl\n' >&2
+                ;;
+        esac
+        exit 1
     fi
     printf '\n'
     info "$BIN $VERSION is installed at $install_dst"
@@ -254,7 +269,7 @@ verify_install() {
     fi
 }
 
-TARGET=$(detect_target)
+TARGET="${TARGET_OVERRIDE:-$(detect_target)}"
 info "install prefix: $PREFIX (from $PREFIX_SRC)"
 if [ -z "$VERSION" ]; then
     info "resolving latest release..."
