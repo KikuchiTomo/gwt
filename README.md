@@ -145,7 +145,7 @@ defines a `gwt` alias **after** the git-wt block, move the block below it.
 | `git wt secret`                      | **interactive** secrets manager (see below)             |
 | `git wt secret add/rm/ls`            | same thing, non-interactively                           |
 | `git wt relink`                      | re-apply secret links to every worktree                 |
-| `git wt relativize [name]`           | convert worktree gitdir pointers to relative paths      |
+| `git wt relativize [name]`           | make worktree gitdir pointers portable (see below)      |
 | `git wt config`                      | show the resolved language and where it came from        |
 | `git wt config lang <en\|ja>`         | set the interface language                              |
 | `git wt shellinit <shell>`           | emit the shell function for `cd` integration            |
@@ -256,6 +256,20 @@ git wt: branch 'feature' already exists
   · --recreate   delete it and re-create from origin (asks first)
   · or run `git wt` and choose interactively
 ```
+
+### Portable gitdir pointers, and old git
+
+A worktree and the bare repo point at each other. `git wt` writes the
+worktree's own `.git` pointer relative, so a checkout survives being mounted at
+a different absolute path (a VM share, a container bind mount).
+
+The pointer back — `.bare/worktrees/<id>/gitdir` — can only be relative on
+**git 2.48+**, which added `worktree.useRelativePaths`. Older git reads that
+file as the worktree's location, so `git worktree list` reports
+`../../../default` and marks the worktree *prunable*, which means an ordinary
+`git gc` may delete its metadata. On git older than 2.48, `git wt` therefore
+writes that half absolute, and repairs any relative pointer it finds — so a
+repo created by an earlier version heals the first time you run `git wt`.
 
 ## Secrets
 

@@ -39,6 +39,13 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// git hands back canonical paths, and macOS's /var is a symlink to
+/// /private/var — compare what the filesystem says, not the strings.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let c = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    c(a) == c(b)
+}
+
 fn commit(cwd: &Path, file: &str, body: &str, msg: &str) {
     std::fs::write(cwd.join(file), body).unwrap();
     git(cwd, &["add", "-A"]);
@@ -233,4 +240,77 @@ fn pull_refuses_to_merge_divergent_history() {
         ops::pull(&wt).is_err(),
         "divergent history must not be merged behind the user's back"
     );
+}
+
+/// gwt ≤ 0.6.3 wrote a relative pointer into `.bare/worktrees/<id>/gitdir`
+/// unconditionally, but only git 2.48+ reads one back. On Ubuntu 22.04/24.04
+/// git reported the worktree as `../../../default` — which the picker then
+/// handed to the shell, so `Enter` moved nowhere — and marked it prunable, so
+/// a routine `git gc` was entitled to delete the metadata. Whatever this git
+/// does with such a repo, the paths we hand out must be absolute and real.
+#[test]
+fn a_relative_gitdir_pointer_still_yields_usable_worktree_paths() {
+    let (_origin, layout) = fixture("relgitdir");
+    let meta = std::fs::read_dir(layout.bare_dir.join("worktrees"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(meta.join("gitdir"), "../../../default/.git\n").unwrap();
+
+    let repo = gwt_core::Repo::discover(&layout.root).unwrap();
+    let wts = repo.list_worktrees().unwrap();
+    let default = wts
+        .iter()
+        .find(|w| w.name() == "default")
+        .expect("the default worktree is still listed");
+    assert!(
+        default.path.is_absolute(),
+        "handed a relative path to the caller: {}",
+        default.path.display()
+    );
+    assert!(default.path.join(".git").exists());
+    assert!(same_path(&default.path, &layout.root.join("default")));
+
+    // And the pointer itself is left in a state this git can read, so `git gc`
+    // cannot decide the worktree is prunable.
+    let pointer = std::fs::read_to_string(meta.join("gitdir")).unwrap();
+    let readable = Path::new(pointer.trim()).is_absolute()
+        || gwt_core::git::understands_relative_gitdirs(&layout.root);
+    assert!(readable, "left an unreadable pointer: {pointer}");
+}
+
+/// The writer half: on a git that cannot read relative pointers we must not
+/// create them in the first place.
+#[test]
+fn relativize_never_writes_a_pointer_this_git_cannot_read() {
+    let (_origin, layout) = fixture("relwrite");
+    gwt_core::relativize::relativize_one(&layout, Path::new("default")).unwrap();
+
+    let meta = std::fs::read_dir(layout.bare_dir.join("worktrees"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let pointer = std::fs::read_to_string(meta.join("gitdir")).unwrap();
+    if !gwt_core::git::understands_relative_gitdirs(&layout.root) {
+        assert!(
+            Path::new(pointer.trim()).is_absolute(),
+            "git {:?} cannot read {pointer}",
+            gwt_core::git::version(&layout.root)
+        );
+    }
+    // The worktree side stays relative either way: that is the portable half,
+    // and every git version has understood it.
+    let dot_git = std::fs::read_to_string(layout.root.join("default/.git")).unwrap();
+    assert!(dot_git.contains("gitdir: ../.bare/worktrees/"), "{dot_git}");
+
+    // Whatever we wrote, git must still resolve the worktree.
+    let repo = gwt_core::Repo::discover(&layout.root).unwrap();
+    let wts = repo.list_worktrees().unwrap();
+    assert!(wts
+        .iter()
+        .any(|w| same_path(&w.path, &layout.root.join("default"))));
 }

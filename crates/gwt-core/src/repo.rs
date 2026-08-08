@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::git;
@@ -33,7 +33,65 @@ impl Repo {
 
     pub fn list_worktrees(&self) -> Result<Vec<Worktree>> {
         let raw = git::run(&self.cwd, ["worktree", "list", "--porcelain"])?;
-        worktree::parse_porcelain(&raw)
+        let mut wts = worktree::parse_porcelain(&raw)?;
+        // A relative path here means this git could not read the pointer that
+        // put it there (see `repair_relative_gitdirs`). Repair, then ask again;
+        // if the repair changed nothing, absolutize what we got so callers —
+        // the picker hands its answer to a shell `cd` — never see a path that
+        // is relative to a directory they know nothing about.
+        if wts.iter().any(|w| w.path.is_relative()) {
+            let repaired = self.repair_relative_gitdirs().unwrap_or(0);
+            if repaired > 0 {
+                let raw = git::run(&self.cwd, ["worktree", "list", "--porcelain"])?;
+                wts = worktree::parse_porcelain(&raw)?;
+            }
+            for w in &mut wts {
+                if w.path.is_relative() {
+                    w.path = self.resolve_worktree_path(&w.path);
+                }
+            }
+        }
+        Ok(wts)
+    }
+
+    /// git reads `<common>/worktrees/<id>/gitdir` relative to the directory
+    /// holding it, so a relative entry resolves the same way for every `<id>`
+    /// (they are all one component deep).
+    fn resolve_worktree_path(&self, rel: &Path) -> PathBuf {
+        let base = self.common_dir.join("worktrees").join("_id");
+        normalize(&base.join(rel))
+    }
+
+    /// gwt ≤ 0.6.3 wrote relative gitdir pointers unconditionally, but only
+    /// git 2.48+ can read them back. On older git those worktrees are reported
+    /// with a relative path and flagged prunable — so `git gc` may delete their
+    /// metadata. Rewrite the pointers absolutely, which is what
+    /// `git worktree repair` does, and return how many were fixed.
+    pub fn repair_relative_gitdirs(&self) -> Result<usize> {
+        let dir = self.common_dir.join("worktrees");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(0);
+        };
+        let mut fixed = 0usize;
+        for entry in entries.flatten() {
+            let pointer = entry.path().join("gitdir");
+            let Ok(content) = std::fs::read_to_string(&pointer) else {
+                continue;
+            };
+            let target = Path::new(content.trim());
+            if target.as_os_str().is_empty() || target.is_absolute() {
+                continue;
+            }
+            let abs = normalize(&entry.path().join(target));
+            // Only rewrite a pointer we can still make sense of: if the worktree
+            // is genuinely gone, leave it for `git worktree prune` to report.
+            if !abs.exists() {
+                continue;
+            }
+            std::fs::write(&pointer, format!("{}\n", abs.display()))?;
+            fixed += 1;
+        }
+        Ok(fixed)
     }
 
     pub fn add_worktree(&self, path: &Path, branch: &str, create_branch: bool) -> Result<()> {
@@ -111,5 +169,47 @@ fn absolutize(base: &Path, p: &Path) -> PathBuf {
         p.to_path_buf()
     } else {
         base.join(p)
+    }
+}
+
+/// Resolve `..` lexically. The path may not exist yet (a pruned worktree), so
+/// `canonicalize` is not an option, and leaving `..` in would produce a target
+/// that only works from the directory it was written in.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_a_relative_pointer_to_the_worktree_beside_the_bare_dir() {
+        let repo = Repo {
+            cwd: PathBuf::from("/r/proj"),
+            common_dir: PathBuf::from("/r/proj/.bare"),
+            current_worktree: None,
+        };
+        // What git 2.43 prints for a gwt ≤ 0.6.3 clone.
+        assert_eq!(
+            repo.resolve_worktree_path(Path::new("../../../default")),
+            PathBuf::from("/r/proj/default")
+        );
+        assert_eq!(
+            repo.resolve_worktree_path(Path::new("../../../team/api")),
+            PathBuf::from("/r/proj/team/api")
+        );
     }
 }

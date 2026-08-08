@@ -41,11 +41,19 @@ pub fn relativize_one(layout: &BareLayout, worktree_rel: &Path) -> Result<()> {
         &dot_git,
         format!("gitdir: {up}{BARE_DIR}/worktrees/{meta_name}\n"),
     )?;
+    // The reverse pointer is the half git reads back, and only git 2.48+ (which
+    // added worktree.useRelativePaths) understands a relative one. Older git
+    // takes the string as the worktree's location: `git worktree list` then
+    // reports `../../../default`, so nothing downstream can cd into it, and it
+    // flags the worktree prunable — meaning a routine `git gc` is entitled to
+    // delete its metadata. Only write relative where it is actually read back.
     // Metadata dir always sits 3 levels under the root: .bare / worktrees / <meta>.
-    fs::write(
-        bare_wt_dir.join("gitdir"),
-        format!("../../../{}/.git\n", worktree_rel.display()),
-    )?;
+    let reverse = if git::understands_relative_gitdirs(&wt_dir) {
+        format!("../../../{}/.git\n", worktree_rel.display())
+    } else {
+        format!("{}\n", dot_git.display())
+    };
+    fs::write(bare_wt_dir.join("gitdir"), reverse)?;
     Ok(())
 }
 
