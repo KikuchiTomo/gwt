@@ -1,0 +1,164 @@
+name: tui-probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [debug/tui-probe]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        flavour: [musl, gnu]
+        shell: [zsh, bash]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      - name: fetch released binary
+        run: |
+          set -eux
+          curl -fsSL -o bin.tar.gz \
+            "https://github.com/KikuchiTomo/gwt/releases/download/v0.6.3/git-wt-v0.6.3-x86_64-unknown-linux-${{ matrix.flavour }}.tar.gz"
+          tar xzf bin.tar.gz
+          sudo install -m755 "git-wt-v0.6.3-x86_64-unknown-linux-${{ matrix.flavour }}/git-wt" /usr/local/bin/git-wt
+          git-wt --version
+          uname -m; ldd --version | head -1 || true
+
+      - name: build a bare-style repo
+        run: |
+          set -eux
+          git config --global user.email t@example.com
+          git config --global user.name T
+          git config --global init.defaultBranch main
+          git init -q --bare "$HOME/origin.git"
+          mkdir -p "$HOME/seed" && cd "$HOME/seed"
+          git init -q && echo hi > README.md && git add -A && git commit -qm init
+          git branch -M main && git remote add origin "$HOME/origin.git"
+          git push -q -u origin main
+          git checkout -qb feature/alpha && echo a > a.txt && git add -A && git commit -qm alpha
+          git push -q -u origin feature/alpha
+          mkdir -p "$HOME/work" && cd "$HOME/work"
+          git-wt clone "$HOME/origin.git" proj
+          ls -la "$HOME/work/proj"
+
+      - name: write the pty driver
+        run: |
+          cat > "$HOME/drive.py" <<'PY'
+          import os, pty, sys, time, select, fcntl, termios, struct, re, unicodedata
+          shell, rcfile = sys.argv[1], sys.argv[2]
+          keys = sys.argv[4:] if len(sys.argv) > 3 and sys.argv[3] == "--" else []
+          ROWS, COLS = 30, 110
+          pid, fd = pty.fork()
+          if pid == 0:
+              os.environ.update(TERM="xterm-256color", PS1="PROMPT> ")
+              os.environ.pop("TMUX", None)
+              for kv in os.environ.get("DRIVE_ENV", "").split(","):
+                  if "=" in kv:
+                      k, v = kv.split("=", 1); os.environ[k] = v
+              if shell == "zsh":
+                  os.execvp("zsh", ["zsh", "-i", "-f"])
+              else:
+                  os.execvp("bash", ["bash", "-i", "--norc"])
+          fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+          os.set_blocking(fd, False)
+          screen = [[" "] * COLS for _ in range(ROWS)]
+          cy = cx = 0
+          raw = b""
+          def feed(text):
+              global cy, cx, screen
+              i = 0
+              while i < len(text):
+                  c = text[i]
+                  if c == "\x1b":
+                      m = re.match(r"\x1b\[([0-9;?]*)([a-zA-Z])", text[i:])
+                      if not m:
+                          i += 1; continue
+                      params, ch = m.group(1), m.group(2)
+                      nums = [int(x) for x in params.split(";") if x.isdigit()]
+                      if ch == "H":
+                          cy = (nums[0]-1) if nums else 0
+                          cx = (nums[1]-1) if len(nums) > 1 else 0
+                      elif ch == "J":
+                          screen = [[" "] * COLS for _ in range(ROWS)]; cy = cx = 0
+                      elif ch == "K":
+                          for x in range(cx, COLS): screen[cy][x] = " "
+                      elif ch == "A": cy = max(0, cy - (nums[0] if nums else 1))
+                      elif ch == "B": cy = min(ROWS-1, cy + (nums[0] if nums else 1))
+                      elif ch == "C": cx = min(COLS-1, cx + (nums[0] if nums else 1))
+                      elif ch == "D": cx = max(0, cx - (nums[0] if nums else 1))
+                      elif ch == "n" and nums == [6]:
+                          os.write(fd, ("\x1b[%d;%dR" % (cy+1, cx+1)).encode())
+                      i += m.end(); continue
+                  if c == "\n": cy = min(ROWS-1, cy+1); i += 1; continue
+                  if c == "\r": cx = 0; i += 1; continue
+                  if 0 <= cy < ROWS and 0 <= cx < COLS and c.isprintable():
+                      screen[cy][cx] = c
+                      cx += 2 if unicodedata.east_asian_width(c) in "WF" else 1
+                      if cx >= COLS: cx = 0; cy = min(ROWS-1, cy+1)
+                  i += 1
+          def pump(t):
+              global raw
+              end = time.time() + t
+              while time.time() < end:
+                  r, _, _ = select.select([fd], [], [], 0.05)
+                  if r:
+                      try: d = os.read(fd, 65536)
+                      except OSError: return
+                      if not d: return
+                      raw += d; feed(d.decode("utf-8", "replace"))
+          pump(1.5)
+          os.write(fd, ("source %s\r" % rcfile).encode()); pump(1.5)
+          for k in keys:
+              os.write(fd, k.encode().decode("unicode_escape").encode()); pump(1.5)
+          pump(1.0)
+          try: os.close(fd)
+          except OSError: pass
+          try: os.waitpid(pid, 0)
+          except ChildProcessError: pass
+          print("=== FINAL SCREEN ===")
+          print("\n".join("".join(r).rstrip() for r in screen).rstrip())
+          print("=== RAW (ansi-stripped) ===")
+          t = raw.decode("utf-8", "replace")
+          t = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", t)
+          t = re.sub(r"\x1b[()][A-Z0-9]|\x1b[=>]", "", t)
+          print("\n".join(l.rstrip() for l in t.replace("\r", "\n").split("\n") if l.strip()))
+          PY
+
+      - name: plain shellinit — git wt, Enter, pwd
+        run: |
+          cat > "$HOME/rc" <<'RC'
+          export PATH="/usr/local/bin:$PATH"
+          eval "$(git-wt shellinit ${{ matrix.shell }})"
+          RC
+          python3 "$HOME/drive.py" ${{ matrix.shell }} "$HOME/rc" -- \
+            'cd $HOME/work/proj\r' 'git wt\r' '\r' 'pwd\r'
+
+      - name: with a pre-existing git alias
+        run: |
+          cat > "$HOME/rc2" <<'RC'
+          export PATH="/usr/local/bin:$PATH"
+          alias git='git'
+          alias gwt='echo OLDALIAS'
+          eval "$(git-wt shellinit ${{ matrix.shell }})"
+          RC
+          python3 "$HOME/drive.py" ${{ matrix.shell }} "$HOME/rc2" -- \
+            'cd $HOME/work/proj\r' 'git wt\r' '\r' 'pwd\r'
+
+      - name: gwt directly (no git indirection)
+        run: |
+          python3 "$HOME/drive.py" ${{ matrix.shell }} "$HOME/rc" -- \
+            'cd $HOME/work/proj\r' 'gwt\r' '\r' 'pwd\r'
+
+      - name: raw binary, no wrapper
+        run: |
+          cat > "$HOME/rc3" <<'RC'
+          export PATH="/usr/local/bin:$PATH"
+          RC
+          python3 "$HOME/drive.py" ${{ matrix.shell }} "$HOME/rc3" -- \
+            'cd $HOME/work/proj\r' 'git wt\r' '\r' 'pwd\r'
