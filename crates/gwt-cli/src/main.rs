@@ -1,4 +1,5 @@
 use std::env;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -218,10 +219,36 @@ fn emit_cd_target(path: &std::path::Path) -> Result<()> {
     if let Some(file) = env::var_os("GWT_CD_FILE") {
         std::fs::write(&file, path.to_string_lossy().as_bytes())
             .with_context(|| format!("failed to write cd target to {}", file.to_string_lossy()))?;
+        return Ok(());
+    }
+    // No wrapper. A terminal on stdout means nobody is capturing the path, so
+    // printing it accomplishes nothing and Enter just looked broken — explain
+    // it instead. Otherwise something *is* reading stdout (`cd "$(git wt)"`),
+    // so keep emitting the bare path.
+    if std::io::stdout().is_terminal() {
+        eprintln!(
+            "{}",
+            gwt_core::t::cd_integration_missing(&path.display().to_string(), &login_shell())
+        );
     } else {
         println!("{}", path.display());
     }
     Ok(())
+}
+
+/// Which `shellinit` line to suggest. `$SHELL` is the user's login shell, which
+/// is the rc they would have to edit; anything unrecognised gets the bash form,
+/// which zsh also accepts.
+fn login_shell() -> String {
+    let raw = env::var("SHELL").unwrap_or_default();
+    let name = std::path::Path::new(&raw)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.as_str() {
+        "zsh" | "fish" | "bash" => name,
+        _ => "bash".into(),
+    }
 }
 
 fn dispatch(cli: Cli) -> Result<()> {

@@ -109,6 +109,8 @@ jobs:
         target: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
     container: ${{ matrix.image }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -120,6 +122,8 @@ jobs:
           set -euo pipefail
           echo "distro: $(cat /etc/os-release | grep PRETTY_NAME)"
           echo "glibc:  $(ldd --version 2>&1 | head -1 || echo none)"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq && apt-get install -y -qq zsh git python3
           tar -C dist -xzf dist/*.tar.gz
           bin="$(find dist -type f -name git-wt | head -1)"
           chmod +x "$bin"
@@ -127,14 +131,25 @@ jobs:
           "$bin" --version
           # The shell snippet has to survive a user who already has a `gwt`
           # alias — that combination produced a parse error on every startup.
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq && apt-get install -y -qq zsh
           "$bin" shellinit zsh > /snippet.zsh
           printf 'alias gwt=OLD\nalias git=GITALIAS\neval "$(cat /snippet.zsh)"\n' > ~/.zshrc
           out="$(zsh -i -c 'type gwt' 2>&1)"
           echo "$out"
           case "$out" in *"shell function"*) ;; *) echo "shellinit did not define gwt"; exit 1 ;; esac
           echo "OK on ${{ matrix.image }} (${{ matrix.target }})"
+
+      # Defining the function is not the same as the feature working: drive the
+      # real picker in a pty and require that Enter actually moves the shell,
+      # including from a shell that already aliases gwt/cat/mktemp/cd.
+      - name: the picker actually cds
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$(find dist -type f -name git-wt | head -1)"
+          for shell in zsh bash; do
+            python3 .github/scripts/picker_pty_test.py --bin "$bin" --shell "$shell"
+            python3 .github/scripts/picker_pty_test.py --bin "$bin" --shell "$shell" --hostile
+          done
 
   publish:
     needs: [build, linux-compat]

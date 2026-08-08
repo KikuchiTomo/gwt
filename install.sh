@@ -23,6 +23,7 @@ fi
 ASSUME_YES=0
 FORCE=0
 NO_SETUP=0
+UNINSTALL=0
 MARKER="# >>> git-wt setup (managed by install.sh) >>>"
 MARKER_END="# <<< git-wt setup <<<"
 
@@ -38,6 +39,7 @@ Options:
   --yes              don't prompt; auto-update and auto-setup shell rc
   --force            reinstall even if the same version is already installed
   --no-setup         skip writing shell init / PATH lines into your rc file
+  --uninstall        remove the binary and the managed rc block, then exit
   -h, --help         show this help
 EOF
 }
@@ -50,6 +52,7 @@ while [ $# -gt 0 ]; do
         --yes|-y)  ASSUME_YES=1; shift ;;
         --force)   FORCE=1;      shift ;;
         --no-setup) NO_SETUP=1;  shift ;;
+        --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -161,6 +164,16 @@ rc_path_for() {
     esac
 }
 
+# Everything between the markers is ours: drop it so a re-run (or an uninstall)
+# never leaves a second copy or a stale eval behind.
+strip_setup_block() {
+    awk -v m="$MARKER" -v e="$MARKER_END" '
+        $0 == m { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip   { print }
+    ' "$1"
+}
+
 # Idempotent: a marker block lets re-runs rewrite cleanly without dupes.
 write_setup_block() {
     rc="$1"; shell="$2"
@@ -168,11 +181,7 @@ write_setup_block() {
     [ -f "$rc" ] || : > "$rc"
 
     tmp="${rc}.gwt.tmp"
-    awk -v m="$MARKER" -v e="$MARKER_END" '
-        $0 == m { skip = 1; next }
-        $0 == e { skip = 0; next }
-        !skip   { print }
-    ' "$rc" > "$tmp"
+    strip_setup_block "$rc" > "$tmp"
 
     # The eval is guarded twice: `command -v` for a missing binary, and a
     # captured, stderr-silenced run for one that resolves but cannot exec (a
@@ -268,6 +277,57 @@ verify_install() {
         info "Then verify with:  $BIN --version  &&  git wt --help"
     fi
 }
+
+# Uninstall is the whole run when asked for: no network, no version resolution.
+# It only ever touches what this script created — the binary it installed and
+# the marker block it wrote. Worktrees, secrets and git state are never touched.
+run_uninstall() {
+    bin_path=""
+    [ -f "$PREFIX/$BIN" ] && bin_path="$PREFIX/$BIN"
+    rcs=""
+    for shell in zsh bash fish; do
+        rc=$(rc_path_for "$shell")
+        [ -f "$rc" ] || continue
+        grep -qF "$MARKER" "$rc" 2>/dev/null || continue
+        case " $rcs " in *" $rc "*) ;; *) rcs="$rcs $rc" ;; esac
+    done
+
+    if [ -z "$bin_path" ] && [ -z "$rcs" ]; then
+        info "nothing to uninstall: no $BIN at $PREFIX and no managed rc block."
+        other=$(command -v "$BIN" 2>/dev/null || true)
+        [ -n "$other" ] && info "note: a different $BIN is on your PATH at $other"
+        exit 0
+    fi
+
+    printf '\n'
+    info "about to remove:"
+    [ -n "$bin_path" ] && info "  binary    $bin_path"
+    for rc in $rcs; do info "  rc block  $rc"; done
+    printf '\n'
+    prompt_yes_no "Remove these?" || { info "cancelled."; exit 0; }
+
+    [ -n "$bin_path" ] && rm -f "$bin_path" && info "removed $bin_path"
+    for rc in $rcs; do
+        strip_setup_block "$rc" > "$rc.new" && mv "$rc.new" "$rc"
+        info "removed the setup block from $rc"
+    done
+
+    cfg="${XDG_CONFIG_HOME:-$HOME/.config}/gwt/config"
+    printf '\n'
+    if [ -f "$cfg" ]; then
+        info "left in place: $cfg (your language setting)"
+        info "  delete it with:  rm -rf $(dirname "$cfg")"
+    fi
+    other=$(command -v "$BIN" 2>/dev/null || true)
+    [ -n "$other" ] && info "note: another $BIN is still on your PATH at $other"
+    info "The gwt/git shell functions live in this shell until you open a new one"
+    info "(or run: unset -f gwt git __gwt_run)."
+    exit 0
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+    run_uninstall
+fi
 
 TARGET="${TARGET_OVERRIDE:-$(detect_target)}"
 info "install prefix: $PREFIX (from $PREFIX_SRC)"

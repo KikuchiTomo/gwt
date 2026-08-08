@@ -319,6 +319,36 @@ pub mod t {
         )
     }
 
+    /// Enter was pressed but no shell wrapper is listening, so the directory
+    /// did not change. Without this the picker looks broken and there is
+    /// nothing on screen to explain it.
+    pub fn cd_integration_missing(path: &str, shell: &str) -> String {
+        let rc = match shell {
+            "zsh" => "~/.zshrc",
+            "fish" => "~/.config/fish/config.fish",
+            _ => "~/.bashrc",
+        };
+        let line = if shell == "fish" {
+            "git-wt shellinit fish | source".to_string()
+        } else {
+            format!("eval \"$(git-wt shellinit {shell})\"")
+        };
+        pick(
+            format!(
+                "git wt: shell integration is not active, so the directory was not changed.\n\
+                 \x20       picked: {path}\n\
+                 \x20       add to {rc}:  {line}\n\
+                 \x20       then open a new shell, and use `gwt` or `git wt`."
+            ),
+            format!(
+                "git wt: シェル連携が有効でないため、ディレクトリを移動できませんでした。\n\
+                 \x20       選択したパス: {path}\n\
+                 \x20       {rc} に追加してください:  {line}\n\
+                 \x20       追加後、新しいシェルを開いて `gwt` か `git wt` を使ってください。"
+            ),
+        )
+    }
+
     pub fn relinked(n: usize) -> String {
         pick(
             format!("relinked {n} worktree(s)"),

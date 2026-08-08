@@ -31,14 +31,16 @@ Re-running the installer detects an existing version and prompts to update.
 ```sh
 # explicit version, no prompts:
 curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh \
-  | sh -s -- --version v0.6.3 --yes
+  | sh -s -- --version v0.6.4 --yes
 ```
 
 Supported targets: **macOS arm64**, **Linux x86_64 (musl / gnu)**, **Windows x86_64**.
 
 Every release runs its Linux binaries on **Ubuntu 22.04, 24.04 and 26.04**
-before publishing — both the musl and the gnu build, and including a zsh
-startup check. A release that would not start on one of them cannot ship.
+before publishing — both the musl and the gnu build. On each one, a real bash
+and a real zsh open the picker in a pty and press `Enter`, and the release is
+blocked unless the shell actually changed directory — also from a shell that
+already aliases `gwt`, `git`, `cat`, `mktemp` and `cd`.
 
 On Linux the installer picks the **musl** build. It is statically linked, so it
 runs on any distro regardless of age. The `gnu` build is also published and can
@@ -86,6 +88,46 @@ Notes:
 - `PREFIX` / `GWT_PREFIX` in your environment override the install prefix. The
   installer prints which one it used, so check that line if `git-wt` lands
   somewhere unexpected.
+- Existing aliases are fine. The snippet is written so a `gwt`, `git`, `cat`,
+  `mktemp`, `rm` or `cd` alias can neither shadow it nor be pulled into it.
+
+### Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh | sh -s -- --uninstall
+```
+
+It lists the binary and the rc block it is about to delete, then asks. Add
+`--yes` to skip the question, `--prefix DIR` if you installed somewhere custom.
+Your worktrees, branches and secret files are never touched.
+
+By hand, it is three things:
+
+```sh
+rm -f ~/.local/bin/git-wt                      # 1. the binary
+                                               # 2. the `# >>> git-wt setup ... <<<`
+                                               #    block in your rc file
+rm -rf ~/.config/gwt                           # 3. settings (language) — optional
+```
+
+The `gwt` and `git` shell functions stay defined in shells that are already
+open; start a new shell, or `unset -f gwt git __gwt_run`.
+
+### If `Enter` doesn't change directory
+
+A subprocess cannot change its parent shell's directory, so the `cd` is done by
+the shell function from `shellinit`. If that function isn't active, `git wt`
+now says so instead of appearing to ignore `Enter`:
+
+```
+git wt: shell integration is not active, so the directory was not changed.
+        picked: /repo/feature-a
+        add to ~/.zshrc:  eval "$(git-wt shellinit zsh)"
+        then open a new shell, and use `gwt` or `git wt`.
+```
+
+Check with `type gwt` — it must print *shell function*, not *alias*. If your rc
+defines a `gwt` alias **after** the git-wt block, move the block below it.
 
 ## Usage
 

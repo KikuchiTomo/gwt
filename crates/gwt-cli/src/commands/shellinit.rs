@@ -15,29 +15,42 @@ pub fn print(shell: &str) {
     print!("{snippet}");
 }
 
-const BASH: &str = r#"# `gwt` and `git` are ordinary words, so either may already be an alias. In zsh
-# an existing alias turns `name() {` into "defining function based on alias" and
-# a parse error, which lands in the middle of shell startup. The `function`
-# keyword suppresses that alias expansion in both bash and zsh, and the unalias
-# stops a leftover `gwt` alias from shadowing the function once it is defined.
-# `git` is left alone: overriding someone else's git alias is not ours to do,
-# and `gwt` keeps working either way.
-unalias gwt 2>/dev/null || true
+// Everything this snippet touches — `gwt`, `git`, `cat`, `rm`, `mktemp`, `cd` —
+// is an ordinary word somebody has aliased (`gwt='git worktree'`, `cat=bat`,
+// `cd=z`, `rm='rm -i'`). Both bash and zsh expand aliases while PARSING, and
+// `eval "$(git-wt shellinit zsh)"` parses this whole snippet before running a
+// single line of it, so every alias that exists at eval time gets baked into the
+// function bodies below — `unalias` on line 1 runs far too late to stop it. Two
+// rules keep the snippet ours:
+//
+//   * define with the `function` keyword, so the name being defined is not
+//     alias-expanded (the POSIX `name() {` form dies with "defining function
+//     based on alias" when `name` is taken);
+//   * escape every command word we call (`\cat`), which suppresses alias
+//     expansion in both shells while still finding functions and builtins.
+//
+// `git` itself is deliberately left alone at call time: overriding someone
+// else's `git` alias is not ours to do, and `gwt` keeps working either way.
+const BASH: &str = r#"unalias gwt 2>/dev/null || true
 
-function gwt {
+function __gwt_run {
   # Do NOT capture stdout: the picker keeps it attached to the terminal for its
   # cursor probe and writes the chosen path to $GWT_CD_FILE instead.
-  local __gwt_cd
-  __gwt_cd="$(mktemp "${TMPDIR:-/tmp}/gwt-cd.XXXXXX")" || return
-  GWT_CD_FILE="$__gwt_cd" command git wt "$@"
-  local __gwt_rc=$?
-  local __gwt_dir
-  __gwt_dir="$(cat "$__gwt_cd" 2>/dev/null)"
-  rm -f "$__gwt_cd"
+  local __gwt_cd __gwt_rc __gwt_dir
+  __gwt_cd="$(\command mktemp "${TMPDIR:-/tmp}/gwt-cd.XXXXXX")" || return
+  GWT_CD_FILE="$__gwt_cd" \command git wt "$@"
+  __gwt_rc=$?
+  __gwt_dir="$(\command cat "$__gwt_cd" 2>/dev/null)"
+  \command rm -f "$__gwt_cd"
   if [ "$__gwt_rc" -eq 0 ] && [ -n "$__gwt_dir" ] && [ -d "$__gwt_dir" ]; then
-    cd "$__gwt_dir" || return
+    # \cd skips an alias but keeps a `cd` function (zoxide and friends) working.
+    \cd "$__gwt_dir" || return
   fi
   return "$__gwt_rc"
+}
+
+function gwt {
+  __gwt_run "$@"
 }
 
 function git {
@@ -45,30 +58,38 @@ function git {
   # else — including `git wt list`, `git wt new …`, plain `git status`, etc. —
   # falls straight through to the real binary so we don't surprise users.
   if [ "$#" = "1" ] && [ "$1" = "wt" ]; then
-    gwt
+    __gwt_run
     return
   fi
-  command git "$@"
+  \command git "$@"
 }
 "#;
 
-const FISH: &str = r#"function gwt
+// fish expands nothing at parse time and its `alias` just defines a function,
+// which our definitions replace — but a config that aliases `gwt` *after* this
+// snippet would still capture the `git` wrapper, so route both through the
+// private helper here too.
+const FISH: &str = r#"function __gwt_run
   # Do NOT capture stdout: the picker keeps it attached to the terminal for its
   # cursor probe and writes the chosen path to $GWT_CD_FILE instead.
-  set -l __gwt_cd (mktemp (test -n "$TMPDIR"; and echo $TMPDIR; or echo /tmp)/gwt-cd.XXXXXX)
-  env GWT_CD_FILE=$__gwt_cd git wt $argv
+  set -l __gwt_cd (command mktemp (test -n "$TMPDIR"; and echo $TMPDIR; or echo /tmp)/gwt-cd.XXXXXX)
+  env GWT_CD_FILE=$__gwt_cd command git wt $argv
   set -l __gwt_rc $status
-  set -l __gwt_dir (cat $__gwt_cd 2>/dev/null)
-  rm -f $__gwt_cd
+  set -l __gwt_dir (command cat $__gwt_cd 2>/dev/null)
+  command rm -f $__gwt_cd
   if test $__gwt_rc -eq 0 -a -n "$__gwt_dir" -a -d "$__gwt_dir"
     cd $__gwt_dir
   end
   return $__gwt_rc
 end
 
+function gwt
+  __gwt_run $argv
+end
+
 function git
   if test (count $argv) -eq 1 -a "$argv[1]" = "wt"
-    gwt
+    __gwt_run
     return
   end
   command git $argv
@@ -102,6 +123,47 @@ mod tests {
     #[test]
     fn clears_a_stale_gwt_alias() {
         assert!(BASH.contains("unalias gwt"));
+    }
+
+    /// `eval` parses the whole snippet before `unalias` runs, so any command
+    /// word left bare in a function body is replaced by the user's alias at
+    /// definition time. `alias cat=bat` alone was enough to make the chosen
+    /// path unreadable and the `cd` silently not happen.
+    #[test]
+    fn every_command_word_is_alias_proof() {
+        for escaped in [
+            "\\command mktemp",
+            "\\command cat",
+            "\\command rm",
+            "\\command git wt",
+            "\\cd \"$__gwt_dir\"",
+        ] {
+            assert!(BASH.contains(escaped), "must be called as `{escaped}`");
+        }
+        for bare in [
+            "$(mktemp",
+            "$(cat ",
+            "\n  rm ",
+            "\n    cd \"",
+            "\n  command ",
+        ] {
+            assert!(!BASH.contains(bare), "`{bare}` is alias-expandable");
+        }
+    }
+
+    /// The `git` wrapper used to call `gwt`. With `alias gwt='git worktree'`
+    /// (a very common alias) present at eval time, that name was expanded into
+    /// the wrapper's body, so `git wt` ran the old alias and the picker never
+    /// appeared. Route through a name nobody aliases instead.
+    #[test]
+    fn the_git_wrapper_cannot_be_hijacked_by_a_gwt_alias() {
+        for snippet in [BASH, FISH] {
+            assert!(snippet.contains("__gwt_run"));
+            assert!(
+                !snippet.contains("\n    gwt\n"),
+                "the git wrapper must not call the aliasable name `gwt`"
+            );
+        }
     }
 
     #[test]
