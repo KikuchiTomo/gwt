@@ -200,6 +200,7 @@ pub mod t {
         pulling => " pulling… ", " pull 中… ";
         pushing => " pushing… ", " push 中… ";
         deleting => " deleting… ", " 削除中… ";
+        creating => "creating", "作成中";
         branch_help_new => " type:filter  ↑↓/^p^n:nav  enter:choose base → name  esc:back ",
                            " 入力:絞込  ↑↓/^p^n:移動  enter:基点を選ぶ → 名前  esc:戻る ";
         branch_help_new_dir => " type:filter  ↑↓/^p^n:nav  enter:choose base → name → dir  esc:back ",

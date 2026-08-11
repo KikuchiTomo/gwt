@@ -35,6 +35,11 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
+            if matches!(app.mode, Mode::Creating { .. }) {
+                app.tick_create();
+                std::thread::sleep(Duration::from_millis(70));
+                continue;
+            }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
@@ -58,7 +63,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             Ok(None)
         }
         // Deletion and sync are animated from the main loop; swallow stray keys.
-        Mode::Deleting { .. } | Mode::Syncing { .. } => Ok(None),
+        Mode::Deleting { .. } | Mode::Syncing { .. } | Mode::Creating { .. } => Ok(None),
         Mode::ConfirmSync { .. } => {
             handle_confirm_sync(app, key);
             Ok(None)

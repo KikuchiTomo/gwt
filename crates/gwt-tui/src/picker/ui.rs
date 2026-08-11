@@ -63,7 +63,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         | Mode::Deleting { .. }
         | Mode::Message { .. }
         | Mode::ConfirmSync { .. }
-        | Mode::Syncing { .. } => {
+        | Mode::Syncing { .. }
+        | Mode::Creating { .. } => {
             let list_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -320,6 +321,7 @@ fn help_line(app: &App) -> Line<'static> {
             SyncOp::Pull => t::pulling(),
             SyncOp::Push => t::pushing(),
         },
+        Mode::Creating { .. } => t::working(),
         Mode::ConfirmDelete { paths, force } => match (paths.len() > 1, *force) {
             (true, true) => " y: FORCE delete ALL selected   any: cancel ",
             (true, false) => " y: delete ALL selected   any: cancel ",
@@ -581,6 +583,21 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("'{}' ({branch}) to origin ? y/N", path_name(path))),
+        ]),
+        // The recipe's own output goes here: a five-minute `npm ci` should look
+        // like something happening, not like a hang.
+        Mode::Creating {
+            label, last, frame, ..
+        } => Line::from(vec![
+            Span::styled(
+                format!(" {} ", spinner(*frame)),
+                Style::default().fg(C_CREATE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{label}  "),
+                Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(last.clone(), Style::default().fg(C_DIM)),
         ]),
         Mode::Syncing {
             op,

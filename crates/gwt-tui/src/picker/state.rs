@@ -143,6 +143,20 @@ pub enum Mode {
         path: PathBuf,
         branch: String,
     },
+    /// Creating a worktree, on a worker thread. Creation used to be a blocking
+    /// call, which was fine while it was only `git worktree add` — a recipe with
+    /// an `npm ci` in it turns the same call into minutes of frozen terminal.
+    Creating {
+        label: String,
+        /// The most recent line the recipe produced, so the wait shows progress
+        /// rather than a spinner over nothing.
+        last: String,
+        /// A step that failed. The worktree still exists, so this is reported
+        /// at the end rather than treated as the creation failing.
+        warn: Option<String>,
+        frame: usize,
+        rx: Receiver<CreateMsg>,
+    },
     /// pull/push in flight on a worker thread. git talks to the network here, so
     /// running it on the UI thread would freeze the spinner for the whole
     /// round-trip — the result arrives over `rx` while the frame keeps ticking.
@@ -152,6 +166,49 @@ pub enum Mode {
         branch: String,
         frame: usize,
         rx: Receiver<std::result::Result<String, String>>,
+    },
+}
+
+/// What the worker thread sends back while a worktree is being built.
+pub enum CreateMsg {
+    Line(String),
+    Warn(String),
+    Done(std::result::Result<PathBuf, String>),
+}
+
+/// The ways a worktree gets created, named so the worker can run one without
+/// borrowing anything from the picker.
+pub enum CreateJob {
+    New {
+        base: String,
+        branch: String,
+        dir: String,
+    },
+    Adopt {
+        branch: String,
+        dir: String,
+    },
+    AdoptExisting {
+        branch: String,
+        dir: String,
+    },
+    RecreateFromRemote {
+        branch: String,
+        dir: String,
+    },
+    Recreate {
+        dir: String,
+        branch: String,
+        base: Option<String>,
+    },
+    /// No bare-style layout: plain `git worktree add`, no recipe to run.
+    PlainNew {
+        path: PathBuf,
+        branch: String,
+    },
+    PlainRemote {
+        path: PathBuf,
+        remote_ref: String,
     },
 }
 
@@ -501,13 +558,19 @@ impl<'a> App<'a> {
         if self.check_conflicts(&pending) {
             return Ok(true);
         }
-        if let Some(layout) = &self.layout {
-            ops::new(layout, &base, &branch, &dir, &mut sync::noop)?;
+        let job = if self.layout.is_some() {
+            CreateJob::New {
+                base,
+                branch: branch.clone(),
+                dir,
+            }
         } else {
-            self.repo.add_worktree(&pending.path, &branch, true)?;
-        }
-        self.refresh_worktrees()?;
-        self.mode = Mode::List;
+            CreateJob::PlainNew {
+                path: pending.path,
+                branch: branch.clone(),
+            }
+        };
+        self.start_create(format!("{} {branch}", t::creating()), job);
         Ok(true)
     }
 
@@ -656,14 +719,18 @@ impl<'a> App<'a> {
                 if pending.path.exists() && self.check_conflicts(&pending) {
                     return Ok(true);
                 }
-                if let Some(layout) = &self.layout {
-                    ops::add(layout, &plain, &plain, &mut sync::noop)?;
+                let job = if self.layout.is_some() {
+                    CreateJob::Adopt {
+                        branch: plain.clone(),
+                        dir: plain.clone(),
+                    }
                 } else {
-                    self.repo
-                        .add_worktree_from_remote(&pending.path, &b.short)?;
-                }
-                self.refresh_worktrees()?;
-                self.mode = Mode::List;
+                    CreateJob::PlainRemote {
+                        path: pending.path,
+                        remote_ref: b.short.clone(),
+                    }
+                };
+                self.start_create(format!("{} {plain}", t::creating()), job);
                 Ok(true)
             }
         }
@@ -801,6 +868,120 @@ impl<'a> App<'a> {
     }
 
     /// Kick off the git call on a worker thread and switch to the spinner.
+    /// Build a worktree off the UI thread, streaming the recipe's output back.
+    pub fn start_create(&mut self, label: String, job: CreateJob) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let layout = self.layout.clone();
+        let repo = (*self.repo).clone();
+        std::thread::spawn(move || {
+            let out = tx.clone();
+            let mut report = |ev: sync::Event| {
+                let msg = match ev {
+                    // Only commands are worth narrating; a symlink appearing is
+                    // not news, and a failure is news whatever the kind.
+                    sync::Event::StepStart(s @ sync::Step::Run(_)) => {
+                        Some(CreateMsg::Line(s.subject()))
+                    }
+                    sync::Event::Output(l) => Some(CreateMsg::Line(l.to_string())),
+                    sync::Event::StepDone(s, o) if o.is_failure() => {
+                        Some(CreateMsg::Warn(format!("{} failed", s.subject())))
+                    }
+                    _ => None,
+                };
+                if let Some(m) = msg {
+                    let _ = out.send(m);
+                }
+            };
+            let res: std::result::Result<PathBuf, String> = match (layout, job) {
+                (Some(l), CreateJob::New { base, branch, dir }) => {
+                    ops::new(&l, &base, &branch, &dir, &mut report).map_err(|e| e.to_string())
+                }
+                (Some(l), CreateJob::Adopt { branch, dir }) => {
+                    ops::add(&l, &branch, &dir, &mut report).map_err(|e| e.to_string())
+                }
+                (Some(l), CreateJob::AdoptExisting { branch, dir }) => {
+                    ops::add_existing_branch(&l, &branch, &dir, &mut report)
+                        .map_err(|e| e.to_string())
+                }
+                (Some(l), CreateJob::RecreateFromRemote { branch, dir }) => {
+                    ops::recreate_branch_from_remote(&l, &branch, &dir, &mut report)
+                        .map_err(|e| e.to_string())
+                }
+                (Some(l), CreateJob::Recreate { dir, branch, base }) => {
+                    ops::recreate_worktree(&l, &dir, &branch, base.as_deref(), &mut report)
+                        .map_err(|e| e.to_string())
+                }
+                (_, CreateJob::PlainNew { path, branch }) => repo
+                    .add_worktree(&path, &branch, true)
+                    .map(|_| path)
+                    .map_err(|e| e.to_string()),
+                (_, CreateJob::PlainRemote { path, remote_ref }) => repo
+                    .add_worktree_from_remote(&path, &remote_ref)
+                    .map(|_| path)
+                    .map_err(|e| e.to_string()),
+                (None, _) => Err("not a bare-style worktree root".to_string()),
+            };
+            let _ = tx.send(CreateMsg::Done(res));
+        });
+        self.mode = Mode::Creating {
+            label,
+            last: String::new(),
+            warn: None,
+            frame: 0,
+            rx,
+        };
+    }
+
+    /// Advance the spinner and pick up whatever the worker has said. Returns
+    /// `true` when the worktree is built (or failed to be).
+    pub fn tick_create(&mut self) -> bool {
+        let (outcome, warn) = match &mut self.mode {
+            Mode::Creating {
+                frame,
+                rx,
+                last,
+                warn,
+                ..
+            } => {
+                *frame = frame.wrapping_add(1);
+                let mut done = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(CreateMsg::Line(l)) => *last = l,
+                        Ok(CreateMsg::Warn(w)) => *warn = Some(w),
+                        Ok(CreateMsg::Done(r)) => {
+                            done = Some(r);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            done = Some(Err("the worktree task ended unexpectedly".to_string()));
+                            break;
+                        }
+                    }
+                }
+                (done, warn.clone())
+            }
+            _ => return true,
+        };
+        let Some(res) = outcome else {
+            return false;
+        };
+        match res {
+            Ok(path) => {
+                let _ = self.refresh_worktrees();
+                match warn {
+                    // The worktree is there either way; a failed step is a
+                    // result to read, not a reason to pretend nothing happened.
+                    Some(w) => self.set_error(format!("{} created, but {w}", path_name(&path))),
+                    None => self.mode = Mode::List,
+                }
+            }
+            Err(e) => self.set_error(e),
+        }
+        true
+    }
+
     pub fn start_sync(&mut self, op: SyncOp, path: PathBuf, branch: String) {
         let (tx, rx) = std::sync::mpsc::channel();
         let work_path = path.clone();
@@ -1060,32 +1241,34 @@ impl<'a> App<'a> {
                 Ok(Some(target))
             }
             ConflictAction::UseExistingBranch => {
-                ops::add_existing_branch(&layout, &pending.branch, &pending.dir, &mut sync::noop)?;
-                self.refresh_worktrees()?;
-                self.mode = Mode::List;
+                self.start_create(
+                    format!("{} {}", t::creating(), pending.dir),
+                    CreateJob::AdoptExisting {
+                        branch: pending.branch.clone(),
+                        dir: pending.dir.clone(),
+                    },
+                );
                 Ok(None)
             }
             ConflictAction::RecreateBranchFromRemote => {
-                ops::recreate_branch_from_remote(
-                    &layout,
-                    &pending.branch,
-                    &pending.dir,
-                    &mut sync::noop,
-                )?;
-                self.refresh_worktrees()?;
-                self.mode = Mode::List;
+                self.start_create(
+                    format!("{} {}", t::creating(), pending.dir),
+                    CreateJob::RecreateFromRemote {
+                        branch: pending.branch.clone(),
+                        dir: pending.dir.clone(),
+                    },
+                );
                 Ok(None)
             }
             ConflictAction::RecreateWorktree => {
-                ops::recreate_worktree(
-                    &layout,
-                    &pending.dir,
-                    &pending.branch,
-                    pending.base.as_deref(),
-                    &mut sync::noop,
-                )?;
-                self.refresh_worktrees()?;
-                self.mode = Mode::List;
+                self.start_create(
+                    format!("{} {}", t::creating(), pending.dir),
+                    CreateJob::Recreate {
+                        dir: pending.dir.clone(),
+                        branch: pending.branch.clone(),
+                        base: pending.base.clone(),
+                    },
+                );
                 Ok(None)
             }
         }
