@@ -208,13 +208,13 @@ pub fn bind(layout: &BareLayout, worktree_dir: &Path, step: &CacheStep) -> Resul
     // every `sync apply` and every worktree creation.
     if let Ok(meta) = mount.symlink_metadata() {
         if meta.file_type().is_symlink() {
-            if fs::read_link(&mount).is_ok_and(|t| t == bucket_abs) {
+            if resolves_to(&mount, &bucket_abs) {
                 fs::create_dir_all(&bucket_abs)?;
                 return Ok(BindOutcome::Unchanged { bucket });
             }
             // Pointing at another bucket: the key changed. Re-point it; the old
             // bucket stays on disk, warm, in case the key changes back.
-            fs::remove_file(&mount)?;
+            remove_link(&mount)?;
         }
     }
 
@@ -280,11 +280,12 @@ pub fn unbind(layout: &BareLayout, worktree_dir: &Path, step: &CacheStep) -> Res
     if !meta.file_type().is_symlink() {
         return Ok(false);
     }
-    let target = fs::read_link(&mount)?;
-    if !target.starts_with(cache_root(layout)) {
+    let root = fs::canonicalize(cache_root(layout)).unwrap_or_else(|_| cache_root(layout));
+    let target = fs::canonicalize(&mount).or_else(|_| fs::read_link(&mount))?;
+    if !target.starts_with(&root) {
         return Ok(false);
     }
-    fs::remove_file(&mount)?;
+    remove_link(&mount)?;
     Ok(true)
 }
 
@@ -293,7 +294,7 @@ pub fn is_bound(layout: &BareLayout, worktree_dir: &Path, step: &CacheStep) -> b
     mount
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
-        && fs::read_link(&mount).is_ok_and(|t| t == bucket_dir(layout, step, worktree_dir))
+        && resolves_to(&mount, &bucket_dir(layout, step, worktree_dir))
 }
 
 fn is_empty_dir(p: &Path) -> bool {
@@ -447,9 +448,12 @@ pub fn buckets(layout: &BareLayout, worktrees: &[PathBuf]) -> Vec<Bucket> {
         };
         for b in entries.flatten().filter(|e| e.path().is_dir()) {
             let path = b.path();
+            // Compare resolved paths on both sides: a mount reads back
+            // canonical, and on macOS /var and /private/var are the same place.
+            let real = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let used_by = mounts
                 .iter()
-                .filter(|(_, targets)| targets.contains(&path))
+                .filter(|(_, targets)| targets.contains(&real) || targets.contains(&path))
                 .map(|(name, _)| name.clone())
                 .collect();
             out.push(Bucket {
@@ -486,7 +490,8 @@ fn mount_targets(worktree: &Path) -> Vec<PathBuf> {
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_symlink() {
-                if let Ok(t) = fs::read_link(e.path()) {
+                let p = e.path();
+                if let Ok(t) = fs::canonicalize(&p).or_else(|_| fs::read_link(&p)) {
                     out.push(t);
                 }
             } else if ft.is_dir() && e.file_name() != ".git" {
@@ -638,9 +643,52 @@ fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
 }
 
+/// Windows refuses `symlink_dir` unless Developer Mode is on or the process is
+/// elevated, which is not a reasonable thing to require in order to have a
+/// build cache. A directory junction needs neither and behaves the same for a
+/// mount point that never leaves the volume.
 #[cfg(windows)]
 fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(src, dst)
+    if std::os::windows::fs::symlink_dir(src, dst).is_ok() {
+        return Ok(());
+    }
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dst)
+        .arg(src)
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "could not link {} to {}",
+            dst.display(),
+            src.display()
+        )))
+    }
+}
+
+/// Remove a link without following it. On Windows a directory symlink and a
+/// junction are both reparse points, which `remove_file` refuses.
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if p.is_dir() {
+        return fs::remove_dir(p);
+    }
+    fs::remove_file(p)
+}
+
+/// Whether `link` resolves to `target`.
+///
+/// Comparing `read_link` output directly is not enough on Windows: a junction
+/// reads back with a `\\?\` prefix, so the plain paths never match and the
+/// mount would be torn down and rebuilt on every apply.
+fn resolves_to(link: &Path, target: &Path) -> bool {
+    match (fs::canonicalize(link), fs::canonicalize(target)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => fs::read_link(link).is_ok_and(|t| t == target),
+    }
 }
 
 #[cfg(unix)]

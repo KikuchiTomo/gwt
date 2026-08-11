@@ -366,12 +366,17 @@ fn a_copy_step_lands_a_real_file_and_leaves_edits_alone() {
 #[test]
 fn a_run_step_fires_on_create_but_not_on_a_plain_apply() {
     let (_origin, layout) = fixture("run-step");
+    // A `run` step goes through the platform's shell, so the command that
+    // proves it knows which worktree it is in has to be written for that shell.
+    let cmd = if cfg!(windows) {
+        "echo %GWT_BRANCH%>> ran.txt"
+    } else {
+        "echo \"$GWT_BRANCH\" >> ran.txt"
+    };
     ops::sync_add(
         &layout,
         Step::Run(RunStep {
-            // Proves both that the command runs in the worktree and that it is
-            // told which worktree it is in.
-            cmd: "echo \"$GWT_BRANCH\" >> ran.txt".into(),
+            cmd: cmd.into(),
             when: vec![Phase::Create],
             only_if: None,
             timeout: std::time::Duration::from_secs(30),
@@ -379,21 +384,25 @@ fn a_run_step_fires_on_create_but_not_on_a_plain_apply() {
         }),
     )
     .unwrap();
+    let ran = |p: &Path| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
 
     let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
     let marker = wt.join("ran.txt");
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "feature\n");
+    assert_eq!(ran(&marker), ["feature"]);
 
     // `when = ["create"]`, so re-applying the recipe must not run it again.
     ops::sync_apply(&layout, Phase::Apply, &mut sync::noop).unwrap();
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "feature\n");
+    assert_eq!(ran(&marker), ["feature"]);
 
     // Asking for the apply phase explicitly is how you opt in.
     ops::sync_apply(&layout, Phase::Create, &mut sync::noop).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&marker).unwrap(),
-        "feature\nfeature\n"
-    );
+    assert_eq!(ran(&marker), ["feature", "feature"]);
 }
 
 #[test]
