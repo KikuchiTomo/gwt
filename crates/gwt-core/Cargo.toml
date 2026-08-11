@@ -2,9 +2,11 @@
 name = "gwt-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+toml_edit = "0.22"
 which.workspace = true

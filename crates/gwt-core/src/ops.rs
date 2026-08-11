@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::git;
-use crate::layout::{BareLayout, BARE_DIR, DEFAULT_WT_NAME, MANIFEST_FILE, SECRETS_DIR};
+use crate::layout::{BareLayout, BARE_DIR, DEFAULT_WT_NAME, SECRETS_DIR};
 use crate::relativize::relativize_one;
-use crate::secrets;
-use crate::secrets::{LinkOutcome, SecretEntry, UnlinkOutcome};
+use crate::sync;
+use crate::sync::{Outcome, Phase, Reporter, Step, UnlinkOutcome};
 
 #[derive(Debug, Clone)]
 pub struct CheckReport {
@@ -50,20 +50,22 @@ pub fn clone(url: &str, dir_name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
     )?;
     git::run(&root, ["--git-dir", BARE_DIR, "fetch", "origin"])?;
 
-    let secrets_dir = root.join(SECRETS_DIR);
-    std::fs::create_dir_all(&secrets_dir)?;
-    std::fs::File::create(secrets_dir.join(MANIFEST_FILE))?;
+    // The conventional home for the real files a recipe points at. Creating it
+    // empty is the cheapest way to answer "where do I put my .env?".
+    std::fs::create_dir_all(root.join(SECRETS_DIR))?;
 
     let layout = BareLayout::require(&root)?;
+    sync::write_starter(&layout)?;
     let default = layout.default_branch()?;
     git::run(&root, ["worktree", "add", DEFAULT_WT_NAME, &default])?;
     relativize_one(&layout, Path::new(DEFAULT_WT_NAME))?;
+    sync::apply_quiet(&layout, &root.join(DEFAULT_WT_NAME), Phase::Create)?;
     Ok(root)
 }
 
 /// Adopt an existing branch (local or origin) into a fresh worktree at
-/// `<root>/<name>`. Applies secrets and relativizes.
-pub fn add(layout: &BareLayout, branch: &str, name: &str) -> Result<PathBuf> {
+/// `<root>/<name>`. Runs the sync recipe and relativizes.
+pub fn add(layout: &BareLayout, branch: &str, name: &str, report: Reporter) -> Result<PathBuf> {
     let dest = layout.root.join(name);
     if dest.exists() {
         return Err(Error::PathExists(dest));
@@ -87,13 +89,19 @@ pub fn add(layout: &BareLayout, branch: &str, name: &str) -> Result<PathBuf> {
         return Err(Error::RemoteBranchMissing(branch.into()));
     }
     relativize_one(layout, Path::new(name))?;
-    secrets::apply_links(layout, &dest)?;
+    sync::apply(layout, &dest, Phase::Create, report)?;
     Ok(dest)
 }
 
 /// Create a brand-new branch from `base` and add a worktree for it at
 /// `<root>/<name>`. `base` may be a branch, tag, or commit.
-pub fn new(layout: &BareLayout, base: &str, branch: &str, name: &str) -> Result<PathBuf> {
+pub fn new(
+    layout: &BareLayout,
+    base: &str,
+    branch: &str,
+    name: &str,
+    report: Reporter,
+) -> Result<PathBuf> {
     let dest = layout.root.join(name);
     if dest.exists() {
         return Err(Error::PathExists(dest));
@@ -106,7 +114,7 @@ pub fn new(layout: &BareLayout, base: &str, branch: &str, name: &str) -> Result<
     }
     git::run(&layout.root, ["worktree", "add", "-b", branch, name, base])?;
     relativize_one(layout, Path::new(name))?;
-    secrets::apply_links(layout, &dest)?;
+    sync::apply(layout, &dest, Phase::Create, report)?;
     Ok(dest)
 }
 
@@ -128,7 +136,7 @@ pub fn remove(layout: &BareLayout, name: &str) -> Result<Option<String>> {
     Ok(branch)
 }
 
-pub fn review(layout: &BareLayout, branch: &str) -> Result<PathBuf> {
+pub fn review(layout: &BareLayout, branch: &str, report: Reporter) -> Result<PathBuf> {
     let branch = branch.strip_prefix("origin/").unwrap_or(branch);
     let dest = layout.root.join(branch);
     if dest.exists() {
@@ -144,7 +152,7 @@ pub fn review(layout: &BareLayout, branch: &str) -> Result<PathBuf> {
     if !branch_exists_remote(layout, branch)? {
         return Err(Error::RemoteBranchMissing(branch.into()));
     }
-    new(layout, &format!("origin/{branch}"), branch, branch)
+    new(layout, &format!("origin/{branch}"), branch, branch, report)
 }
 
 pub fn check(layout: &BareLayout, branch: &str, do_fetch: bool) -> Result<CheckReport> {
@@ -220,97 +228,218 @@ pub fn check(layout: &BareLayout, branch: &str, do_fetch: bool) -> Result<CheckR
 }
 
 /// Every real worktree directory, excluding the bare dir and the root itself.
+///
+/// The comparison goes through `canonicalize`, because git answers with
+/// resolved paths: on macOS a repo under `/var/…` comes back as `/private/var/…`
+/// and a plain `!=` then fails to recognise `.bare` — which is how the recipe
+/// used to get applied *inside the bare directory*.
 pub fn worktree_dirs(layout: &BareLayout) -> Result<Vec<PathBuf>> {
     let raw = git::run(
         &layout.root,
         ["--git-dir", BARE_DIR, "worktree", "list", "--porcelain"],
     )?;
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let root = real(&layout.root);
+    let bare = real(&layout.bare_dir);
     Ok(raw
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
-        .filter(|abs| *abs != layout.root && *abs != layout.bare_dir)
+        .filter(|abs| {
+            let c = real(abs);
+            c != root && c != bare
+        })
         .collect())
 }
 
-/// Re-apply secrets to every existing worktree (idempotent, never touches the
-/// bare or root itself).
-pub fn relink(layout: &BareLayout) -> Result<Vec<PathBuf>> {
-    let visited = worktree_dirs(layout)?;
-    for abs in &visited {
-        secrets::apply_links(layout, abs)?;
+/// What one worktree's pass through the recipe produced.
+pub type WorktreeReport = (PathBuf, Vec<(Step, Outcome)>);
+
+/// Re-apply the recipe to every existing worktree (never touches the bare dir
+/// or the root itself). `phase` decides whether `run` steps fire.
+pub fn sync_apply(
+    layout: &BareLayout,
+    phase: Phase,
+    report: Reporter,
+) -> Result<Vec<WorktreeReport>> {
+    let mut out = Vec::new();
+    for abs in worktree_dirs(layout)? {
+        let outcomes = sync::apply(layout, &abs, phase, report)?;
+        out.push((abs, outcomes));
     }
-    Ok(visited)
+    Ok(out)
 }
 
-/// What `secret add` did, per worktree — so the CLI can report the links it
-/// actually created rather than telling the user to run `relink` themselves.
+/// What `sync add` did, per worktree — so the CLI can report what it actually
+/// created rather than telling the user to run `apply` themselves.
 #[derive(Debug, Clone)]
-pub struct SecretAdd {
-    pub entry: SecretEntry,
-    /// The mapping this replaced, if `src` was already registered.
-    pub previous: Option<SecretEntry>,
-    pub src_abs: PathBuf,
+pub struct StepAdded {
+    pub step: Step,
+    /// Steps this replaced, because they targeted the same destination.
+    pub replaced: Vec<Step>,
+    pub src_abs: Option<PathBuf>,
     pub src_exists: bool,
-    pub linked: Vec<(PathBuf, LinkOutcome)>,
+    pub applied: Vec<(PathBuf, Outcome)>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SecretRemove {
-    pub entry: SecretEntry,
+pub struct StepRemoved {
+    pub step: Step,
     pub unlinked: Vec<(PathBuf, UnlinkOutcome)>,
 }
 
-/// Register a mapping and immediately link it into every existing worktree.
-pub fn secret_add(layout: &BareLayout, src: &str, dst: &str) -> Result<SecretAdd> {
-    let (entry, previous) = secrets::add_entry(layout, src, dst)?;
-    let src_abs = entry.src_abs(layout);
-    let src_exists = src_abs.exists();
-
-    let mut linked = Vec::new();
-    for wt in worktree_dirs(layout)? {
-        // A changed destination leaves a stale link behind; clear it first so the
-        // worktree only ever carries the mapping the manifest describes.
-        if let Some(prev) = previous.as_ref().filter(|p| p.dst != entry.dst) {
-            secrets::unlink_entry(layout, &wt, prev)?;
-        }
-        let outcome = secrets::apply_entry(layout, &wt, &entry)?;
-        linked.push((wt, outcome));
+/// Two steps writing to the same path inside a worktree is the one genuine
+/// conflict, so that is what "already registered" means. A `run` step collides
+/// only with the identical command line.
+fn collides(a: &Step, b: &Step) -> bool {
+    match (a.dst(), b.dst()) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.subject() == b.subject(),
+        _ => false,
     }
-    Ok(SecretAdd {
-        entry,
-        previous,
+}
+
+/// Register a step and apply it to every existing worktree right away.
+///
+/// A `run` step is registered but not executed: a command is not idempotent the
+/// way a link is, and firing someone's `npm ci` in six worktrees because they
+/// typed `sync add --run` would be its own kind of surprise.
+pub fn sync_add(layout: &BareLayout, step: Step) -> Result<StepAdded> {
+    let mut steps = sync::load(layout)?.steps;
+    let mut replaced = Vec::new();
+    match steps.iter().position(|s| collides(s, &step)) {
+        Some(pos) => {
+            replaced.push(std::mem::replace(&mut steps[pos], step.clone()));
+            // Anything else aiming at the same place was already dead weight.
+            let mut i = pos + 1;
+            while i < steps.len() {
+                if collides(&steps[i], &step) {
+                    replaced.push(steps.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        None => steps.push(step.clone()),
+    }
+    sync::save(layout, &steps)?;
+
+    let src_abs = step.src_abs(layout);
+    let src_exists = src_abs.as_ref().is_some_and(|p| p.exists());
+    let mut applied = Vec::new();
+    if !matches!(step, Step::Run(_)) {
+        for wt in worktree_dirs(layout)? {
+            let outcome = sync::apply_step(layout, &wt, &step, &mut sync::noop)?;
+            applied.push((wt, outcome));
+        }
+    }
+    Ok(StepAdded {
+        step,
+        replaced,
         src_abs,
         src_exists,
-        linked,
+        applied,
     })
 }
 
-/// Drop a mapping and immediately remove its links from every worktree.
-/// Returns `None` when `src` was not registered.
-pub fn secret_remove(layout: &BareLayout, src: &str) -> Result<Option<SecretRemove>> {
-    let Some(entry) = secrets::remove_entry(layout, src)? else {
+/// Replace the step at `idx`, undoing the old one where it landed somewhere
+/// else. Returns `None` when the recipe is shorter than `idx`.
+pub fn sync_replace_at(layout: &BareLayout, idx: usize, step: Step) -> Result<Option<StepAdded>> {
+    let mut steps = sync::load(layout)?.steps;
+    if idx >= steps.len() {
         return Ok(None);
-    };
-    let mut unlinked = Vec::new();
-    for wt in worktree_dirs(layout)? {
-        let outcome = secrets::unlink_entry(layout, &wt, &entry)?;
-        unlinked.push((wt, outcome));
     }
-    Ok(Some(SecretRemove { entry, unlinked }))
+    let previous = std::mem::replace(&mut steps[idx], step.clone());
+    sync::save(layout, &steps)?;
+
+    let src_abs = step.src_abs(layout);
+    let src_exists = src_abs.as_ref().is_some_and(|p| p.exists());
+    let mut applied = Vec::new();
+    if !matches!(step, Step::Run(_)) {
+        for wt in worktree_dirs(layout)? {
+            // A moved destination leaves the old file behind; clear it first so
+            // a worktree only ever carries what the recipe describes.
+            if previous.dst() != step.dst() {
+                sync::unlink_step(layout, &wt, &previous)?;
+            }
+            let outcome = sync::apply_step(layout, &wt, &step, &mut sync::noop)?;
+            applied.push((wt, outcome));
+        }
+    }
+    Ok(Some(StepAdded {
+        step,
+        replaced: vec![previous],
+        src_abs,
+        src_exists,
+        applied,
+    }))
 }
 
-/// How many worktrees currently carry the link for `entry` (for `secret ls`).
-pub fn secret_link_count(layout: &BareLayout, entry: &SecretEntry, worktrees: &[PathBuf]) -> usize {
-    let src_abs = entry.src_abs(layout);
+pub fn sync_remove_at(layout: &BareLayout, idx: usize) -> Result<Option<StepRemoved>> {
+    let mut steps = sync::load(layout)?.steps;
+    if idx >= steps.len() {
+        return Ok(None);
+    }
+    let step = steps.remove(idx);
+    sync::save(layout, &steps)?;
+    Ok(Some(unlink_everywhere(layout, step)?))
+}
+
+/// Drop every step matching `key` and undo it in each worktree.
+///
+/// `key` is matched against the destination first, then the source, then a
+/// command line — so both halves of what `sync ls` prints identify a step.
+pub fn sync_remove(layout: &BareLayout, key: &str) -> Result<Vec<StepRemoved>> {
+    let steps = sync::load(layout)?.steps;
+    let matches = |s: &Step| {
+        s.dst() == Some(key) || s.src() == Some(key) || (s.dst().is_none() && s.subject() == key)
+    };
+    let hit_dst = steps.iter().any(|s| s.dst() == Some(key));
+    let doomed: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            // An exact destination match wins outright: one source linked to two
+            // destinations should not lose both because one was named.
+            if hit_dst {
+                s.dst() == Some(key)
+            } else {
+                matches(s)
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if doomed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kept: Vec<Step> = steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !doomed.contains(i))
+        .map(|(_, s)| s.clone())
+        .collect();
+    sync::save(layout, &kept)?;
+
+    let mut out = Vec::new();
+    for i in doomed {
+        out.push(unlink_everywhere(layout, steps[i].clone())?);
+    }
+    Ok(out)
+}
+
+fn unlink_everywhere(layout: &BareLayout, step: Step) -> Result<StepRemoved> {
+    let mut unlinked = Vec::new();
+    for wt in worktree_dirs(layout)? {
+        unlinked.push((wt.clone(), sync::unlink_step(layout, &wt, &step)?));
+    }
+    Ok(StepRemoved { step, unlinked })
+}
+
+/// How many worktrees currently carry `step` (for `sync ls`).
+pub fn sync_applied_count(layout: &BareLayout, step: &Step, worktrees: &[PathBuf]) -> usize {
     worktrees
         .iter()
-        .filter(|wt| {
-            let dst = entry.dst_abs(wt);
-            dst.symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-                && std::fs::read_link(&dst).is_ok_and(|t| t == src_abs)
-        })
+        .filter(|wt| sync::is_applied(layout, wt, step))
         .count()
 }
 
@@ -466,14 +595,19 @@ pub fn delete_local_branch(layout: &BareLayout, branch: &str) -> Result<()> {
 
 /// Adopt an existing local branch into a new worktree at `<root>/<name>`,
 /// without creating or moving the branch.
-pub fn add_existing_branch(layout: &BareLayout, branch: &str, name: &str) -> Result<PathBuf> {
+pub fn add_existing_branch(
+    layout: &BareLayout,
+    branch: &str,
+    name: &str,
+    report: Reporter,
+) -> Result<PathBuf> {
     let dest = layout.root.join(name);
     if dest.exists() {
         return Err(Error::PathExists(dest));
     }
     git::run(&layout.root, ["worktree", "add", name, branch])?;
     relativize_one(layout, Path::new(name))?;
-    secrets::apply_links(layout, &dest)?;
+    sync::apply(layout, &dest, Phase::Create, report)?;
     Ok(dest)
 }
 
@@ -483,6 +617,7 @@ pub fn recreate_branch_from_remote(
     layout: &BareLayout,
     branch: &str,
     name: &str,
+    report: Reporter,
 ) -> Result<PathBuf> {
     let _ = git::run(
         &layout.root,
@@ -494,7 +629,7 @@ pub fn recreate_branch_from_remote(
     if branch_exists_local(layout, branch)? {
         delete_local_branch(layout, branch)?;
     }
-    add(layout, branch, name)
+    add(layout, branch, name, report)
 }
 
 /// Remove an existing worktree directory (and its branch), then build it again.
@@ -504,6 +639,7 @@ pub fn recreate_worktree(
     name: &str,
     branch: &str,
     base: Option<&str>,
+    report: Reporter,
 ) -> Result<PathBuf> {
     let dest = layout.root.join(name);
     if dest.exists() {
@@ -522,8 +658,8 @@ pub fn recreate_worktree(
         let _ = delete_local_branch(layout, branch);
     }
     match base {
-        Some(base) => new(layout, base, branch, name),
-        None => recreate_branch_from_remote(layout, branch, name),
+        Some(base) => new(layout, base, branch, name, report),
+        None => recreate_branch_from_remote(layout, branch, name, report),
     }
 }
 

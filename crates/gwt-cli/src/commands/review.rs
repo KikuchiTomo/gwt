@@ -6,7 +6,7 @@ use super::conflict::{self, Resolve};
 
 pub fn run(layout: &BareLayout, branch: &str, r: Resolve) -> Result<()> {
     let name = branch.strip_prefix("origin/").unwrap_or(branch);
-    let path = match ops::review(layout, branch) {
+    let path = match ops::review(layout, branch, &mut super::sync::report) {
         Ok(p) => p,
         // Review always wants origin's version, so a rebuild tracks the remote.
         Err(e) => conflict::resolve(layout, e, name, name, None, r)?,

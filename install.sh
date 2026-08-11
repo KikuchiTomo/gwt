@@ -280,7 +280,7 @@ verify_install() {
 
 # Uninstall is the whole run when asked for: no network, no version resolution.
 # It only ever touches what this script created — the binary it installed and
-# the marker block it wrote. Worktrees, secrets and git state are never touched.
+# the marker block it wrote. Worktrees, secrets, .gwt/ and git state are never touched.
 run_uninstall() {
     bin_path=""
     [ -f "$PREFIX/$BIN" ] && bin_path="$PREFIX/$BIN"

@@ -77,7 +77,7 @@ pub fn resolve(
 ) -> Result<std::path::PathBuf> {
     match &err {
         Error::BranchExists(_) if r.reuse => {
-            let p = ops::add_existing_branch(layout, branch, name)?;
+            let p = ops::add_existing_branch(layout, branch, name, &mut super::sync::report)?;
             eprintln!("reused existing branch '{branch}'");
             Ok(p)
         }
@@ -85,7 +85,7 @@ pub fn resolve(
             if !confirm_destroy(layout, name, branch, r.yes)? {
                 bail!("cancelled");
             }
-            let p = ops::recreate_worktree(layout, name, branch, base)?;
+            let p = ops::recreate_worktree(layout, name, branch, base, &mut super::sync::report)?;
             eprintln!("re-created '{name}'");
             Ok(p)
         }

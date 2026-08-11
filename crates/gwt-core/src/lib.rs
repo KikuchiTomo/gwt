@@ -1,4 +1,5 @@
 pub mod branch;
+pub mod cache;
 pub mod error;
 pub mod git;
 #[macro_use]
@@ -7,8 +8,8 @@ pub mod layout;
 pub mod ops;
 pub mod relativize;
 pub mod repo;
-pub mod secrets;
 pub mod status;
+pub mod sync;
 pub mod worktree;
 
 pub use branch::{BranchKind, BranchRef};

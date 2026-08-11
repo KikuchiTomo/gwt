@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use anyhow::Result;
 use gwt_core::layout::{BareLayout, DEFAULT_WT_NAME};
 use gwt_core::status::{self, WorktreeMetrics};
+use gwt_core::sync;
 use gwt_core::{ops, t, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
 
 use crate::fuzzy;
@@ -501,7 +502,7 @@ impl<'a> App<'a> {
             return Ok(true);
         }
         if let Some(layout) = &self.layout {
-            ops::new(layout, &base, &branch, &dir)?;
+            ops::new(layout, &base, &branch, &dir, &mut sync::noop)?;
         } else {
             self.repo.add_worktree(&pending.path, &branch, true)?;
         }
@@ -656,7 +657,7 @@ impl<'a> App<'a> {
                     return Ok(true);
                 }
                 if let Some(layout) = &self.layout {
-                    ops::add(layout, &plain, &plain)?;
+                    ops::add(layout, &plain, &plain, &mut sync::noop)?;
                 } else {
                     self.repo
                         .add_worktree_from_remote(&pending.path, &b.short)?;
@@ -1059,13 +1060,18 @@ impl<'a> App<'a> {
                 Ok(Some(target))
             }
             ConflictAction::UseExistingBranch => {
-                ops::add_existing_branch(&layout, &pending.branch, &pending.dir)?;
+                ops::add_existing_branch(&layout, &pending.branch, &pending.dir, &mut sync::noop)?;
                 self.refresh_worktrees()?;
                 self.mode = Mode::List;
                 Ok(None)
             }
             ConflictAction::RecreateBranchFromRemote => {
-                ops::recreate_branch_from_remote(&layout, &pending.branch, &pending.dir)?;
+                ops::recreate_branch_from_remote(
+                    &layout,
+                    &pending.branch,
+                    &pending.dir,
+                    &mut sync::noop,
+                )?;
                 self.refresh_worktrees()?;
                 self.mode = Mode::List;
                 Ok(None)
@@ -1076,6 +1082,7 @@ impl<'a> App<'a> {
                     &pending.dir,
                     &pending.branch,
                     pending.base.as_deref(),
+                    &mut sync::noop,
                 )?;
                 self.refresh_worktrees()?;
                 self.mode = Mode::List;

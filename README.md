@@ -99,7 +99,8 @@ curl -fsSL https://raw.githubusercontent.com/KikuchiTomo/gwt/main/install.sh | s
 
 It lists the binary and the rc block it is about to delete, then asks. Add
 `--yes` to skip the question, `--prefix DIR` if you installed somewhere custom.
-Your worktrees, branches and secret files are never touched.
+Your worktrees, branches and secret files are never touched, and neither is any
+repo's `.gwt/`.
 
 By hand, it is three things:
 
@@ -142,9 +143,13 @@ defines a `gwt` alias **after** the git-wt block, move the block below it.
 | `git wt review <branch>`             | fetch `origin/<branch>` and make a tracking worktree    |
 | `git wt remove <name>` / `rm`        | remove worktree `<name>` and delete its local branch    |
 | `git wt check <branch> [--fetch]`    | compare local `<branch>` against `origin/<branch>`      |
-| `git wt secret`                      | **interactive** secrets manager (see below)             |
-| `git wt secret add/rm/ls`            | same thing, non-interactively                           |
-| `git wt relink`                      | re-apply secret links to every worktree                 |
+| `git wt sync`                        | **interactive** manager for the worktree recipe (below) |
+| `git wt sync add/copy/run/rm/ls`     | same thing, non-interactively                           |
+| `git wt sync apply`                  | re-apply the recipe to every worktree                   |
+| `git wt sync edit`                   | open `.gwt/sync.toml` in `$EDITOR`                      |
+| `git wt sync cache <dir>`            | mount a build cache from outside the worktree           |
+| `git wt cache ls` / `gc` / `init`    | inspect, collect, and detect build caches               |
+| `git wt cache env` / `hooks`         | env vars for the buckets; hooks that keep them current  |
 | `git wt relativize [name]`           | make worktree gitdir pointers portable (see below)      |
 | `git wt config`                      | show the resolved language and where it came from        |
 | `git wt config lang <en\|ja>`         | set the interface language                              |
@@ -271,83 +276,247 @@ file as the worktree's location, so `git worktree list` reports
 writes that half absolute, and repairs any relative pointer it finds — so a
 repo created by an earlier version heals the first time you run `git wt`.
 
-## Secrets
+## Sync: what every worktree needs that git does not carry
 
-The real file lives **once** in the repo root; every worktree gets a symlink to
-it. The two paths are relative to different places, which is the only fiddly
-part:
+A worktree starts with the tracked files and nothing else. The recipe at
+`<repo-root>/.gwt/sync.toml` says what to add, as an ordered list of steps:
+
+| kind | what it does |
+| --- | --- |
+| `link` | symlink one real file into every worktree (this was `secret`) |
+| `copy` | copy it instead, for files a tool rewrites in place |
+| `run`  | run a command in a worktree, by default only when it is created |
+| `cache` | mount a build cache from outside the worktree (see below) |
+
+Order matters, and is preserved: put `.env` in place before the command that
+reads it.
+
+```toml
+version = 1
+
+[[step]]
+type = "link"
+src  = "secrets/.env"          # relative to the REPO ROOT
+dst  = ".env"                  # relative to EACH WORKTREE ROOT
+
+[[step]]
+type = "copy"
+src  = "secrets/env.sample"
+dst  = ".env"
+overwrite = false              # an edited copy is never clobbered
+render    = true               # substitute {{branch}} etc.
+
+[[step]]
+type = "run"
+cmd  = "npm ci"
+when = ["create"]              # create | apply | manual
+only_if = "package.json"       # only where this exists in the worktree
+timeout = "10m"
+```
+
+The two path columns use different bases, which is the only fiddly part:
 
 ```
-SOURCE            relative to the REPO ROOT      (where .git / .bare / secrets/ live)
-DEST_IN_WORKTREE  relative to EACH WORKTREE ROOT (created in every worktree)
+src   relative to the REPO ROOT      (where .git / .bare / secrets/ live)
+dst   relative to EACH WORKTREE ROOT (created in every worktree)
 
 <repo-root>/
-├── secrets/.env                          <- SOURCE            = secrets/.env
-├── default/.env    -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
-└── feature-a/.env  -> ../secrets/.env    <- DEST_IN_WORKTREE  = .env
+├── .gwt/sync.toml                        <- the recipe
+├── secrets/.env                          <- src = secrets/.env
+├── default/.env    -> ../secrets/.env    <- dst = .env
+└── feature-a/.env  -> ../secrets/.env    <- dst = .env
 ```
+
+### Why `run` is safe to have
+
+`.gwt/` sits beside `.bare/` at the repo root, inside no worktree, so git does
+not track it. Nobody can add a command to your recipe with a push, and `git
+pull` cannot bring one in. A recipe is something you wrote on this machine.
+
+`run` steps also stay out of the way of ordinary repair work: `git wt sync
+apply` re-links and re-copies without re-running anyone's `npm ci`. Ask for it
+with `--run`, or put `apply` in the step's `when`.
+
+The command goes through the shell, from the worktree root, with `GWT_ROOT`,
+`GWT_WORKTREE`, `GWT_WORKTREE_NAME` and `GWT_BRANCH` set. Its output is echoed
+line by line as it arrives, so a slow install is visibly alive.
 
 ### The interactive manager
 
-`git wt secret` with no subcommand opens a manager built like the worktree
-picker:
+`git wt sync` with no subcommand opens a manager built like the worktree picker:
 
 ```
-╭ git wt secret · 2/2 ──────────────────────────────────────────────╮
-│  SOURCE (<repo-root>/…)   DEST (<worktree>/…)   SOURCE   LINKED   │
-│▌ secrets/.env             .env                  ok       2/2      │
-│  secrets/gcp.json         config/gcp.json       ok       2/2      │
-│ manifest /repo/secrets/manifest                                   │
-╰ j/k ↑↓:nav  a:add  d:remove  r:relink  f:filter  q:quit ──────────╯
+╭ git wt sync · 3/3 ─────────────────────────────────────────────────────────╮
+│  KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE  APPLIED│
+│▌ link  secrets/.env                       .env                 ok     2/2   │
+│  copy  secrets/env.sample                 .env.local           ok     2/2   │
+│  run   npm ci                             -                    create   -   │
+│ recipe /repo/.gwt/sync.toml                                                 │
+╰ ↑↓:nav  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q:quit ─────────╯
 ```
 
 | key | action |
 | --- | --- |
-| `a` | add a mapping — **fuzzy-pick the real file**, then type the destination |
-| `d` | remove the mapping and unlink it everywhere (asks `y/N`) |
-| `r` | relink all worktrees |
-| `e` | re-point the selected mapping to a new destination |
+| `a` | add a step — pick `link` / `copy` / `run` / `cache`, then fill it in |
+| `e` | edit the selected step's destination, or its command |
+| `d` | remove the step and undo it everywhere (asks `y/N`) |
+| `r` | re-apply the recipe to all worktrees |
 | `f` / `/` | filter |
 | `?` | show every key binding |
 | `j/k ↑↓`, `g`/`G` | navigate |
 | `q` / `Esc` | quit |
 
-Under the list, a detail strip names the worktrees behind the `LINKED` count —
-`✓ linked in api, default   ✗ missing in web` — so a partial count tells you
-which worktree to go fix, and the absolute source path is shown in full.
+`a` never asks you to type a source path: for `link` and `copy` it lists the
+real files under the repo root (worktrees and `.bare` excluded) and you pick
+one. Then it asks for the destination with the other root spelled out — which is
+the whole src/dst confusion, removed rather than documented. While describing a
+`copy`, `^o` toggles overwrite and `^r` toggles render.
 
-`a` never asks you to type the source: it lists the real files under the repo
-root (worktrees and `.bare` excluded) and you pick one. Then it asks for the
-destination with the other root spelled out — which is the whole src/dst
-confusion, removed rather than documented.
+Under the list, a detail strip names the worktrees behind the `APPLIED` count —
+`✓ applied in api, default   ✗ missing in web` — so a partial count tells you
+which worktree to go fix. For a `run` step it shows `when`, `only_if` and
+`timeout` instead, since a command leaves no mark to count; for a `cache` it
+shows each bucket with its size and the worktrees sharing it, which is the one
+thing the count cannot say.
+
+Creating a worktree runs on a worker thread, so a recipe with an `npm ci` in it
+shows the command and its output on the status line while it works instead of
+freezing the picker.
 
 ### Non-interactively
 
 ```sh
-git wt secret add secrets/.env .env
-git wt secret add secrets/gcp.json config/gcp.json
-git wt secret ls
-git wt secret rm secrets/.env
+git wt sync add  secrets/.env .env                  # link (alias: sync link)
+git wt sync add  secrets/gcp.json config/gcp.json
+git wt sync copy secrets/env.sample .env --render
+git wt sync run  'npm ci' --only-if package.json --timeout 10m
+git wt sync ls
+git wt sync rm   .env
+git wt sync apply [--run]
+git wt sync edit                                    # $EDITOR, then re-parsed
 ```
 
-- `add` and `rm` take effect **immediately** in every existing worktree — no
-  `relink` needed. `relink` is only for repairing links, or after creating a
-  source file that didn't exist when you registered it.
-- `add` accepts an absolute path as long as it is inside the repo root, so shell
-  tab-completion works.
-- `rm` removes only symlinks that still point at that source. A real file
-  sitting at the destination is left alone and reported.
-- The source file itself is never deleted.
+- `link`, `copy` and `rm` take effect **immediately** in every existing
+  worktree. `apply` is only for repairing them, or after creating a source file
+  that didn't exist when you registered it.
+- `run` is registered, not executed: firing someone's `npm ci` in six worktrees
+  because they typed one command would be its own surprise.
+- Source paths may be absolute as long as they are inside the repo root, so
+  shell tab-completion works.
+- `rm` names a step by its destination, its source, or its command line.
+- `rm` removes only a symlink still pointing at that source, or a copy still
+  byte-identical to it. Anything else is left alone and reported with the
+  reason. The source file itself is never deleted.
 
-`secret ls` shows both bases, whether the source exists, and how many worktrees
-currently carry the link:
+`sync ls` shows both bases, whether the source exists, and how many worktrees
+currently carry each step:
 
 ```
-SOURCE (<repo-root>/…)    DEST (<worktree>/…)    SOURCE    LINKED
-------------------------  ---------------------  --------  ------
-secrets/.env              .env                   ok        2/2
-secrets/gcp.json          config/gcp.json        MISSING   0/2
+KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE    APPLIED
+----  ---------------------------------  -------------------  -------  -------
+link  secrets/.env                       .env                 ok       2/2
+copy  secrets/env.sample                 .env.local           MISSING  0/2
+run   npm ci                             -                    create   -
 ```
+
+## Build caches that outlive the worktree
+
+A worktree is a fresh directory, so every build system starts cold. Six
+worktrees of one repo means six `target/` directories and six full builds — and
+deleting a worktree throws its cache away with it.
+
+The obvious fix is to share one cache, and the obvious fix is wrong: two
+branches with different lockfiles must not write to the same `node_modules`.
+So a cache step moves the directory out of the worktree into a **bucket**, and
+which bucket a worktree binds to is decided by the *contents* of the files that
+would make sharing unsafe:
+
+```
+<repo-root>/.gwt/cache/target/a3f19c02b7e4/     <- bucket, keyed on Cargo.lock
+<repo-root>/feature-a/target -> ../.gwt/cache/target/a3f19c02b7e4
+<repo-root>/feature-b/target -> ../.gwt/cache/target/a3f19c02b7e4   same lock
+<repo-root>/bump-deps/target -> ../.gwt/cache/target/71dd4e0af8c1   changed it
+```
+
+Nobody declares "these two branches are compatible". Change the lockfile and
+that worktree moves to its own bucket by itself; change it back and it returns
+to the shared one, still warm.
+
+```sh
+git wt cache init                    # detect what this project is built with
+git wt sync cache target --key Cargo.lock --env CARGO_TARGET_DIR
+git wt cache ls                      # buckets, sizes, who uses them
+git wt cache gc [--older-than 30]    # delete buckets nobody points at
+```
+
+| mode | one bucket per | use it for |
+| --- | --- | --- |
+| `keyed` (default) | distinct contents of `key` | anything a lockfile governs |
+| `shared` | the repo | caches that cannot be poisoned — download caches, content-addressed stores |
+| `private` | worktree | shares nothing, but survives deleting the worktree |
+
+`seed` is on by default: a brand-new bucket is filled from the most recently
+used one by copy-on-write. On APFS, btrfs and XFS that costs neither time nor
+space, so a worktree that has just been split off by a lockfile change starts
+warm instead of empty.
+
+### What it does to your working tree
+
+An existing directory at the mount point is **adopted** — moved into its bucket,
+not deleted — so bringing a warm 4 GB `target/` under management costs nothing.
+If both the worktree and the bucket already hold a cache, gwt stops and says so
+rather than merging them, because merging them is exactly the accident this
+design exists to prevent.
+
+The mount point is added to the clone-local `info/exclude`, not to `.gitignore`:
+git stays quiet and the project's own file is left alone.
+
+```
+$ git wt cache ls
+CACHE         BUCKET        SIZE     USED BY
+------------  ------------  -------  ------------------
+target        a3f19c02b7e4  4.1 GiB  feature-a, default
+target        71dd4e0af8c1  2.7 GiB  bump-deps
+node_modules  8c1e0b3d2af5  412 MiB  (unused)
+```
+
+### The part symlinks cannot fix
+
+Sharing the directory solves one half. The other half is that some tools bake an
+absolute path into their own cache keys, so the same bucket read from a
+different worktree path can still miss. cargo's dep-info and incremental data
+are like this: a shared `target/` used from two paths may rebuild anyway.
+
+Where a tool accepts the cache location as an environment variable, that is the
+better answer, because then the worktree path never enters into it:
+
+```sh
+git wt sync cache target --key Cargo.lock --env CARGO_TARGET_DIR
+eval "$(git wt cache env)"     # export CARGO_TARGET_DIR=…/.gwt/cache/target/a3f…
+```
+
+Otherwise the honest advice is to lean on `keyed` plus `seed`, which gives you
+"not shared, but warm" and sidesteps the question entirely.
+
+### Keeping the binding current
+
+A keyed bucket is chosen from a lockfile, so switching branches can invalidate
+the choice. `git wt sync apply` re-checks and re-points every mount, and
+
+```sh
+git wt cache hooks
+```
+
+installs `post-checkout` and `post-merge` in the bare repo's `hooks/` — shared
+by every worktree — so it happens on its own.
+
+### Upgrading from `git wt secret`
+
+Nothing to do. `secret` and `relink` still work — they print the new name and
+run `sync` and `sync apply`. An existing `secrets/manifest` is read as a list of
+`link` steps, and the first change you make writes `.gwt/sync.toml` with those
+rows carried over. Comments in a hand-edited `sync.toml` survive edits made from
+the TUI.
 
 ## Language
 

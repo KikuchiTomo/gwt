@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.6.4"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"   # `is_none_or`, used since 0.6
 license = "MIT"
 repository = "https://github.com/tomookikuchi/gwt"
 

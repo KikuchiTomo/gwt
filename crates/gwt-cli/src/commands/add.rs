@@ -7,7 +7,7 @@ use super::conflict::{self, Resolve};
 pub fn run(layout: &BareLayout, branch: &str, name: &str, r: Resolve) -> Result<()> {
     // `add` already adopts an existing local branch, so only a taken path can
     // fail here — but route everything through the same resolver for one story.
-    let path = match ops::add(layout, branch, name) {
+    let path = match ops::add(layout, branch, name, &mut super::sync::report) {
         Ok(p) => p,
         Err(e) => conflict::resolve(layout, e, branch, name, None, r)?,
     };

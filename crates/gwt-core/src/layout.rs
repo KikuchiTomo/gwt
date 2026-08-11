@@ -4,6 +4,8 @@ use crate::error::{Error, Result};
 use crate::git;
 
 pub const BARE_DIR: &str = ".bare";
+pub const GWT_DIR: &str = ".gwt";
+pub const SYNC_FILE: &str = "sync.toml";
 pub const SECRETS_DIR: &str = "secrets";
 pub const MANIFEST_FILE: &str = "manifest";
 pub const DEFAULT_WT_NAME: &str = "default";
@@ -12,8 +14,15 @@ pub const DEFAULT_WT_NAME: &str = "default";
 pub struct BareLayout {
     pub root: PathBuf,
     pub bare_dir: PathBuf,
+    /// `<root>/.gwt` — gwt's own state, beside `.bare` and inside no worktree.
+    pub gwt_dir: PathBuf,
+    /// `<root>/.gwt/sync.toml` — the sync recipe.
+    pub sync_config: PathBuf,
+    /// Where the real files a recipe points at conventionally live.
     pub secrets_dir: PathBuf,
-    pub manifest: PathBuf,
+    /// `<root>/secrets/manifest` — the pre-0.7 manifest, still read if the
+    /// TOML recipe does not exist yet.
+    pub legacy_manifest: PathBuf,
 }
 
 impl BareLayout {
@@ -39,13 +48,17 @@ impl BareLayout {
                 reason: ".bare/ directory missing",
             });
         }
+        let gwt_dir = cwd.join(GWT_DIR);
+        let sync_config = gwt_dir.join(SYNC_FILE);
         let secrets_dir = cwd.join(SECRETS_DIR);
-        let manifest = secrets_dir.join(MANIFEST_FILE);
+        let legacy_manifest = secrets_dir.join(MANIFEST_FILE);
         Ok(Self {
             root: cwd.to_path_buf(),
             bare_dir,
+            gwt_dir,
+            sync_config,
             secrets_dir,
-            manifest,
+            legacy_manifest,
         })
     }
 

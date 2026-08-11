@@ -226,55 +226,113 @@ pub mod t {
         nothing_to_create => "nothing to create", "作成対象がありません";
     }}
 
-    // ---- secrets manager --------------------------------------------------
-    msg! { SECRET {
-        secret_help => " ↑↓:nav  a:add  e:re-point  d:remove  r:relink  f:filter  ?:keys  q:quit ",
-                       " ↑↓:移動  a:追加  e:変更  d:削除  r:再リンク  f:絞込  ?:キー  q:終了 ";
-        secret_help_filter => " type:filter  esc:clear  ↑↓:nav  enter:done ",
-                              " 入力:絞込  esc:解除  ↑↓:移動  enter:確定 ";
-        secret_help_source => " type:filter  ↑↓/^p^n:nav  enter:choose file  esc:back ",
-                              " 入力:絞込  ↑↓/^p^n:移動  enter:ファイル決定  esc:戻る ";
-        secret_help_dest => " type:path inside each worktree  enter:link now  esc:cancel ",
-                            " 各ワークツリー内のパスを入力  enter:リンク作成  esc:中止 ";
-        secret_help_remove => " y: remove mapping + its links   any other key: cancel ",
-                              " y: 対応付けとリンクを削除   その他のキー: 中止 ";
-        secret_title => "git wt secret", "git wt secret";
-        secret_title_source => "secret · pick source", "secret · ソース選択";
-        secret_title_dest => "secret · destination", "secret · 配置先";
-        secret_dest_sub => "in every worktree", "全ワークツリー内";
-        col_source => "SOURCE (<repo-root>/…)", "ソース (<リポジトリルート>/…)";
+    // ---- sync manager -----------------------------------------------------
+    msg! { SYNC {
+        sync_help => " ↑↓:nav  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q:quit ",
+                     " ↑↓:移動  a:追加  e:変更  d:削除  r:適用  f:絞込  ?:キー  q:終了 ";
+        sync_help_filter => " type:filter  esc:clear  ↑↓:nav  enter:done ",
+                            " 入力:絞込  esc:解除  ↑↓:移動  enter:確定 ";
+        sync_help_kind => " l:link  c:copy  r:run  k:cache   ↑↓:move  enter:pick  esc/q:cancel ",
+                          " l:リンク  c:コピー  r:コマンド  k:キャッシュ   enter:決定  esc/q:中止 ";
+        sync_help_source => " type:filter  ↑↓/^p^n:nav  enter:choose file  esc:back ",
+                            " 入力:絞込  ↑↓/^p^n:移動  enter:ファイル決定  esc:戻る ";
+        sync_help_dest => " type:path inside each worktree  enter:apply now  esc:cancel ",
+                          " 各ワークツリー内のパスを入力  enter:今すぐ適用  esc:中止 ";
+        sync_help_dest_copy => " ^o:overwrite  ^r:render  enter:copy now  esc:cancel ",
+                               " ^o:上書き  ^r:置換  enter:今すぐコピー  esc:中止 ";
+        sync_help_cmd => " type a command  enter:register  esc:cancel ",
+                         " コマンドを入力  enter:登録  esc:中止 ";
+        sync_help_cache_path => " type the directory to cache  enter:next  esc:cancel ",
+                                " キャッシュするディレクトリを入力  enter:次へ  esc:中止 ";
+        sync_help_cache_mode => " ↑↓:move  enter:pick  k/s/p  esc/q:cancel ",
+                                " ↑↓:移動  enter:決定  k/s/p  esc/q:中止 ";
+        sync_help_cache_key => " space-separated files  enter:mount now  esc:cancel ",
+                               " 空白区切りでファイルを列挙  enter:今すぐ適用  esc:中止 ";
+        sync_help_remove => " y: remove the step and undo it   any other key: cancel ",
+                            " y: 手順を削除して元に戻す   その他のキー: 中止 ";
+        sync_title => "git wt sync", "git wt sync";
+        sync_title_kind => "sync · new step", "sync · 手順の追加";
+        sync_title_source => "sync · pick source", "sync · ソース選択";
+        sync_title_dest => "sync · destination", "sync · 配置先";
+        sync_title_cmd => "sync · command", "sync · コマンド";
+        sync_title_cache => "sync · build cache", "sync · ビルドキャッシュ";
+        sync_dest_sub => "in every worktree", "全ワークツリー内";
+        col_kind => "KIND", "種別";
+        col_source => "SOURCE (<repo-root>/…) or COMMAND",
+                      "ソース (<リポジトリルート>/…) / コマンド";
         col_dest => "DEST (<worktree>/…)", "配置先 (<ワークツリー>/…)";
         col_state => "STATE", "状態";
-        col_linked => "LINKED", "リンク";
+        col_applied => "APPLIED", "適用";
         state_ok => "ok", "ok";
         state_missing => "MISSING", "無し";
-        empty_title => "no secret mappings yet.", "まだ登録がありません。";
+        kind_link_desc => "symlink one real file into every worktree",
+                          "実ファイルを全ワークツリーに symlink する";
+        kind_copy_desc => "copy it instead — for files a tool rewrites in place",
+                          "コピーする。ツールが書き換えるファイル向け";
+        kind_run_desc => "run a command when a worktree is created",
+                         "ワークツリー作成時にコマンドを実行する";
+        kind_cache_desc => "keep a build cache outside the worktree, and share it safely",
+                           "ビルドキャッシュをワークツリーの外に置いて安全に共有する";
+        cache_mode_keyed_desc => "share only with worktrees whose key files match",
+                                 "キーのファイルが一致するワークツリーとだけ共有";
+        cache_mode_shared_desc => "one cache for the whole repo — for caches that cannot be poisoned",
+                                  "リポジトリで 1 つ。壊れようがないキャッシュ向け";
+        cache_mode_private_desc => "one per worktree, but it outlives the worktree",
+                                   "ワークツリーごとに 1 つ。削除しても残る";
+        cache_path_question => "which directory should live outside the worktree?",
+                               "どのディレクトリをワークツリーの外に置きますか？";
+        cache_path_hint => "relative to each worktree's root, e.g. ",
+                           "各ワークツリーのルートからの相対パス。例: ";
+        cache_path_hint2 => "the real data goes under ", "実体の置き場所は ";
+        cache_key_hint => "files whose contents decide who shares, e.g. ",
+                          "共有の可否を決めるファイル。例: ";
+        cache_key_hint2 => "or several, space separated, e.g. ",
+                           "複数可。空白区切り。例: ";
+        cache_key_required => "at least one key file is required",
+                              "キーとなるファイルを 1 つ以上入力してください";
+        cache_detail_split => "the key has separated these worktrees",
+                              "キーによってワークツリーが分かれています";
+        cache_detail_together => "every worktree shares one bucket",
+                                 "全ワークツリーが同じ実体を共有しています";
+        label_cache_path => "cache dir", "キャッシュ先";
+        label_cache_key => "key files", "キー";
+        label_mounting => "mounting", "接続中";
+        empty_title => "no sync steps yet.", "まだ手順がありません。";
         empty_hint_pre => "press ", "";
-        empty_hint_post => " to pick a file and link it into every worktree.",
-                           " を押すとファイルを選んで全ワークツリーにリンクできます。";
+        empty_hint_post => " to link a file, copy one, or add a command.",
+                           " を押すとリンク・コピー・コマンドを追加できます。";
         pick_source_hint => "pick the real file — paths are relative to ",
                             "実ファイルを選んでください — パスの基準は ";
-        dest_question => "where should the link appear inside each worktree?",
-                         "各ワークツリー内のどこにリンクを置きますか？";
+        dest_question => "where should it land inside each worktree?",
+                         "各ワークツリー内のどこに置きますか？";
         dest_relative_hint => "the path is relative to that worktree's root, e.g. ",
                               "そのワークツリーのルートからの相対パス。例: ";
         dest_required => "destination is required", "配置先を入力してください";
+        cmd_question => "what should run inside a new worktree?",
+                        "新しいワークツリーで何を実行しますか？";
+        cmd_hint => "it runs through the shell, from the worktree root, e.g. ",
+                    "ワークツリーのルートでシェル経由で実行します。例: ";
+        cmd_required => "a command is required", "コマンドを入力してください";
+        cmd_more_in_toml => "only_if, timeout and dir are set in .gwt/sync.toml",
+                            "only_if・timeout・dir は .gwt/sync.toml で設定します";
+        opt_overwrite => "overwrite", "上書き";
+        opt_render => "render", "置換";
         label_source => "source", "ソース";
         label_dest => "dest (in each worktree)", "配置先 (各ワークツリー内)";
+        label_command => "command", "コマンド";
         label_filter => "filter", "絞込";
-        label_manifest => " manifest ", " 定義ファイル ";
-        detail_linked_in => "linked in", "リンク済み";
-        detail_missing_in => "missing in", "未リンク";
+        label_recipe => " recipe ", " 定義ファイル ";
+        detail_applied_in => "applied in", "適用済み";
+        detail_missing_in => "missing in", "未適用";
         detail_no_worktrees => "no worktrees yet", "ワークツリーがありません";
-        detail_foreign => "a real file is in the way", "実ファイルが存在します";
+        detail_runs_on => "runs on", "実行タイミング";
+        detail_only_if => "only if", "条件";
+        detail_timeout => "timeout", "制限時間";
         no_candidates => "no files to pick under the repo root — put the real file there first",
                          "リポジトリルート直下に候補がありません。先に実ファイルを置いてください";
-        label_relinking => "relinking", "再リンク中";
+        label_applying => "applying", "適用中";
         label_linking => "linking", "リンク中";
         label_removing => "removing", "削除中";
-        secret_confirm_remove_pre => "remove '", "'";
-        secret_confirm_remove_mid => "' and unlink ", "' の対応付けを削除し ";
-        secret_confirm_remove_post => " everywhere ? y/N", " のリンクを全て解除しますか？ y/N";
         src_missing_note => "the source file does not exist yet",
                             "ソースファイルがまだ存在しません";
         src_untouched => "the source file itself is never deleted",
@@ -284,38 +342,59 @@ pub mod t {
     // ---- runtime-formatted messages ---------------------------------------
     use super::pick;
 
-    pub fn secret_linked_into(src: &str, dst: &str, n: usize) -> String {
+    pub fn sync_applied_into(src: &str, dst: &str, n: usize) -> String {
         pick(
-            format!("{src} → (worktree)/{dst}  · linked into {n}"),
-            format!("{src} → (ワークツリー)/{dst}  · {n} 個にリンクしました"),
+            format!("{src} → (worktree)/{dst}  · applied to {n}"),
+            format!("{src} → (ワークツリー)/{dst}  · {n} 個に適用しました"),
         )
     }
 
-    pub fn secret_registered_no_src(src: &str) -> String {
+    pub fn sync_registered_no_src(src: &str) -> String {
         pick(
             format!("{src} registered, but the source does not exist yet"),
             format!("{src} を登録しました（ソースはまだ存在しません）"),
         )
     }
 
-    pub fn secret_removed(src: &str, n: usize) -> String {
+    pub fn cache_key_question(path: &str) -> String {
         pick(
-            format!("removed {src} · unlinked {n}"),
-            format!("{src} を削除 · {n} 個のリンクを解除"),
+            format!("which files decide who may share '{path}'?"),
+            format!("'{path}' を共有してよいかを，どのファイルで判定しますか？"),
         )
     }
 
-    pub fn secret_kept_real(names: &str) -> String {
+    pub fn cache_mounted(path: &str, bucket: &str, n: usize) -> String {
+        pick(
+            format!("{path} → bucket {bucket}  · mounted in {n}"),
+            format!("{path} → バケツ {bucket}  · {n} 個に接続しました"),
+        )
+    }
+
+    pub fn sync_registered_cmd(cmd: &str) -> String {
+        pick(
+            format!("registered: {cmd} — it runs when a worktree is created"),
+            format!("{cmd} を登録しました。ワークツリー作成時に実行します"),
+        )
+    }
+
+    pub fn sync_removed(subject: &str, n: usize) -> String {
+        pick(
+            format!("removed {subject} · undone in {n}"),
+            format!("{subject} を削除 · {n} 個で元に戻しました"),
+        )
+    }
+
+    pub fn sync_kept_real(names: &str) -> String {
         pick(
             format!("  · kept a real file in {names}"),
             format!("  · {names} は実ファイルのため残しました"),
         )
     }
 
-    pub fn secret_no_entry(src: &str) -> String {
+    pub fn sync_no_entry(subject: &str) -> String {
         pick(
-            format!("no entry for {src}"),
-            format!("{src} の登録がありません"),
+            format!("no entry for {subject}"),
+            format!("{subject} の登録がありません"),
         )
     }
 
@@ -349,10 +428,10 @@ pub mod t {
         )
     }
 
-    pub fn relinked(n: usize) -> String {
+    pub fn sync_applied_to(n: usize) -> String {
         pick(
-            format!("relinked {n} worktree(s)"),
-            format!("{n} 個のワークツリーを再リンクしました"),
+            format!("applied to {n} worktree(s)"),
+            format!("{n} 個のワークツリーに適用しました"),
         )
     }
 
@@ -382,13 +461,13 @@ pub mod t {
         k_quit => "close the picker", "ピッカーを閉じる";
         k_help => "show this help", "このヘルプを表示";
 
-        k_sadd => "add a mapping (pick a file, then the destination)",
-                  "対応付けを追加 (ファイルを選び、配置先を入力)";
-        k_sedit => "re-point the selected mapping to a new destination",
-                   "選択中の配置先を変更";
-        k_sdel => "remove the mapping and unlink it everywhere",
-                  "対応付けを削除し全ワークツリーのリンクも解除";
-        k_srelink => "re-apply every link", "全リンクを貼り直す";
+        k_sadd => "add a step: link a file, copy one, or run a command",
+                  "手順を追加: リンク・コピー・コマンド実行";
+        k_sedit => "change the selected step's destination or command",
+                   "選択中の手順の配置先やコマンドを変更";
+        k_sdel => "remove the step and undo it in every worktree",
+                  "手順を削除し全ワークツリーで元に戻す";
+        k_sapply => "re-apply the whole recipe", "定義を全ワークツリーに再適用";
         k_squit => "close the manager", "管理画面を閉じる";
     }}
 }
@@ -423,7 +502,7 @@ mod tests {
     #[test]
     fn footer_lines_fit_a_narrow_terminal() {
         const BUDGET: usize = 96;
-        for group in [t::SHARED, t::PICKER, t::SECRET, t::HELP] {
+        for group in [t::SHARED, t::PICKER, t::SYNC, t::HELP] {
             for (name, en, ja) in group {
                 // Convention: help/footer strings are padded with spaces.
                 if !(en.starts_with(' ') && en.ends_with(' ')) {
@@ -442,11 +521,11 @@ mod tests {
 
     #[test]
     fn every_entry_is_translated() {
-        for group in [t::SHARED, t::PICKER, t::SECRET, t::HELP] {
+        for group in [t::SHARED, t::PICKER, t::SYNC, t::HELP] {
             for (name, en, ja) in group {
                 assert!(!en.trim().is_empty(), "{name} has no English text");
                 // A handful are deliberately identical (product names, "ok").
-                let same_ok = ["secret_title", "state_ok", "empty_hint_pre"];
+                let same_ok = ["sync_title", "state_ok", "empty_hint_pre"];
                 if !same_ok.contains(name) {
                     assert_ne!(en, ja, "{name} was never translated");
                 }

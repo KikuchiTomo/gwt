@@ -38,13 +38,16 @@ pub enum Error {
     #[error("worktree '{0}' not found")]
     WorktreeNotFound(String),
 
-    #[error("invalid secret source '{path}': {reason} (it must name a file inside the repo root)")]
-    SecretSrcInvalid { path: String, reason: &'static str },
+    #[error("invalid source '{path}': {reason} (it must name a file inside the repo root)")]
+    SyncSrcInvalid { path: String, reason: &'static str },
 
     #[error(
-        "invalid secret destination '{path}': {reason} (it is the path the link takes inside each worktree)"
+        "invalid destination '{path}': {reason} (it is the path the step takes inside each worktree)"
     )]
-    SecretDstInvalid { path: String, reason: &'static str },
+    SyncDstInvalid { path: String, reason: &'static str },
+
+    #[error("invalid .gwt/sync.toml: {reason}")]
+    SyncConfigInvalid { reason: String },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

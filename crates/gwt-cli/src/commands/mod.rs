@@ -1,4 +1,5 @@
 pub mod add;
+pub mod cache;
 pub mod check;
 pub mod clone;
 pub mod config;
@@ -6,8 +7,7 @@ pub mod conflict;
 pub mod list;
 pub mod new;
 pub mod relativize;
-pub mod relink;
 pub mod remove;
 pub mod review;
-pub mod secret;
 pub mod shellinit;
+pub mod sync;
