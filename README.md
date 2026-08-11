@@ -202,6 +202,34 @@ upstream instead of failing with git's "no tracking information" hint.
 `P` publishes to the remote, so it always asks for confirmation first. A branch
 with no upstream is pushed with `-u`.
 
+### Cloning
+
+`git wt clone` shows what git is doing while it does it:
+
+```
+  Counting objects     ████████████████████████ 100%
+  Compressing objects  ████████████████████████ 100%
+  Receiving objects    ████████████████████████ 100%  128.4 MiB | 11.2 MiB/s, done.
+```
+
+git writes that progress to stderr in `\r`-separated updates and only when it
+is talking to a terminal, so `git wt` asks for it explicitly and reads it as it
+arrives. Piped or in CI the bar would be thousands of useless lines, so only the
+phase changes are printed. A clone from a plain local path stays silent because
+git copies the objects directly and reports nothing to show.
+
+**A remote with no commits** — one you created on the host a minute ago — used
+to fail with `fatal: invalid reference: main` and leave a root with no worktree
+in it. HEAD names a branch that does not exist as a ref yet. Now the `default`
+worktree is created on that unborn branch, exactly where `git clone` would leave
+you, and the reason is spelled out:
+
+```
+$ git wt clone git@github.com:you/brand-new.git
+note: git@github.com:you/brand-new.git has no commits yet — 'default' is on the
+      unborn branch 'main'. commit and `git push -u origin main` to start it.
+```
+
 ### When something already exists
 
 Creating a worktree used to fail outright if the branch or the directory was

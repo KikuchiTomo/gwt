@@ -66,8 +66,8 @@ fn fixture(tag: &str) -> (PathBuf, BareLayout) {
     // A non-bare origin refuses pushes to the checked-out branch; park it.
     git(&origin, &["config", "receive.denyCurrentBranch", "ignore"]);
 
-    let root = ops::clone(origin.to_str().unwrap(), Some("repo"), &base).unwrap();
-    let layout = BareLayout::require(&root).unwrap();
+    let done = ops::clone(origin.to_str().unwrap(), Some("repo"), &base, &mut |_| {}).unwrap();
+    let layout = BareLayout::require(&done.root).unwrap();
     (origin, layout)
 }
 
@@ -499,6 +499,42 @@ fn the_bare_dir_is_never_treated_as_a_worktree() {
     assert!(
         !layout.bare_dir.join(".env").exists(),
         "nothing belongs inside .bare"
+    );
+}
+
+/// A repository created on the host and not yet pushed to has a HEAD but no
+/// commit, so the branch HEAD names does not exist as a ref. `worktree add
+/// <branch>` failed with "invalid reference: main" and left a root with no
+/// worktree in it — the first thing you would ever do with a new remote.
+#[test]
+fn cloning_an_empty_origin_still_gives_you_somewhere_to_work() {
+    let base = scratch("empty-origin");
+    let origin = base.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main", "."]);
+
+    let done = ops::clone(origin.to_str().unwrap(), Some("repo"), &base, &mut |_| {}).unwrap();
+    assert!(done.empty_origin);
+    assert_eq!(done.branch, "main");
+
+    let wt = done.root.join("default");
+    assert!(wt.is_dir(), "the default worktree must exist anyway");
+    assert_eq!(branch_of(&wt), "main");
+    assert!(
+        git(&wt, &["status", "-sb"]).contains("No commits yet"),
+        "the branch should be unborn, not sitting on a fabricated commit"
+    );
+
+    // And it is a real worktree: a first commit works, and lands on `main`.
+    commit(&wt, "first.txt", "hello\n", "first");
+    assert_eq!(branch_of(&wt), "main");
+    assert_eq!(
+        git(
+            &done.root,
+            &["--git-dir", ".bare", "rev-parse", "--abbrev-ref", "main"]
+        )
+        .trim(),
+        "main"
     );
 }
 

@@ -22,7 +22,21 @@ pub struct CheckReport {
     pub has_local: bool,
 }
 
-pub fn clone(url: &str, dir_name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
+/// What a clone produced. `empty_origin` is true when the remote has no commits
+/// yet, which changes what the caller should tell the user to do next.
+#[derive(Debug, Clone)]
+pub struct Cloned {
+    pub root: PathBuf,
+    pub branch: String,
+    pub empty_origin: bool,
+}
+
+pub fn clone(
+    url: &str,
+    dir_name: Option<&str>,
+    cwd: &Path,
+    report: &mut dyn FnMut(&git::Progress),
+) -> Result<Cloned> {
     let inferred = dir_name.map(str::to_string).unwrap_or_else(|| {
         let trimmed = url.trim_end_matches('/');
         let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
@@ -34,7 +48,18 @@ pub fn clone(url: &str, dir_name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
     }
     std::fs::create_dir(&root)?;
 
-    git::run(&root, ["clone", "--bare", url, BARE_DIR])?;
+    // `--progress` because git only volunteers it to a terminal, and our stderr
+    // is a pipe.
+    let mut on_line = |line: &str| {
+        if let Some(p) = git::parse_progress(line) {
+            report(&p);
+        }
+    };
+    git::stream(
+        &root,
+        ["clone", "--bare", "--progress", url, BARE_DIR],
+        &mut on_line,
+    )?;
     std::fs::write(root.join(".git"), format!("gitdir: ./{BARE_DIR}\n"))?;
     // `--bare` doesn't set the canonical fetch refspec — fix that so subsequent
     // `git fetch` brings down remote branches as `refs/remotes/origin/*`.
@@ -48,7 +73,11 @@ pub fn clone(url: &str, dir_name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
             "+refs/heads/*:refs/remotes/origin/*",
         ],
     )?;
-    git::run(&root, ["--git-dir", BARE_DIR, "fetch", "origin"])?;
+    git::stream(
+        &root,
+        ["--git-dir", BARE_DIR, "fetch", "--progress", "origin"],
+        &mut on_line,
+    )?;
 
     // The conventional home for the real files a recipe points at. Creating it
     // empty is the cheapest way to answer "where do I put my .env?".
@@ -56,11 +85,89 @@ pub fn clone(url: &str, dir_name: Option<&str>, cwd: &Path) -> Result<PathBuf> {
 
     let layout = BareLayout::require(&root)?;
     sync::write_starter(&layout)?;
-    let default = layout.default_branch()?;
-    git::run(&root, ["worktree", "add", DEFAULT_WT_NAME, &default])?;
+    let branch = layout.default_branch()?;
+    // A repo created on the host five minutes ago has a HEAD but no commit, so
+    // the branch HEAD names does not exist as a ref. `worktree add <branch>`
+    // then fails with "invalid reference", which said nothing about the actual
+    // situation — and left a root with no worktree in it.
+    let empty_origin = !branch_exists_local(&layout, &branch)?;
+    if empty_origin {
+        add_unborn_worktree(&layout, &branch, DEFAULT_WT_NAME)?;
+    } else {
+        git::run(&root, ["worktree", "add", DEFAULT_WT_NAME, &branch])?;
+    }
     relativize_one(&layout, Path::new(DEFAULT_WT_NAME))?;
     sync::apply_quiet(&layout, &root.join(DEFAULT_WT_NAME), Phase::Create)?;
-    Ok(root)
+    Ok(Cloned {
+        root,
+        branch,
+        empty_origin,
+    })
+}
+
+/// Check out a branch that has no commits yet, the way `git clone` leaves you
+/// after cloning an empty repository.
+///
+/// git 2.42 added `worktree add --orphan` for exactly this. Older git — Ubuntu
+/// 22.04 ships 2.34 — needs the same state built from plumbing: branch the
+/// worktree off a throwaway commit, then delete the ref, which leaves HEAD
+/// pointing at an unborn branch. The temporary commit is unreachable from that
+/// moment and the next `git gc` collects it.
+fn add_unborn_worktree(layout: &BareLayout, branch: &str, name: &str) -> Result<()> {
+    let root = &layout.root;
+    if matches!(git::version(root), Some(v) if v >= (2, 42)) {
+        git::run(root, ["worktree", "add", "--orphan", "-b", branch, name])?;
+        return Ok(());
+    }
+    let empty_tree = git::run(
+        root,
+        [
+            "--git-dir",
+            BARE_DIR,
+            "hash-object",
+            "-w",
+            "-t",
+            "tree",
+            devnull(),
+        ],
+    )?
+    .trim()
+    .to_string();
+    let seed = git::run(
+        root,
+        [
+            "--git-dir",
+            BARE_DIR,
+            "commit-tree",
+            &empty_tree,
+            "-m",
+            "gwt: temporary root for an empty repository",
+        ],
+    )?
+    .trim()
+    .to_string();
+    git::run(root, ["worktree", "add", "-b", branch, name, &seed])?;
+    git::run(
+        root,
+        [
+            "--git-dir",
+            BARE_DIR,
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn devnull() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn devnull() -> &'static str {
+    "NUL"
 }
 
 /// Adopt an existing branch (local or origin) into a fresh worktree at
@@ -556,11 +663,15 @@ pub fn push(worktree_dir: &Path) -> Result<String> {
 }
 
 pub fn current_branch(worktree_dir: &Path) -> Result<String> {
-    Ok(
-        git::run(worktree_dir, ["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_string(),
-    )
+    // On a branch with no commits yet, `rev-parse HEAD` has nothing to resolve
+    // and fails. HEAD is still a symref to the branch, which is the answer.
+    match git::run(worktree_dir, ["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(out) => Ok(out.trim().to_string()),
+        Err(e) => match git::run(worktree_dir, ["symbolic-ref", "--short", "HEAD"]) {
+            Ok(out) => Ok(out.trim().to_string()),
+            Err(_) => Err(e),
+        },
+    }
 }
 
 /// The worktree that currently has `branch` checked out, if any. Git refuses to
