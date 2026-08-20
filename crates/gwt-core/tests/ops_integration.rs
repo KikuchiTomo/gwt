@@ -239,6 +239,67 @@ fn pull_is_fast_forward_only_and_push_sets_upstream() {
     assert_ne!(git(&main_wt, &["rev-parse", "HEAD"]).trim(), before);
 }
 
+/// Standing in a worktree is the normal way to work in one, so everything that
+/// needs the layout has to be reachable from there. It was not: `git wt sync`
+/// refused to open, and the picker fell back to a plain `git worktree add` that
+/// skipped the recipe entirely.
+#[test]
+fn the_layout_is_found_from_anywhere_inside_the_repo() {
+    let (_origin, layout) = fixture("discover");
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+
+    let from_root = BareLayout::discover(&layout.root).unwrap();
+    assert!(same_path(&from_root.root, &layout.root));
+
+    let from_worktree = BareLayout::discover(&wt).unwrap();
+    assert!(same_path(&from_worktree.root, &layout.root));
+    // And the recipe it finds is the one at the root, not a path inside the
+    // worktree that nothing would ever write to.
+    assert!(same_path(&from_worktree.sync_config, &layout.sync_config));
+
+    let nested = wt.join("deep/inside");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(same_path(
+        &BareLayout::discover(&nested).unwrap().root,
+        &layout.root
+    ));
+
+    // A plain checkout has a common dir too, and it is not this layout.
+    let plain = scratch("discover-plain");
+    git(&plain, &["init", "-q", "-b", "main", "."]);
+    assert!(BareLayout::discover(&plain).is_err());
+}
+
+/// With `sync` runnable from a worktree, a relative SOURCE can no longer mean
+/// "relative to the root" — that is not where the shell just tab-completed.
+#[test]
+fn a_source_path_is_relative_to_where_you_are_standing() {
+    let (_origin, layout) = fixture("src-cwd");
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    std::fs::create_dir_all(&layout.secrets_dir).unwrap();
+    std::fs::write(layout.secrets_dir.join(".env"), "TOKEN=1\n").unwrap();
+
+    // From the root, the two readings coincide — unchanged behaviour.
+    assert_eq!(
+        sync::normalize_src(&layout, &layout.root, "secrets/.env").unwrap(),
+        "secrets/.env"
+    );
+    // From a worktree, the path the user can actually type resolves.
+    assert_eq!(
+        sync::normalize_src(&layout, &wt, "../secrets/.env").unwrap(),
+        "secrets/.env"
+    );
+    // An absolute path still works from either place, and a file that does not
+    // exist yet is still registerable.
+    let abs = layout.secrets_dir.join("later.json");
+    assert_eq!(
+        sync::normalize_src(&layout, &wt, abs.to_str().unwrap()).unwrap(),
+        "secrets/later.json"
+    );
+    // Outside the root is refused rather than quietly reinterpreted.
+    assert!(sync::normalize_src(&layout, &wt, "../../elsewhere").is_err());
+}
+
 /// Branching from a stale `main` is the mistake the picker offers to head off,
 /// so the answer it asks about has to come from origin, not from whatever the
 /// last fetch happened to leave behind.

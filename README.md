@@ -403,6 +403,21 @@ dst   relative to EACH WORKTREE ROOT (created in every worktree)
 └── feature-a/.env  -> ../secrets/.env    <- dst = .env
 ```
 
+### Running it from a worktree
+
+Every `git wt` command works from anywhere inside the repo — the root, a
+worktree, or a directory inside one. The root is found the way git finds it, so
+being one `cd` in is the normal case rather than an error.
+
+This matters beyond convenience: with no root there is no recipe, so creating a
+worktree from inside another one used to fall back to a plain `git worktree add`
+that skipped the recipe and left a non-portable gitdir pointer behind. For the
+same reason the picker showed no `REMOTE` / `DIRTY` / `STASH` columns there.
+
+A relative `src` is read from where you are standing — `../secrets/.env` from a
+worktree names the same file as `secrets/.env` from the root — and is stored
+root-relative either way, so the recipe reads the same however it was written.
+
 ### Why `run` is safe to have
 
 `.gwt/` sits beside `.bare/` at the repo root, inside no worktree, so git does

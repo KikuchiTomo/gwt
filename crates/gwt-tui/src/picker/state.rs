@@ -294,7 +294,11 @@ pub struct App<'a> {
 
 impl<'a> App<'a> {
     pub fn new(repo: &'a Repo) -> Result<Self> {
-        let layout = BareLayout::require(&repo.cwd).ok();
+        // From anywhere in the repo, not just its root: standing in a worktree
+        // is the normal case, and without the layout the picker loses its
+        // metrics columns, its base-branch check, and — worst — creates
+        // worktrees with a plain `git worktree add` that never runs the recipe.
+        let layout = BareLayout::discover(&repo.cwd).ok();
         let worktrees = visible_worktrees(repo, layout.as_ref())?;
         let metrics = compute_metrics(layout.as_ref(), &worktrees);
         let cols = compute_col_widths(&worktrees, &metrics);

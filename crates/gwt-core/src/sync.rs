@@ -224,9 +224,11 @@ pub struct SyncConfig {
 
 /// Normalize a user-supplied source path into a repo-root-relative path.
 ///
-/// Accepts an absolute path inside the root, or a path relative to the root
-/// (which is also the cwd, since every `sync` subcommand runs from the root).
-pub fn normalize_src(layout: &BareLayout, input: &str) -> Result<String> {
+/// Accepts an absolute path inside the root, or one relative to `cwd` — which
+/// is what the shell just tab-completed against, and no longer necessarily the
+/// root now that these subcommands run from inside a worktree too. From the
+/// root the two readings coincide, so `sync add secrets/.env` is unchanged.
+pub fn normalize_src(layout: &BareLayout, cwd: &Path, input: &str) -> Result<String> {
     let raw = input.trim();
     if raw.is_empty() {
         return Err(Error::SyncSrcInvalid {
@@ -235,22 +237,26 @@ pub fn normalize_src(layout: &BareLayout, input: &str) -> Result<String> {
         });
     }
     let p = Path::new(raw);
-    // An absolute source is fine as long as it names a file inside the root —
-    // shell tab-completion produces these, so accept and fold them back.
-    let rel: PathBuf = if p.is_absolute() {
-        // Compare against the canonical root so /var vs /private/var (macOS) and
-        // symlinked checkouts don't spuriously look "outside".
-        let root = fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
-        let cand = canonicalize_lexically_existing(p);
-        cand.strip_prefix(&root)
-            .map(Path::to_path_buf)
-            .map_err(|_| Error::SyncSrcInvalid {
-                path: input.to_string(),
-                reason: "absolute path is outside the repo root",
-            })?
+    let absolute = p.is_absolute();
+    // Compare against the canonical root so /var vs /private/var (macOS) and
+    // symlinked checkouts don't spuriously look "outside".
+    let root = fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
+    let cand = canonicalize_lexically_existing(&if absolute {
+        p.to_path_buf()
     } else {
-        PathBuf::from(raw)
-    };
+        cwd.join(p)
+    });
+    let rel = cand
+        .strip_prefix(&root)
+        .map_err(|_| Error::SyncSrcInvalid {
+            path: input.to_string(),
+            reason: if absolute {
+                "absolute path is outside the repo root"
+            } else {
+                "path is outside the repo root"
+            },
+        })?
+        .to_path_buf();
 
     lexical_normalize(&rel).ok_or_else(|| Error::SyncSrcInvalid {
         path: input.to_string(),
