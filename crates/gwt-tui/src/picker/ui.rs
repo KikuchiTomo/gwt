@@ -16,8 +16,10 @@ use crate::theme::{
     PAD, POINTER,
 };
 
+use gwt_core::ops::BaseStatus;
+
 use super::state::{
-    dirty_plain, path_name, remote_plain, App, BranchPurpose, ColWidths, ConflictAction,
+    dirty_plain, path_name, remote_plain, App, BaseNote, BranchPurpose, ColWidths, ConflictAction,
     ConflictChoice, Mode, NameStage, SyncOp, H_BRANCH, H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
 };
 
@@ -58,13 +60,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_confirm_action(f, chunks[0], prompt);
             draw_prompt_confirm_action(f, chunks[1], prompt);
         }
+        Mode::ConfirmBasePull { status, .. } => {
+            draw_base_pull(f, chunks[0], status);
+            draw_prompt_base_pull(f, chunks[1], &status.branch);
+        }
         Mode::List
         | Mode::ConfirmDelete { .. }
         | Mode::Deleting { .. }
         | Mode::Message { .. }
         | Mode::ConfirmSync { .. }
         | Mode::Syncing { .. }
-        | Mode::Creating { .. } => {
+        | Mode::Creating { .. }
+        | Mode::CheckingBase { .. }
+        | Mode::UpdatingBase { .. } => {
             let list_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -83,8 +91,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dir_buf,
             customize_dir,
             stage,
+            note,
         } => {
-            draw_new_name(f, chunks[0], base, buf, dir_buf, *customize_dir, *stage);
+            draw_new_name(f, chunks[0], base, *customize_dir, note.as_ref());
             draw_prompt_new_name(f, chunks[1], buf, dir_buf, *stage);
         }
     }
@@ -202,17 +211,15 @@ fn draw_new_name(
     f: &mut Frame,
     area: Rect,
     base: &str,
-    _buf: &str,
-    _dir_buf: &str,
     customize_dir: bool,
-    _stage: NameStage,
+    note: Option<&BaseNote>,
 ) {
     let hint = if customize_dir {
         t::name_two_step_hint()
     } else {
         t::name_is_dir_hint()
     };
-    let line = Line::from(vec![
+    let mut lines = vec![Line::from(vec![
         Span::raw(PAD),
         Span::styled(t::branching_from(), Style::default().fg(C_DIM)),
         Span::styled(
@@ -220,6 +227,78 @@ fn draw_new_name(
             Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
         ),
         Span::styled(hint, Style::default().fg(C_DIM)),
+    ])];
+    // What the base check just did. It happened behind a spinner that is already
+    // gone, so this line is the only place the answer is visible.
+    if let Some(note) = note {
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(vec![
+            Span::styled(
+                if note.error { " ! " } else { " ✓ " },
+                Style::default().fg(if note.error { C_ERR } else { C_CREATE }),
+            ),
+            Span::styled(
+                note.text.clone(),
+                Style::default().fg(if note.error { C_ERR } else { C_TEXT }),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// The base branch has fallen behind origin: say by how much, where the
+/// fast-forward would land, and that it is only ever a fast-forward.
+fn draw_base_pull(f: &mut Frame, area: Rect, status: &BaseStatus) {
+    let holder = status.holder.as_ref().map(|p| path_name(p));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " ↓ ",
+                Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                t::base_behind(&status.branch, status.behind),
+                Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(t::base_pull_question(), Style::default().fg(C_TEXT)),
+        ]),
+        Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(
+                t::base_pull_where(holder.as_deref()),
+                Style::default().fg(C_DIM),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(t::base_pull_ff_note(), Style::default().fg(C_DIM)),
+        ]),
+    ];
+    // Local commits of your own on the base branch make this worth a second
+    // look: a fast-forward cannot happen, and the pull will say so.
+    if status.ahead > 0 {
+        lines.push(Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(
+                format!("↑{} local commit(s) not on origin", status.ahead),
+                Style::default().fg(C_ERR),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_prompt_base_pull(f: &mut Frame, area: Rect, branch: &str) {
+    let line = Line::from(vec![
+        Span::styled(
+            " pull ",
+            Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{branch} from origin first ? Y/n")),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -289,6 +368,10 @@ fn title_line(app: &App) -> Line<'static> {
         }
         Mode::Keys { .. } => (t::help_title().to_string(), String::new()),
         Mode::NewName { base, .. } => (format!("new · from {base}"), String::new()),
+        Mode::CheckingBase { base, .. } | Mode::UpdatingBase { base, .. } => {
+            (format!("new · from {base}"), "origin".into())
+        }
+        Mode::ConfirmBasePull { .. } => (t::title_base_behind().to_string(), "Y/n".into()),
         Mode::Conflict { title, .. } => (title.clone(), "choose".into()),
         Mode::ConfirmAction { .. } => ("confirm".to_string(), "y/N".into()),
         Mode::ConfirmSync { op, branch, .. } | Mode::Syncing { op, branch, .. } => {
@@ -322,6 +405,9 @@ fn help_line(app: &App) -> Line<'static> {
             SyncOp::Push => t::pushing(),
         },
         Mode::Creating { .. } => t::working(),
+        Mode::CheckingBase { .. } => t::checking_base(),
+        Mode::UpdatingBase { .. } => t::updating_base(),
+        Mode::ConfirmBasePull { .. } => t::base_pull_help(),
         Mode::ConfirmDelete { paths, force } => match (paths.len() > 1, *force) {
             (true, true) => " y: FORCE delete ALL selected   any: cancel ",
             (true, false) => " y: delete ALL selected   any: cancel ",
@@ -599,6 +685,23 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(last.clone(), Style::default().fg(C_DIM)),
         ]),
+        // Both of these talk to origin, which can take a moment on a slow link:
+        // the branch being waited on belongs on screen while it happens.
+        Mode::CheckingBase { base, frame, .. } | Mode::UpdatingBase { base, frame, .. } => {
+            let updating = matches!(app.mode, Mode::UpdatingBase { .. });
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", spinner(*frame)),
+                    Style::default().fg(C_CREATE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if updating { "updating " } else { "checking " },
+                    Style::default().fg(C_BRANCH).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(base.clone()),
+                Span::styled("  origin", Style::default().fg(C_DIM)),
+            ])
+        }
         Mode::Syncing {
             op,
             path,
@@ -665,7 +768,9 @@ fn draw_branches(f: &mut Frame, area: Rect, app: &App) {
                 continue;
             };
             let b = &all[scored.idx];
-            lines.push(branch_line(b, &scored.indices, selected));
+            let is_default = matches!(b.kind, BranchKind::Local)
+                && app.default_branch.as_deref() == Some(b.short.as_str());
+            lines.push(branch_line(b, &scored.indices, selected, is_default));
         } else {
             lines.push(create_line(&app.branch_filter, selected));
         }
@@ -673,8 +778,8 @@ fn draw_branches(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn branch_line<'a>(b: &'a BranchRef, hit: &[usize], selected: bool) -> Line<'a> {
-    let mut spans = Vec::with_capacity(4);
+fn branch_line<'a>(b: &'a BranchRef, hit: &[usize], selected: bool, is_default: bool) -> Line<'a> {
+    let mut spans = Vec::with_capacity(5);
     spans.push(Span::styled(
         if selected { POINTER } else { PAD },
         Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
@@ -685,6 +790,14 @@ fn branch_line<'a>(b: &'a BranchRef, hit: &[usize], selected: bool) -> Line<'a> 
         kind_label(&b.kind),
         Style::default().fg(C_DIM),
     ));
+    // The row is first for a reason; say what the reason is rather than leaving
+    // the order looking arbitrary.
+    if is_default {
+        spans.push(Span::styled(
+            format!("  · {}", t::branch_tag_default()),
+            Style::default().fg(C_CREATE),
+        ));
+    }
     Line::from(spans).style(if selected {
         Style::default().add_modifier(Modifier::BOLD)
     } else {

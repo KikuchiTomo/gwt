@@ -239,6 +239,94 @@ fn pull_is_fast_forward_only_and_push_sets_upstream() {
     assert_ne!(git(&main_wt, &["rev-parse", "HEAD"]).trim(), before);
 }
 
+/// Branching from a stale `main` is the mistake the picker offers to head off,
+/// so the answer it asks about has to come from origin, not from whatever the
+/// last fetch happened to leave behind.
+#[test]
+fn a_base_branch_reports_how_far_behind_origin_it_is() {
+    let (origin, layout) = fixture("base-behind");
+
+    // Nothing has moved yet, and nothing to ask about.
+    assert!(ops::base_status(&layout, "main").unwrap().is_none());
+
+    commit(&origin, "d.txt", "four\n", "upstream work");
+    // Deliberately no fetch here: base_status has to go and look for itself.
+    let status = ops::base_status(&layout, "main")
+        .unwrap()
+        .expect("main is a commit behind origin/main");
+    assert_eq!(status.behind, 1);
+    assert_eq!(status.ahead, 0);
+    // `main` is checked out in `default`, so that is where a pull would happen.
+    let holder = status.holder.expect("default holds main");
+    assert!(same_path(&holder, &layout.root.join("default")));
+
+    // A remote ref is already whatever the fetch made it, and a branch with no
+    // origin counterpart has nothing to compare against.
+    assert!(ops::base_status(&layout, "origin/main").unwrap().is_none());
+    git(&layout.root, &["--git-dir", ".bare", "branch", "solo"]);
+    assert!(ops::base_status(&layout, "solo").unwrap().is_none());
+}
+
+#[test]
+fn updating_the_base_branch_fast_forwards_it_wherever_it_lives() {
+    let (origin, layout) = fixture("base-update");
+    commit(&origin, "d.txt", "four\n", "upstream work");
+
+    // Checked out in `default`: the update has to go through that worktree,
+    // because git will not move a branch a worktree is holding.
+    ops::update_base_branch(&layout, "main").unwrap();
+    assert!(ops::base_status(&layout, "main").unwrap().is_none());
+    let default = layout.root.join("default");
+    assert!(default.join("d.txt").exists(), "the worktree moved with it");
+
+    // `feature` has no worktree, so the branch itself is fast-forwarded.
+    git(&origin, &["checkout", "-q", "feature"]);
+    commit(&origin, "e.txt", "five\n", "their feature work");
+    git(&origin, &["checkout", "-q", "main"]);
+    let before = git(
+        &layout.root,
+        &["--git-dir", ".bare", "rev-parse", "feature"],
+    )
+    .trim()
+    .to_string();
+    ops::update_base_branch(&layout, "feature").unwrap();
+    let after = git(
+        &layout.root,
+        &["--git-dir", ".bare", "rev-parse", "feature"],
+    )
+    .trim()
+    .to_string();
+    assert_ne!(before, after, "feature should have moved to origin/feature");
+    assert!(ops::base_status(&layout, "feature").unwrap().is_none());
+
+    // And the whole point: a worktree cut afterwards starts from the new tip.
+    let fresh = ops::new(&layout, "feature", "work", "work", &mut sync::noop).unwrap();
+    assert!(fresh.join("e.txt").exists());
+}
+
+/// A base branch that has diverged cannot be fast-forwarded, and this is not the
+/// place to resolve that — refuse rather than merge behind the user's back.
+#[test]
+fn updating_a_divergent_base_branch_is_refused() {
+    let (origin, layout) = fixture("base-diverge");
+    let default = layout.root.join("default");
+    commit(&default, "mine.txt", "mine\n", "local work");
+    commit(&origin, "theirs.txt", "theirs\n", "their work");
+
+    let status = ops::base_status(&layout, "main")
+        .unwrap()
+        .expect("main has gone both ways");
+    assert_eq!((status.ahead, status.behind), (1, 1));
+    assert!(ops::update_base_branch(&layout, "main").is_err());
+
+    // Same story with no worktree in the way.
+    git(
+        &layout.root,
+        &["--git-dir", ".bare", "branch", "-f", "feature", "main"],
+    );
+    assert!(ops::update_base_branch(&layout, "feature").is_err());
+}
+
 #[test]
 fn pull_refuses_to_merge_divergent_history() {
     let (origin, layout) = fixture("diverge");
@@ -403,6 +491,47 @@ fn a_run_step_fires_on_create_but_not_on_a_plain_apply() {
     // Asking for the apply phase explicitly is how you opt in.
     ops::sync_apply(&layout, Phase::Create, &mut sync::noop).unwrap();
     assert_eq!(ran(&marker), ["feature", "feature"]);
+}
+
+/// A multi-line command is one shell script, not a line-at-a-time list: state
+/// set on one line has to still be there on the next, and `dir` has to put the
+/// whole thing somewhere other than the worktree root.
+#[test]
+#[cfg(unix)]
+fn a_multi_line_command_runs_as_one_script_in_the_directory_it_names() {
+    let (_origin, layout) = fixture("run-script");
+    let step = Step::Run(RunStep {
+        // `set -e` and the variable only survive into the later lines if this
+        // reaches the shell as a single script.
+        cmd: "set -e\nwhere=$(pwd)\n\necho \"$where\" > ran.txt".into(),
+        when: vec![Phase::Create],
+        only_if: None,
+        timeout: std::time::Duration::from_secs(30),
+        dir: Some("sub".into()),
+    });
+    ops::sync_add(&layout, step.clone()).unwrap();
+
+    // The recipe survives the round trip through the TOML block form.
+    assert_eq!(sync::load(&layout).unwrap().steps, vec![step]);
+    let raw = std::fs::read_to_string(&layout.sync_config).unwrap();
+    assert!(raw.contains("'''"), "the script should be readable:\n{raw}");
+
+    // The directory the step names has to exist in the worktree, so put it in
+    // the branch the worktree is cut from.
+    let default = layout.root.join("default");
+    std::fs::create_dir(default.join("sub")).unwrap();
+    commit(&default, "sub/keep.txt", "x\n", "add sub");
+    git(
+        &layout.root,
+        &["--git-dir", ".bare", "branch", "-f", "feature", "main"],
+    );
+
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    let ran = std::fs::read_to_string(wt.join("sub/ran.txt")).unwrap();
+    assert!(
+        same_path(Path::new(ran.trim()), &wt.join("sub")),
+        "the script ran in {ran:?}, not in the sub directory"
+    );
 }
 
 #[test]

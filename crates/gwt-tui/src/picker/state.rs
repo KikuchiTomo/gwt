@@ -24,6 +24,14 @@ pub enum NameStage {
     Dir,
 }
 
+/// What happened to the base branch on the way to this screen, carried along so
+/// the name prompt can say so instead of the news being lost behind a spinner.
+#[derive(Debug, Clone)]
+pub struct BaseNote {
+    pub text: String,
+    pub error: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncOp {
     Pull,
@@ -113,6 +121,29 @@ pub enum Mode {
         dir_buf: String,
         customize_dir: bool,
         stage: NameStage,
+        note: Option<BaseNote>,
+    },
+    /// Asking origin whether the chosen base branch is still current. This talks
+    /// to the network, so it runs on a worker thread like every other git call
+    /// that might not come back promptly.
+    CheckingBase {
+        base: String,
+        customize_dir: bool,
+        frame: usize,
+        rx: Receiver<std::result::Result<Option<ops::BaseStatus>, String>>,
+    },
+    /// The base branch is behind origin — offer to fast-forward it first, so a
+    /// new branch does not start life already out of date.
+    ConfirmBasePull {
+        base: String,
+        customize_dir: bool,
+        status: Box<ops::BaseStatus>,
+    },
+    UpdatingBase {
+        base: String,
+        customize_dir: bool,
+        frame: usize,
+        rx: Receiver<std::result::Result<String, String>>,
     },
     Message {
         text: String,
@@ -242,6 +273,9 @@ pub struct App<'a> {
     pub repo: &'a Repo,
     pub layout: Option<BareLayout>,
     pub mode: Mode,
+    /// The repo's trunk. Worth knowing once: it is the branch most new work is
+    /// cut from, so it leads the base-branch list instead of being hunted for.
+    pub default_branch: Option<String>,
 
     pub worktrees: Vec<Worktree>,
     pub metrics: Vec<Option<WorktreeMetrics>>,
@@ -264,10 +298,19 @@ impl<'a> App<'a> {
         let worktrees = visible_worktrees(repo, layout.as_ref())?;
         let metrics = compute_metrics(layout.as_ref(), &worktrees);
         let cols = compute_col_widths(&worktrees, &metrics);
+        // A bare-style clone copies the remote's HEAD into its own, and never
+        // grows an `origin/HEAD` to read; a plain checkout is the other way
+        // round. Ask whichever one this is.
+        let default_branch = layout
+            .as_ref()
+            .and_then(|l| l.default_branch().ok())
+            .filter(|b| !b.is_empty())
+            .or_else(|| repo.default_branch());
         let mut s = Self {
             repo,
             layout,
             mode: Mode::List,
+            default_branch,
             worktrees,
             metrics,
             cols,
@@ -487,12 +530,16 @@ impl<'a> App<'a> {
             }
         }
 
-        // Local first, then alphabetical so `develop`/`main` sit at the top.
-        all.sort_by(|a, b| match (&a.kind, &b.kind) {
-            (BranchKind::Local, BranchKind::Remote { .. }) => std::cmp::Ordering::Less,
-            (BranchKind::Remote { .. }, BranchKind::Local) => std::cmp::Ordering::Greater,
-            _ => a.short.cmp(&b.short),
-        });
+        // The default branch first when one is being picked to branch off —
+        // it is the answer often enough that hunting for it is the common case.
+        // Then local before remote, then alphabetical.
+        let default = match purpose {
+            BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => self.default_branch.clone(),
+            // Review is for picking up someone else's branch; the trunk at the
+            // top of that list would only be in the way.
+            BranchPurpose::Review => None,
+        };
+        all.sort_by_key(|b| (branch_rank(b, default.as_deref()), b.short.clone()));
 
         self.branch_filter.clear();
         self.branch_cursor = 0;
@@ -501,13 +548,14 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    pub fn enter_name_input(&mut self, base: String, customize_dir: bool) {
+    pub fn enter_name_input(&mut self, base: String, customize_dir: bool, note: Option<BaseNote>) {
         self.mode = Mode::NewName {
             base,
             buf: String::new(),
             dir_buf: String::new(),
             customize_dir,
             stage: NameStage::Branch,
+            note,
         };
     }
 
@@ -521,6 +569,7 @@ impl<'a> App<'a> {
                 dir_buf,
                 customize_dir,
                 stage,
+                ..
             } => (
                 base.clone(),
                 buf.trim().to_string(),
@@ -626,14 +675,16 @@ impl<'a> App<'a> {
             .iter()
             .enumerate()
             .filter_map(|(idx, b)| {
-                fuzzy::score(q, &b.short).map(|m| Scored {
+                score_branch(q, b).map(|(score, indices)| Scored {
                     idx,
-                    score: m.score,
-                    indices: m.indices,
+                    score,
+                    indices,
                     ..Default::default()
                 })
             })
             .collect();
+        // A stable sort, so branches that score the same keep the order
+        // `enter_branch_mode` put them in: default, then local, then remote.
         scored.sort_by_key(|s| std::cmp::Reverse(s.score));
         self.filtered_branches = scored;
         if self.branch_cursor >= self.filtered_branches.len() {
@@ -693,12 +744,13 @@ impl<'a> App<'a> {
 
         match purpose {
             BranchPurpose::NewBase => {
-                // Step 1 done — store base, advance to name input. ops::new runs on commit.
-                self.enter_name_input(b.short.clone(), false);
+                // Step 1 done — the base is settled, so ask origin whether it is
+                // still current before the name prompt. ops::new runs on commit.
+                self.begin_base_check(b.short.clone(), false);
                 Ok(true)
             }
             BranchPurpose::NewBaseWithPath => {
-                self.enter_name_input(b.short.clone(), true);
+                self.begin_base_check(b.short.clone(), true);
                 Ok(true)
             }
             BranchPurpose::Review => {
@@ -840,6 +892,136 @@ impl<'a> App<'a> {
         self.mode = Mode::Message { text, error: false };
     }
 
+    // ---- the base branch ---------------------------------------------------
+
+    /// Ask origin whether the chosen base branch is still current.
+    ///
+    /// Branching from a `main` that is a week old is the mistake this catches,
+    /// and it is only catchable *here*: once the worktree exists, rebasing it is
+    /// a real job. Without the layout there is no bare dir to fetch through, so
+    /// that case goes straight on to the name prompt.
+    pub fn begin_base_check(&mut self, base: String, customize_dir: bool) {
+        let Some(layout) = self.layout.clone() else {
+            return self.enter_name_input(base, customize_dir, None);
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = base.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ops::base_status(&layout, &probe).map_err(|e| e.to_string()));
+        });
+        self.mode = Mode::CheckingBase {
+            base,
+            customize_dir,
+            frame: 0,
+            rx,
+        };
+    }
+
+    /// Advance the spinner; move on once origin has answered. Returns `true`
+    /// when the check is over, whichever way it went.
+    pub fn tick_base_check(&mut self) -> bool {
+        let (base, customize_dir, outcome) = match &mut self.mode {
+            Mode::CheckingBase {
+                base,
+                customize_dir,
+                frame,
+                rx,
+            } => {
+                *frame = frame.wrapping_add(1);
+                let outcome = match rx.try_recv() {
+                    Ok(res) => Some(res),
+                    Err(TryRecvError::Empty) => None,
+                    // Nothing came back, so we know nothing about the base —
+                    // which is the same position as "it looks up to date".
+                    Err(TryRecvError::Disconnected) => Some(Ok(None)),
+                };
+                (base.clone(), *customize_dir, outcome)
+            }
+            _ => return true,
+        };
+        let Some(res) = outcome else {
+            return false;
+        };
+        match res {
+            Ok(Some(status)) => {
+                self.mode = Mode::ConfirmBasePull {
+                    base,
+                    customize_dir,
+                    status: Box::new(status),
+                }
+            }
+            // Up to date, or nothing to compare against.
+            Ok(None) => self.enter_name_input(base, customize_dir, None),
+            // A base we could not measure is still a base you can branch from;
+            // say what went wrong on the next screen rather than stopping here.
+            Err(e) => self.enter_name_input(
+                base,
+                customize_dir,
+                Some(BaseNote {
+                    text: e,
+                    error: true,
+                }),
+            ),
+        }
+        true
+    }
+
+    /// Fast-forward the base branch, then carry on to the name prompt.
+    pub fn begin_base_update(&mut self, base: String, customize_dir: bool) {
+        let Some(layout) = self.layout.clone() else {
+            return self.enter_name_input(base, customize_dir, None);
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let branch = base.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ops::update_base_branch(&layout, &branch).map_err(|e| e.to_string()));
+        });
+        self.mode = Mode::UpdatingBase {
+            base,
+            customize_dir,
+            frame: 0,
+            rx,
+        };
+    }
+
+    pub fn tick_base_update(&mut self) -> bool {
+        let (base, customize_dir, outcome) = match &mut self.mode {
+            Mode::UpdatingBase {
+                base,
+                customize_dir,
+                frame,
+                rx,
+            } => {
+                *frame = frame.wrapping_add(1);
+                let outcome = match rx.try_recv() {
+                    Ok(res) => Some(res),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("the update task ended unexpectedly".to_string()))
+                    }
+                };
+                (base.clone(), *customize_dir, outcome)
+            }
+            _ => return true,
+        };
+        let Some(res) = outcome else {
+            return false;
+        };
+        // Either way the base is usable, so both answers are a note on the name
+        // prompt rather than a screen of their own. A refused fast-forward is
+        // the interesting one: the branch has diverged and wants a real shell.
+        let note = match res {
+            Ok(text) => BaseNote { text, error: false },
+            Err(e) => BaseNote {
+                text: e,
+                error: true,
+            },
+        };
+        let _ = self.refresh_worktrees();
+        self.enter_name_input(base, customize_dir, Some(note));
+        true
+    }
+
     // ---- pull / push -------------------------------------------------------
 
     /// Start a sync on the worktree under the cursor. Pull is fast-forward-only
@@ -880,11 +1062,11 @@ impl<'a> App<'a> {
                     // Only commands are worth narrating; a symlink appearing is
                     // not news, and a failure is news whatever the kind.
                     sync::Event::StepStart(s @ sync::Step::Run(_)) => {
-                        Some(CreateMsg::Line(s.subject()))
+                        Some(CreateMsg::Line(s.subject_line()))
                     }
                     sync::Event::Output(l) => Some(CreateMsg::Line(l.to_string())),
                     sync::Event::StepDone(s, o) if o.is_failure() => {
-                        Some(CreateMsg::Warn(format!("{} failed", s.subject())))
+                        Some(CreateMsg::Warn(format!("{} failed", s.subject_line())))
                     }
                     _ => None,
                 };
@@ -1275,6 +1457,41 @@ impl<'a> App<'a> {
     }
 }
 
+/// Score one branch against the filter, returning `(score, hit positions)`.
+///
+/// A remote branch is matched on its **branch name** first, and on the full ref
+/// only if that fails. Scoring `origin/feature` whole would let the `/` earn a
+/// word-boundary bonus that the local `feature` cannot — so typing `feature`
+/// put `origin/feature` above the branch of the same name, which is both
+/// surprising and the wrong one to pick. Falling back to the full ref keeps
+/// `origin/fea` working for anyone who types the remote out.
+fn score_branch(q: &str, b: &BranchRef) -> Option<(i32, Vec<usize>)> {
+    if let BranchKind::Remote { remote } = &b.kind {
+        let prefix = remote.chars().count() + 1; // the remote name and its `/`
+        if let Some(name) = b.short.strip_prefix(&format!("{remote}/")) {
+            if let Some(m) = fuzzy::score(q, name) {
+                // The hits are positions in the name; the row renders the ref.
+                return Some((m.score, m.indices.iter().map(|i| i + prefix).collect()));
+            }
+        }
+    }
+    fuzzy::score(q, &b.short).map(|m| (m.score, m.indices))
+}
+
+/// Sort bucket for the base-branch list: the default branch, then the rest of
+/// the local branches, then the remote ones.
+///
+/// `origin/<default>` is deliberately *not* promoted with its local twin: they
+/// would sit next to each other looking equivalent, and picking the wrong one
+/// makes a worktree that tracks nothing.
+pub fn branch_rank(b: &BranchRef, default: Option<&str>) -> u8 {
+    match &b.kind {
+        BranchKind::Local if Some(b.short.as_str()) == default => 0,
+        BranchKind::Local => 1,
+        BranchKind::Remote { .. } => 2,
+    }
+}
+
 /// Ticks each worktree lingers on the spinner before it is actually removed.
 /// Gives the delete a visible, animated "working…" beat even when git is fast.
 pub const DELETE_STEPS: usize = 3;
@@ -1422,7 +1639,75 @@ fn compute_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::score_worktree;
+    use super::{branch_rank, score_branch, score_worktree};
+    use gwt_core::{BranchKind, BranchRef};
+
+    fn branch(short: &str, kind: BranchKind) -> BranchRef {
+        BranchRef {
+            short: short.into(),
+            full: format!("refs/{short}"),
+            kind,
+            checked_out_at: None,
+        }
+    }
+
+    #[test]
+    fn the_default_branch_leads_the_base_list() {
+        let mut all = [
+            branch(
+                "origin/main",
+                BranchKind::Remote {
+                    remote: "origin".into(),
+                },
+            ),
+            branch("zebra", BranchKind::Local),
+            branch("main", BranchKind::Local),
+            branch("alpha", BranchKind::Local),
+        ];
+        all.sort_by_key(|b| (branch_rank(b, Some("main")), b.short.clone()));
+        let order: Vec<&str> = all.iter().map(|b| b.short.as_str()).collect();
+        assert_eq!(order, vec!["main", "alpha", "zebra", "origin/main"]);
+    }
+
+    #[test]
+    fn a_local_branch_is_not_outscored_by_its_own_remote_twin() {
+        let local = branch("feature", BranchKind::Local);
+        let remote = branch(
+            "origin/feature",
+            BranchKind::Remote {
+                remote: "origin".into(),
+            },
+        );
+        let (local_score, _) = score_branch("feature", &local).unwrap();
+        let (remote_score, hits) = score_branch("feature", &remote).unwrap();
+        assert!(
+            local_score >= remote_score,
+            "the `/` must not buy origin/feature a better score ({remote_score} > {local_score})"
+        );
+        // The row still renders the full ref, so the hits have to point into it.
+        assert_eq!(hits, (7..14).collect::<Vec<_>>());
+
+        // Typing the remote out still finds it.
+        assert!(score_branch("origin/fea", &remote).is_some());
+        assert!(score_branch("origin/fea", &local).is_none());
+    }
+
+    #[test]
+    fn with_no_default_the_list_is_still_local_first_and_alphabetical() {
+        let mut all = [
+            branch(
+                "origin/alpha",
+                BranchKind::Remote {
+                    remote: "origin".into(),
+                },
+            ),
+            branch("zebra", BranchKind::Local),
+            branch("alpha", BranchKind::Local),
+        ];
+        all.sort_by_key(|b| (branch_rank(b, None), b.short.clone()));
+        let order: Vec<&str> = all.iter().map(|b| b.short.as_str()).collect();
+        assert_eq!(order, vec!["alpha", "zebra", "origin/alpha"]);
+    }
 
     #[test]
     fn matches_on_worktree_name_or_branch() {

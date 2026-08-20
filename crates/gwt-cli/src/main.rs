@@ -119,7 +119,8 @@ command that reads it.
 
   link  symlink one real file into every worktree (the old `secret`)
   copy  copy it instead, for files a tool rewrites in place
-  run   run a command in a worktree, by default only when it is created
+  run   run a command — or a whole shell script — in a worktree, by default
+        only when it is created
 
 The two path columns are relative to DIFFERENT places:
 
@@ -216,11 +217,19 @@ By default it runs when a worktree is created, and not on a plain
 `git wt sync apply` — re-running someone's `npm ci` because they repaired a
 symlink would be its own surprise. Pass --when to change that.
 
-The command runs through the shell, from the worktree root, with:
+The command runs through the shell, from the worktree root — or from --dir
+inside it — with:
   GWT_ROOT  GWT_WORKTREE  GWT_WORKTREE_NAME  GWT_BRANCH
 
+A COMMAND with newlines in it is one shell script, not a line-at-a-time list:
+`set -e` holds for the rest of it, and a variable set on one line is still set
+on the next.
+
 Example:
-  git wt sync run 'npm ci' --only-if package.json --timeout 10m";
+  git wt sync run 'npm ci' --only-if package.json --timeout 10m
+  git wt sync run 'set -e
+  pnpm install --frozen-lockfile
+  pnpm run build' --dir packages/web";
 
 #[derive(Subcommand, Debug)]
 enum CacheOp {

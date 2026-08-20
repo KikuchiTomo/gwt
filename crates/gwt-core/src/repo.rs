@@ -143,6 +143,42 @@ impl Repo {
         crate::branch::list(&self.cwd)
     }
 
+    /// The branch this repository treats as its trunk.
+    ///
+    /// `origin/HEAD` is the authoritative answer when it exists, but a bare-style
+    /// clone builds its remote refs by hand and never gets one — there the bare
+    /// repo's own HEAD is what `git clone` copied from the remote. Falling back
+    /// to the conventional names is a guess, but a better one than "no default",
+    /// which would leave the branch list ordered by nothing in particular.
+    pub fn default_branch(&self) -> Option<String> {
+        if let Ok(raw) = git::run(
+            &self.cwd,
+            ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        ) {
+            if let Some(b) = raw.trim().strip_prefix("origin/") {
+                if !b.is_empty() {
+                    return Some(b.to_string());
+                }
+            }
+        }
+        for candidate in ["main", "master"] {
+            let found = git::run(
+                &self.cwd,
+                [
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{candidate}"),
+                ],
+            )
+            .is_ok();
+            if found {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
     pub fn remote_branches(&self) -> Result<Vec<String>> {
         let raw = git::run(
             &self.cwd,

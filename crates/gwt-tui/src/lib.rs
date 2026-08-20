@@ -1,4 +1,5 @@
 pub mod display;
+pub mod editor;
 pub mod fuzzy;
 pub mod picker;
 pub mod sync_ui;

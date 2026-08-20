@@ -218,6 +218,17 @@ pub mod t {
                             "  → ブランチ名がそのままディレクトリ名になります";
         name_two_step_hint => "  → enter branch name, then worktree dir name",
                               "  → ブランチ名を入力後、ディレクトリ名を入力";
+        branch_tag_default => "default", "既定";
+        checking_base => " checking the base branch against origin… ",
+                         " 基点ブランチと origin を比較中… ";
+        updating_base => " updating the base branch… ", " 基点ブランチを更新中… ";
+        base_pull_help => " y/enter: pull first   n: use it as-is   esc: cancel ",
+                          " y/enter: 先に pull   n: そのまま使う   esc: 中止 ";
+        base_pull_question => "pull it before branching?", "分岐する前に pull しますか？";
+        base_pull_ff_note => "fast-forward only — nothing is merged or rebased",
+                             "fast-forward のみ。merge も rebase もしません";
+        title_base_behind => "the base branch is behind origin",
+                             "基点ブランチが origin より遅れています";
         title_worktree_exists => "worktree already exists", "ワークツリーが既に存在します";
         title_branch_exists => "branch already exists", "ブランチが既に存在します";
         title_confirm => "confirm", "確認";
@@ -241,8 +252,10 @@ pub mod t {
                           " 各ワークツリー内のパスを入力  enter:今すぐ適用  esc:中止 ";
         sync_help_dest_copy => " ^o:overwrite  ^r:render  enter:copy now  esc:cancel ",
                                " ^o:上書き  ^r:置換  enter:今すぐコピー  esc:中止 ";
-        sync_help_cmd => " type a command  enter:register  esc:cancel ",
-                         " コマンドを入力  enter:登録  esc:中止 ";
+        sync_help_cmd => " enter:new line  ^s:save  ^d:dir  ↑↓←→:move  esc:cancel ",
+                         " enter:改行  ^s:保存  ^d:作業ディレクトリ  ↑↓←→:移動  esc:中止 ";
+        sync_help_cmd_dir => " type a subdir, or leave it empty  enter:save  ^d:back  esc:cancel ",
+                             " サブディレクトリを入力（空欄可）  enter:保存  ^d:戻る  esc:中止 ";
         sync_help_cache_path => " type the directory to cache  enter:next  esc:cancel ",
                                 " キャッシュするディレクトリを入力  enter:次へ  esc:中止 ";
         sync_help_cache_mode => " ↑↓:move  enter:pick  k/s/p  esc/q:cancel ",
@@ -314,8 +327,17 @@ pub mod t {
         cmd_hint => "it runs through the shell, from the worktree root, e.g. ",
                     "ワークツリーのルートでシェル経由で実行します。例: ";
         cmd_required => "a command is required", "コマンドを入力してください";
-        cmd_more_in_toml => "only_if, timeout and dir are set in .gwt/sync.toml",
-                            "only_if・timeout・dir は .gwt/sync.toml で設定します";
+        cmd_multiline_hint => "write as many lines as you like — they run as one shell script",
+                              "何行でも書けます。まとめて 1 つのシェルスクリプトとして実行します";
+        cmd_more_in_toml => "only_if and timeout are set in .gwt/sync.toml",
+                            "only_if・timeout は .gwt/sync.toml で設定します";
+        cmd_dir_question => "which directory should it run in?",
+                            "どのディレクトリで実行しますか？";
+        cmd_dir_hint => "relative to the worktree root; empty means the root itself, e.g. ",
+                        "ワークツリーのルートからの相対パス。空欄ならルート。例: ";
+        label_run_dir => "dir", "作業ディレクトリ";
+        run_dir_root => "(worktree root)", "(ワークツリーのルート)";
+        run_dir_edit_hint => "^d to change", "^d で変更";
         opt_overwrite => "overwrite", "上書き";
         opt_render => "render", "置換";
         label_source => "source", "ソース";
@@ -354,6 +376,35 @@ pub mod t {
         pick(
             format!("{src} registered, but the source does not exist yet"),
             format!("{src} を登録しました（ソースはまだ存在しません）"),
+        )
+    }
+
+    pub fn base_behind(branch: &str, behind: u32) -> String {
+        pick(
+            format!("{branch} is {behind} commit(s) behind origin/{branch}"),
+            format!("{branch} は origin/{branch} より {behind} コミット遅れています"),
+        )
+    }
+
+    /// Where the fast-forward would happen: in the worktree that has the branch
+    /// checked out, or straight in the bare repo when nothing holds it.
+    pub fn base_pull_where(worktree: Option<&str>) -> String {
+        match worktree {
+            Some(name) => pick(
+                format!("pulls in the '{name}' worktree, which has it checked out"),
+                format!("チェックアウト中のワークツリー '{name}' で pull します"),
+            ),
+            None => pick(
+                "updates the branch itself — no worktree has it checked out".into(),
+                "どのワークツリーでも使われていないため、ブランチだけを更新します".into(),
+            ),
+        }
+    }
+
+    pub fn base_pull_skipped(branch: &str) -> String {
+        pick(
+            format!("branching from {branch} as it is"),
+            format!("{branch} を現状のまま基点にします"),
         )
     }
 

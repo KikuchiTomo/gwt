@@ -20,15 +20,15 @@ fn wt_name(p: &Path) -> String {
 /// output is echoed as it arrives rather than after the fact.
 pub fn report(ev: Event) {
     match ev {
-        Event::StepStart(Step::Run(r)) => eprintln!("· {}", r.cmd),
+        Event::StepStart(Step::Run(r)) => eprintln!("· {}", sync::one_line(&r.cmd)),
         Event::StepStart(_) => {}
         Event::Output(line) => eprintln!("  {line}"),
         Event::StepDone(step, outcome) => match outcome {
-            Outcome::Ran { code: 0, secs } => eprintln!("  ✓ {} ({secs}s)", step.subject()),
+            Outcome::Ran { code: 0, secs } => eprintln!("  ✓ {} ({secs}s)", step.subject_line()),
             Outcome::Ran { code, secs } => {
-                eprintln!("  ✗ {} exited {code} after {secs}s", step.subject())
+                eprintln!("  ✗ {} exited {code} after {secs}s", step.subject_line())
             }
-            Outcome::Failed { detail } => eprintln!("  ✗ {}: {detail}", step.subject()),
+            Outcome::Failed { detail } => eprintln!("  ✗ {}: {detail}", step.subject_line()),
             Outcome::Blocked { reason } => eprintln!(
                 "  ✗ {}: {reason} — move one aside, then run `git wt sync apply`",
                 step.dst().unwrap_or("")
@@ -64,8 +64,8 @@ fn describe(step: &Step) -> String {
             c.summary()
         ),
         _ => match step.dst() {
-            Some(dst) => format!("{} {} → (worktree)/{dst}", step.kind(), step.subject()),
-            None => format!("{} {}", step.kind(), step.subject()),
+            Some(dst) => format!("{} {} → (worktree)/{dst}", step.kind(), step.subject_line()),
+            None => format!("{} {}", step.kind(), step.subject_line()),
         },
     }
 }
@@ -255,7 +255,7 @@ pub fn ls(layout: &BareLayout) -> Result<()> {
             };
             (
                 s.kind().to_string(),
-                s.subject(),
+                s.subject_line(),
                 s.dst().unwrap_or("-").to_string(),
                 state,
                 applied,
