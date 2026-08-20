@@ -131,6 +131,23 @@ impl Step {
         }
     }
 
+    /// `subject` folded onto one line, for tables and status lines.
+    ///
+    /// A `run` step's command may be a whole script; every screen that lists
+    /// steps has exactly one line to show it in, and a raw newline there does
+    /// not truncate — it corrupts the rest of the table.
+    pub fn subject_line(&self) -> String {
+        one_line(&self.subject())
+    }
+
+    /// How many lines the command spans, for the kinds that have one.
+    pub fn cmd_lines(&self) -> usize {
+        match self {
+            Step::Run(r) => r.cmd.lines().filter(|l| !l.trim().is_empty()).count(),
+            _ => 0,
+        }
+    }
+
     /// The right-hand column: where it lands inside a worktree.
     pub fn dst(&self) -> Option<&str> {
         match self {
@@ -169,6 +186,20 @@ impl Step {
     }
 }
 
+/// The first non-blank line of `s`, marked with `…` when more follow.
+pub fn one_line(s: &str) -> String {
+    let mut lines = s
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("").to_string();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first
+    }
+}
+
 /// How the recipe reached us — the CLI says so once, because a user editing
 /// `secrets/manifest` while gwt reads `.gwt/sync.toml` would be baffling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,9 +224,11 @@ pub struct SyncConfig {
 
 /// Normalize a user-supplied source path into a repo-root-relative path.
 ///
-/// Accepts an absolute path inside the root, or a path relative to the root
-/// (which is also the cwd, since every `sync` subcommand runs from the root).
-pub fn normalize_src(layout: &BareLayout, input: &str) -> Result<String> {
+/// Accepts an absolute path inside the root, or one relative to `cwd` — which
+/// is what the shell just tab-completed against, and no longer necessarily the
+/// root now that these subcommands run from inside a worktree too. From the
+/// root the two readings coincide, so `sync add secrets/.env` is unchanged.
+pub fn normalize_src(layout: &BareLayout, cwd: &Path, input: &str) -> Result<String> {
     let raw = input.trim();
     if raw.is_empty() {
         return Err(Error::SyncSrcInvalid {
@@ -204,22 +237,26 @@ pub fn normalize_src(layout: &BareLayout, input: &str) -> Result<String> {
         });
     }
     let p = Path::new(raw);
-    // An absolute source is fine as long as it names a file inside the root —
-    // shell tab-completion produces these, so accept and fold them back.
-    let rel: PathBuf = if p.is_absolute() {
-        // Compare against the canonical root so /var vs /private/var (macOS) and
-        // symlinked checkouts don't spuriously look "outside".
-        let root = fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
-        let cand = canonicalize_lexically_existing(p);
-        cand.strip_prefix(&root)
-            .map(Path::to_path_buf)
-            .map_err(|_| Error::SyncSrcInvalid {
-                path: input.to_string(),
-                reason: "absolute path is outside the repo root",
-            })?
+    let absolute = p.is_absolute();
+    // Compare against the canonical root so /var vs /private/var (macOS) and
+    // symlinked checkouts don't spuriously look "outside".
+    let root = fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
+    let cand = canonicalize_lexically_existing(&if absolute {
+        p.to_path_buf()
     } else {
-        PathBuf::from(raw)
-    };
+        cwd.join(p)
+    });
+    let rel = cand
+        .strip_prefix(&root)
+        .map_err(|_| Error::SyncSrcInvalid {
+            path: input.to_string(),
+            reason: if absolute {
+                "absolute path is outside the repo root"
+            } else {
+                "path is outside the repo root"
+            },
+        })?
+        .to_path_buf();
 
     lexical_normalize(&rel).ok_or_else(|| Error::SyncSrcInvalid {
         path: input.to_string(),
@@ -545,6 +582,26 @@ fn new_document() -> toml_edit::DocumentMut {
     doc
 }
 
+/// A command as TOML.
+///
+/// A multi-line command is a shell script, and a script written as
+/// `"set -e\nnpm ci\nnpm run build"` is unreadable in the very file people are
+/// meant to be able to open and edit. Emit those as a `'''` block instead, and
+/// only when it round-trips exactly — no quoting rule is worth a recipe that
+/// reads back as something else.
+fn cmd_value(cmd: &str) -> toml_edit::Item {
+    if cmd.contains('\n') {
+        let doc: std::result::Result<toml_edit::DocumentMut, _> =
+            format!("cmd = '''\n{cmd}'''").parse();
+        if let Ok(doc) = doc {
+            if doc["cmd"].as_str() == Some(cmd) {
+                return doc["cmd"].clone();
+            }
+        }
+    }
+    toml_edit::value(cmd)
+}
+
 fn write_step(t: &mut toml_edit::Table, step: &Step) {
     // Any key the new kind does not use has to go, or a link that became a run
     // would keep a stale `dst` around.
@@ -576,7 +633,7 @@ fn write_step(t: &mut toml_edit::Table, step: &Step) {
             t["render"] = toml_edit::value(s.render);
         }
         Step::Run(s) => {
-            t["cmd"] = toml_edit::value(&s.cmd);
+            t["cmd"] = cmd_value(&s.cmd);
             let mut when = toml_edit::Array::new();
             for p in &s.when {
                 when.push(p.as_str());
@@ -1160,6 +1217,51 @@ timeout = "3m"
         assert!(normalize_dst("/etc/passwd").is_err());
         assert!(normalize_dst("").is_err());
         assert_eq!(normalize_dst("./config/.env").unwrap(), "config/.env");
+    }
+
+    #[test]
+    fn a_script_is_written_as_a_readable_block() {
+        let cmd = "set -e\ncd api\nnpm ci";
+        let item = cmd_value(cmd);
+        let rendered = format!("cmd = {}", item.as_value().unwrap());
+        assert!(
+            rendered.contains("'''"),
+            "a script should be a TOML block, got {rendered:?}"
+        );
+        // What matters is the value that comes back, not how it looks.
+        let doc: toml_edit::DocumentMut = rendered.parse().unwrap();
+        assert_eq!(doc["cmd"].as_str(), Some(cmd));
+    }
+
+    #[test]
+    fn a_script_survives_a_full_save_and_reload() {
+        let cmd = "set -e\n# it's quoted, ''' and all\nnpm ci";
+        let step = Step::Run(RunStep {
+            cmd: cmd.into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: DEFAULT_TIMEOUT,
+            dir: Some("api".into()),
+        });
+        let mut table = toml_edit::Table::new();
+        write_step(&mut table, &step);
+        let raw = format!("[[step]]\n{table}");
+        let back = parse_toml(&raw).unwrap();
+        assert_eq!(back, vec![step]);
+    }
+
+    #[test]
+    fn a_multi_line_command_shows_as_one_line() {
+        let step = Step::Run(RunStep {
+            cmd: "set -e\n\nnpm ci\nnpm run build".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: DEFAULT_TIMEOUT,
+            dir: None,
+        });
+        assert_eq!(step.subject_line(), "set -e …");
+        assert_eq!(step.cmd_lines(), 3);
+        assert_eq!(one_line("npm ci"), "npm ci");
     }
 
     #[test]

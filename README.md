@@ -183,6 +183,45 @@ remembering the one-line footer.
 The list hides `.bare` and the repo root — neither is somewhere you can work —
 and puts `default` first, then the rest alphabetically.
 
+### Picking a base branch
+
+`e` / `n` open the branch list with the **default branch first**, tagged
+`· default`, then the rest of the local branches alphabetically, then the remote
+ones. It is what most new work is cut from, so it should not have to be hunted
+for. The default branch is `origin/HEAD` where that exists, and the bare repo's
+own HEAD in a `git wt clone` layout, which never grows one.
+
+Filtering matches a remote branch on its **branch name**, falling back to the
+full ref. Scoring `origin/feature` whole let the `/` earn a word-boundary bonus
+that the local `feature` could not, so typing `feature` used to put the remote
+above the branch of the same name — the wrong one to branch from. Typing
+`origin/fea` still finds it.
+
+Then, before asking for a name, `git wt` checks that base against origin:
+
+```
+╭ the base branch is behind origin · Y/n ─────────────────────────────────────╮
+│ ↓ main is 3 commit(s) behind origin/main                                    │
+│                                                                             │
+│   pull it before branching?                                                 │
+│   pulls in the 'default' worktree, which has it checked out                 │
+│   fast-forward only — nothing is merged or rebased                          │
+│ pull main from origin first ? Y/n                                           │
+╰ y/enter: pull first   n: use it as-is   esc: cancel ────────────────────────╯
+```
+
+This is the one prompt that defaults to **yes**: branching off a week-old `main`
+is a mistake that is cheap to avoid here and expensive to fix once the worktree
+exists. `n` branches from the base exactly as it stands, and `Esc` backs out
+altogether. Either way the answer is shown on the name prompt, so nothing
+happens silently.
+
+It fetches the one branch to find out, on a worker thread — the picker keeps
+animating. Being offline just means the question does not come up. The update
+itself is fast-forward only, through the worktree holding the branch when one
+does, and on the branch directly when none does; a base that has diverged is
+refused rather than merged behind your back.
+
 The filter matches the **worktree name and the branch independently**. A
 worktree `aaaa-bbbb` holding `fix/aaaa-bbbb` is found by typing either `aaaa`
 or `fix`, and the column that matched is the one highlighted. (Matching is not
@@ -340,6 +379,15 @@ cmd  = "npm ci"
 when = ["create"]              # create | apply | manual
 only_if = "package.json"       # only where this exists in the worktree
 timeout = "10m"
+dir  = "api"                   # run it here, not at the worktree root
+
+[[step]]
+type = "run"
+cmd  = '''
+set -e
+pnpm install --frozen-lockfile
+pnpm run build'''              # one script, not three steps
+dir  = "packages/web"
 ```
 
 The two path columns use different bases, which is the only fiddly part:
@@ -355,6 +403,21 @@ dst   relative to EACH WORKTREE ROOT (created in every worktree)
 └── feature-a/.env  -> ../secrets/.env    <- dst = .env
 ```
 
+### Running it from a worktree
+
+Every `git wt` command works from anywhere inside the repo — the root, a
+worktree, or a directory inside one. The root is found the way git finds it, so
+being one `cd` in is the normal case rather than an error.
+
+This matters beyond convenience: with no root there is no recipe, so creating a
+worktree from inside another one used to fall back to a plain `git worktree add`
+that skipped the recipe and left a non-portable gitdir pointer behind. For the
+same reason the picker showed no `REMOTE` / `DIRTY` / `STASH` columns there.
+
+A relative `src` is read from where you are standing — `../secrets/.env` from a
+worktree names the same file as `secrets/.env` from the root — and is stored
+root-relative either way, so the recipe reads the same however it was written.
+
 ### Why `run` is safe to have
 
 `.gwt/` sits beside `.bare/` at the repo root, inside no worktree, so git does
@@ -368,6 +431,15 @@ with `--run`, or put `apply` in the step's `when`.
 The command goes through the shell, from the worktree root, with `GWT_ROOT`,
 `GWT_WORKTREE`, `GWT_WORKTREE_NAME` and `GWT_BRANCH` set. Its output is echoed
 line by line as it arrives, so a slow install is visibly alive.
+
+`dir` moves it somewhere else in the worktree — the package that actually needs
+installing, in a monorepo — and the path is relative to that worktree's root
+like every other `dst`.
+
+A `cmd` with newlines in it is **one shell script**, not a line-at-a-time list:
+it reaches `sh -c` whole, so `set -e` holds for the rest of it and a variable
+set on one line is still there on the next. Writing it as three separate `run`
+steps would give you three shells and none of that.
 
 ### The interactive manager
 
@@ -386,7 +458,7 @@ line by line as it arrives, so a slow install is visibly alive.
 | key | action |
 | --- | --- |
 | `a` | add a step — pick `link` / `copy` / `run` / `cache`, then fill it in |
-| `e` | edit the selected step's destination, or its command |
+| `e` | edit the selected step's destination, or its command and directory |
 | `d` | remove the step and undo it everywhere (asks `y/N`) |
 | `r` | re-apply the recipe to all worktrees |
 | `f` / `/` | filter |
@@ -400,10 +472,30 @@ one. Then it asks for the destination with the other root spelled out — which 
 the whole src/dst confusion, removed rather than documented. While describing a
 `copy`, `^o` toggles overwrite and `^r` toggles render.
 
+A `run` step gets an editor rather than a prompt, because a command is often a
+script:
+
+```
+╭ sync · command · in every worktree ─────────────────────────────────────────╮
+│  what should run inside a new worktree?                                     │
+│  1 set -e                                                                   │
+│  2 pnpm install --frozen-lockfile                                           │
+│  3 pnpm run build▏                                                          │
+│                                                                             │
+│  only_if and timeout are set in .gwt/sync.toml                              │
+│ dir › packages/web   ^d to change                                           │
+╰ enter:new line  ^s:save  ^d:dir  ↑↓←→:move  esc:cancel ─────────────────────╯
+```
+
+`Enter` starts a new line, so saving is `^s`. `^d` moves to the working
+directory and back; leave it empty for the worktree root. Arrow keys, Home/End
+and Delete work, so fixing line 1 does not mean retyping line 3.
+
 Under the list, a detail strip names the worktrees behind the `APPLIED` count —
 `✓ applied in api, default   ✗ missing in web` — so a partial count tells you
-which worktree to go fix. For a `run` step it shows `when`, `only_if` and
-`timeout` instead, since a command leaves no mark to count; for a `cache` it
+which worktree to go fix. For a `run` step it shows `when`, `timeout`, `dir`,
+`only_if` and how many lines the script has instead, since a command leaves no
+mark to count; for a `cache` it
 shows each bucket with its size and the worktrees sharing it, which is the one
 thing the count cannot say.
 

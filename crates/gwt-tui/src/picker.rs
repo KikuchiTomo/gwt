@@ -9,7 +9,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gwt_core::Repo;
 
 use crate::term::{enter_inline, leave_inline};
-use state::{App, BranchPurpose, Mode, SyncOp};
+use state::{App, BaseNote, BranchPurpose, Mode, SyncOp};
 
 #[derive(Debug)]
 pub enum PickerOutcome {
@@ -40,6 +40,16 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
+            if matches!(app.mode, Mode::CheckingBase { .. }) {
+                app.tick_base_check();
+                std::thread::sleep(Duration::from_millis(70));
+                continue;
+            }
+            if matches!(app.mode, Mode::UpdatingBase { .. }) {
+                app.tick_base_update();
+                std::thread::sleep(Duration::from_millis(70));
+                continue;
+            }
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
@@ -63,7 +73,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             Ok(None)
         }
         // Deletion and sync are animated from the main loop; swallow stray keys.
-        Mode::Deleting { .. } | Mode::Syncing { .. } | Mode::Creating { .. } => Ok(None),
+        Mode::Deleting { .. }
+        | Mode::Syncing { .. }
+        | Mode::Creating { .. }
+        | Mode::CheckingBase { .. }
+        | Mode::UpdatingBase { .. } => Ok(None),
+        Mode::ConfirmBasePull { .. } => {
+            handle_confirm_base_pull(app, key, ctrl);
+            Ok(None)
+        }
         Mode::ConfirmSync { .. } => {
             handle_confirm_sync(app, key);
             Ok(None)
@@ -241,6 +259,36 @@ fn handle_confirm_sync(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => app.start_sync(op, path, branch),
         _ => app.mode = Mode::List,
+    }
+}
+
+/// The one prompt here that defaults to *yes*: you asked for a worktree off this
+/// branch, and a fast-forward is what you almost always meant. `n` still gets
+/// you the branch exactly as it stands, and esc backs out of the whole thing.
+fn handle_confirm_base_pull(app: &mut App, key: KeyEvent, ctrl: bool) {
+    let Mode::ConfirmBasePull {
+        base,
+        customize_dir,
+        status,
+    } = &app.mode
+    else {
+        return;
+    };
+    let (base, customize_dir, branch) = (base.clone(), *customize_dir, status.branch.clone());
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.begin_base_update(base, customize_dir)
+        }
+        KeyCode::Esc => app.mode = Mode::List,
+        KeyCode::Char('c') if ctrl => app.mode = Mode::List,
+        _ => app.enter_name_input(
+            base,
+            customize_dir,
+            Some(BaseNote {
+                text: gwt_core::t::base_pull_skipped(&branch),
+                error: false,
+            }),
+        ),
     }
 }
 

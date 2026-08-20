@@ -1,5 +1,6 @@
 use std::env;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -119,7 +120,8 @@ command that reads it.
 
   link  symlink one real file into every worktree (the old `secret`)
   copy  copy it instead, for files a tool rewrites in place
-  run   run a command in a worktree, by default only when it is created
+  run   run a command — or a whole shell script — in a worktree, by default
+        only when it is created
 
 The two path columns are relative to DIFFERENT places:
 
@@ -140,21 +142,29 @@ Example:
 link/copy/rm take effect immediately in every existing worktree. `apply` is for
 repairing them later, or after creating a source file that did not exist yet.
 
+Every subcommand works from anywhere inside the repo — the root, a worktree, or
+a directory inside one. A relative SOURCE is read from where you are standing;
+it is stored relative to the repo root either way.
+
 A `run` step is only ever read from .gwt/sync.toml, which is not inside any
 worktree and therefore not tracked by git: `git pull` cannot add one.";
 
 const SYNC_LINK_ABOUT: &str = "\
 Register a symlink and create it in every existing worktree right away.
 
-  SOURCE            path of the real file, relative to the REPO ROOT.
-                    An absolute path inside the root works too.
+  SOURCE            path of the real file, read from where you are standing.
+                    An absolute path inside the root works too. It is stored
+                    relative to the REPO ROOT, which is what `sync ls` shows.
   DEST_IN_WORKTREE  path the symlink takes inside EACH WORKTREE, relative to
                     that worktree's root. Must be relative.
 
-Example (run from the repo root):
+From the repo root:
   git wt sync add secrets/.env .env
     -> <repo-root>/default/.env   -> <repo-root>/secrets/.env
-    -> <repo-root>/feature-a/.env -> <repo-root>/secrets/.env";
+    -> <repo-root>/feature-a/.env -> <repo-root>/secrets/.env
+
+From inside a worktree, the same step:
+  git wt sync add ../secrets/.env .env";
 
 const SYNC_COPY_ABOUT: &str = "\
 Copy a file into every worktree instead of linking it.
@@ -216,11 +226,19 @@ By default it runs when a worktree is created, and not on a plain
 `git wt sync apply` — re-running someone's `npm ci` because they repaired a
 symlink would be its own surprise. Pass --when to change that.
 
-The command runs through the shell, from the worktree root, with:
+The command runs through the shell, from the worktree root — or from --dir
+inside it — with:
   GWT_ROOT  GWT_WORKTREE  GWT_WORKTREE_NAME  GWT_BRANCH
 
+A COMMAND with newlines in it is one shell script, not a line-at-a-time list:
+`set -e` holds for the rest of it, and a variable set on one line is still set
+on the next.
+
 Example:
-  git wt sync run 'npm ci' --only-if package.json --timeout 10m";
+  git wt sync run 'npm ci' --only-if package.json --timeout 10m
+  git wt sync run 'set -e
+  pnpm install --frozen-lockfile
+  pnpm run build' --dir packages/web";
 
 #[derive(Subcommand, Debug)]
 enum CacheOp {
@@ -377,7 +395,7 @@ enum SyncOp {
 }
 
 /// Turn one parsed subcommand into the step it describes.
-fn step_from(op: &SyncOp, layout: &BareLayout) -> Result<gwt_core::sync::Step> {
+fn step_from(op: &SyncOp, layout: &BareLayout, cwd: &Path) -> Result<gwt_core::sync::Step> {
     use gwt_core::cache::{CacheMode, CacheStep};
     use gwt_core::sync::{normalize_dst, normalize_src, CopyStep, LinkStep, Phase, RunStep, Step};
     Ok(match op {
@@ -405,7 +423,7 @@ fn step_from(op: &SyncOp, layout: &BareLayout) -> Result<gwt_core::sync::Step> {
             })
         }
         SyncOp::Link { src, dst } => Step::Link(LinkStep {
-            src: normalize_src(layout, src)?,
+            src: normalize_src(layout, cwd, src)?,
             dst: normalize_dst(dst)?,
         }),
         SyncOp::Copy {
@@ -414,7 +432,7 @@ fn step_from(op: &SyncOp, layout: &BareLayout) -> Result<gwt_core::sync::Step> {
             overwrite,
             render,
         } => Step::Copy(CopyStep {
-            src: normalize_src(layout, src)?,
+            src: normalize_src(layout, cwd, src)?,
             dst: normalize_dst(dst)?,
             overwrite: *overwrite,
             render: *render,
@@ -538,8 +556,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Everything else requires the bare-style layout.
-    let layout = BareLayout::require(&cwd)?;
+    // Everything else requires the bare-style layout — found from wherever the
+    // user happens to be standing, which is usually inside a worktree.
+    let layout = BareLayout::discover(&cwd)?;
     match cli.command.unwrap() {
         Cmd::Add {
             branch,
@@ -558,7 +577,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Remove { name } => commands::remove::run(&layout, &name)?,
         Cmd::List => commands::list::run(&layout)?,
         Cmd::Check { branch, fetch } => commands::check::run(&layout, &branch, fetch)?,
-        Cmd::Sync { op } => run_sync(&layout, op)?,
+        Cmd::Sync { op } => run_sync(&layout, &cwd, op)?,
         Cmd::Cache { op } => match op {
             CacheOp::Ls => commands::cache::ls(&layout)?,
             CacheOp::Gc { older_than, yes } => commands::cache::gc(&layout, older_than, yes)?,
@@ -568,7 +587,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Secret { op } => {
             eprintln!("git wt: `secret` is now `sync` — same thing, plus copy and run steps.");
-            run_sync(&layout, op)?
+            run_sync(&layout, &cwd, op)?
         }
         Cmd::Relink => {
             eprintln!("git wt: `relink` is now `sync apply`.");
@@ -582,14 +601,14 @@ fn dispatch(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn run_sync(layout: &BareLayout, op: Option<SyncOp>) -> Result<()> {
+fn run_sync(layout: &BareLayout, cwd: &Path, op: Option<SyncOp>) -> Result<()> {
     match op {
         None => gwt_tui::run_sync_manager(layout)?,
         Some(SyncOp::Ls) => commands::sync::ls(layout)?,
         Some(SyncOp::Rm { key }) => commands::sync::remove(layout, &key)?,
         Some(SyncOp::Apply { run }) => commands::sync::apply(layout, run)?,
         Some(SyncOp::Edit) => commands::sync::edit(layout)?,
-        Some(op) => commands::sync::add(layout, step_from(&op, layout)?)?,
+        Some(op) => commands::sync::add(layout, step_from(&op, layout, cwd)?)?,
     }
     Ok(())
 }

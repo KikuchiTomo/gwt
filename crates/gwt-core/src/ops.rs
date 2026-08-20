@@ -334,6 +334,79 @@ pub fn check(layout: &BareLayout, branch: &str, do_fetch: bool) -> Result<CheckR
     })
 }
 
+/// How the branch a new worktree is about to be cut from compares to origin.
+#[derive(Debug, Clone)]
+pub struct BaseStatus {
+    pub branch: String,
+    pub ahead: u32,
+    pub behind: u32,
+    /// The worktree holding the branch, if one does. git refuses to move a
+    /// checked-out branch, so that is where the update has to happen.
+    pub holder: Option<PathBuf>,
+}
+
+/// Fetch `base` and report how far behind origin the local branch has fallen.
+///
+/// Returns `None` when there is nothing worth asking about: the base is a remote
+/// ref (which is whatever the fetch just made it), has no local branch, has no
+/// origin counterpart, or is already up to date.
+///
+/// The fetch is best-effort. Being offline is not a reason to refuse to create a
+/// worktree, so a failure just means the answer comes from the refs we already
+/// have — which is exactly what the picker's REMOTE column shows.
+pub fn base_status(layout: &BareLayout, base: &str) -> Result<Option<BaseStatus>> {
+    if base.starts_with("origin/") || !branch_exists_local(layout, base)? {
+        return Ok(None);
+    }
+    let _ = git::run(
+        &layout.root,
+        ["--git-dir", BARE_DIR, "fetch", "origin", base],
+    );
+    if !branch_exists_remote(layout, base)? {
+        return Ok(None);
+    }
+    let Some(ab) = crate::status::ahead_behind(layout, base)? else {
+        return Ok(None);
+    };
+    if ab.behind == 0 {
+        return Ok(None);
+    }
+    Ok(Some(BaseStatus {
+        branch: base.to_string(),
+        ahead: ab.ahead,
+        behind: ab.behind,
+        holder: worktree_holding_branch(layout, base)?,
+    }))
+}
+
+/// Fast-forward the base branch onto origin, so the new branch starts from what
+/// the remote actually has.
+///
+/// Fast-forward only, by both routes: a base branch that has diverged is a
+/// question for a real shell, not something to resolve behind a y/n prompt.
+pub fn update_base_branch(layout: &BareLayout, branch: &str) -> Result<String> {
+    if let Some(holder) = worktree_holding_branch(layout, branch)? {
+        return pull(&holder);
+    }
+    let behind = crate::status::ahead_behind(layout, branch)?
+        .map(|ab| ab.behind)
+        .unwrap_or(0);
+    // `<branch>:<branch>` with no leading `+` is refused unless it fast-forwards.
+    git::run(
+        &layout.root,
+        [
+            "--git-dir",
+            BARE_DIR,
+            "fetch",
+            "origin",
+            &format!("{branch}:{branch}"),
+        ],
+    )?;
+    Ok(format!(
+        "fast-forwarded {branch} {behind} commit(s) from origin"
+    ))
+}
+
 /// Every real worktree directory, excluding the bare dir and the root itself.
 ///
 /// The comparison goes through `canonicalize`, because git answers with

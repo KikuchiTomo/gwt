@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::editor::TextArea;
 use crate::fuzzy;
 use crate::term::{enter_inline, leave_inline};
 use crate::theme::{
@@ -80,6 +81,13 @@ impl Kind {
     }
 }
 
+/// Which half of the run-step screen the keyboard is aimed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmdField {
+    Cmd,
+    Dir,
+}
+
 #[derive(Default, Clone)]
 struct Scored {
     idx: usize,
@@ -110,9 +118,16 @@ enum Mode {
         render: bool,
         editing: Option<usize>,
     },
-    /// The `run` equivalent: type the command line.
+    /// The `run` equivalent: write the command.
+    ///
+    /// Two fields rather than two screens, because they are read together: a
+    /// script and the directory it runs in only make sense as a pair, and `^d`
+    /// sits beside the copy screen's `^o`/`^r` in the same part of the muscle
+    /// memory.
     TypeCommand {
-        buf: String,
+        cmd: TextArea,
+        dir: TextArea,
+        field: CmdField,
         existing: Option<RunStep>,
         editing: Option<usize>,
     },
@@ -246,7 +261,7 @@ impl App {
                 let hay = format!(
                     "{} {} {}",
                     r.step.kind(),
-                    r.step.subject(),
+                    r.step.subject_line(),
                     r.step.dst().unwrap_or("")
                 );
                 fuzzy::score(&q, &hay).map(|m| Scored {
@@ -303,7 +318,7 @@ impl App {
             Job::Replace(idx, step) => ops::sync_replace_at(&self.layout, *idx, step.clone())
                 .map_err(|e| e.to_string())
                 .and_then(|opt| match opt {
-                    None => Err(t::sync_no_entry(&step.subject())),
+                    None => Err(t::sync_no_entry(&step.subject_line())),
                     Some(r) => Ok(added_message(&r)),
                 }),
             Job::Remove(idx) => ops::sync_remove_at(&self.layout, *idx)
@@ -322,7 +337,7 @@ impl App {
                             .filter(|(_, o)| matches!(o, UnlinkOutcome::Kept { .. }))
                             .map(|(p, _)| name_of(p))
                             .collect();
-                        let mut msg = t::sync_removed(&r.step.subject(), removed);
+                        let mut msg = t::sync_removed(&r.step.subject_line(), removed);
                         if !kept.is_empty() {
                             // A real file where the link was is worth naming.
                             msg.push_str(&t::sync_kept_real(&kept.join(", ")));
@@ -456,7 +471,7 @@ impl App {
                 Ok(false)
             }
             Mode::ConfirmRemove { idx, step } => {
-                let (idx, subject) = (*idx, step.subject().to_string());
+                let (idx, subject) = (*idx, step.subject_line());
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.start(
@@ -531,7 +546,9 @@ impl App {
     fn begin_add(&mut self, kind: Kind) {
         if kind == Kind::Run {
             self.mode = Mode::TypeCommand {
-                buf: String::new(),
+                cmd: TextArea::default(),
+                dir: TextArea::default(),
+                field: CmdField::Cmd,
                 existing: None,
                 editing: None,
             };
@@ -757,60 +774,121 @@ impl App {
         }
     }
 
+    /// The one screen here that is an editor rather than a prompt.
+    ///
+    /// Enter has to mean "new line" for a script to be typeable at all, so
+    /// saving moves to `^s` — and to Enter in the single-line dir field, where
+    /// there is no newline to want.
     fn handle_type_command(&mut self, key: KeyEvent, ctrl: bool) {
+        let field = match &self.mode {
+            Mode::TypeCommand { field, .. } => *field,
+            _ => return,
+        };
         match key.code {
-            KeyCode::Esc => self.mode = Mode::List,
-            KeyCode::Char('c') if ctrl => self.mode = Mode::List,
-            KeyCode::Enter => {
-                let Mode::TypeCommand {
-                    buf,
-                    existing,
-                    editing,
-                } = &self.mode
-                else {
-                    return;
-                };
-                let cmd = buf.trim().to_string();
-                if cmd.is_empty() {
+            KeyCode::Char('c') if ctrl => return self.mode = Mode::List,
+            KeyCode::Char('s') if ctrl => return self.commit_command(),
+            KeyCode::Char('d') if ctrl => return self.toggle_cmd_field(),
+            KeyCode::Tab | KeyCode::BackTab => return self.toggle_cmd_field(),
+            // Esc backs out of the dir field first: losing a typed script to a
+            // stray Esc while answering a secondary question would be cruel.
+            KeyCode::Esc => {
+                return match field {
+                    CmdField::Dir => self.toggle_cmd_field(),
+                    CmdField::Cmd => self.mode = Mode::List,
+                }
+            }
+            KeyCode::Enter if field == CmdField::Dir => return self.commit_command(),
+            _ => {}
+        }
+        let Mode::TypeCommand { cmd, dir, .. } = &mut self.mode else {
+            return;
+        };
+        let buf = match field {
+            CmdField::Cmd => cmd,
+            CmdField::Dir => dir,
+        };
+        match key.code {
+            KeyCode::Enter => buf.insert('\n'),
+            KeyCode::Backspace => buf.backspace(),
+            KeyCode::Delete => buf.delete(),
+            KeyCode::Left => buf.left(),
+            KeyCode::Right => buf.right(),
+            KeyCode::Up => buf.up(),
+            KeyCode::Down => buf.down(),
+            KeyCode::Home => buf.home(),
+            KeyCode::End => buf.end(),
+            KeyCode::Char(c) => buf.insert(c),
+            _ => {}
+        }
+    }
+
+    fn toggle_cmd_field(&mut self) {
+        if let Mode::TypeCommand { field, .. } = &mut self.mode {
+            *field = match field {
+                CmdField::Cmd => CmdField::Dir,
+                CmdField::Dir => CmdField::Cmd,
+            };
+        }
+    }
+
+    fn commit_command(&mut self) {
+        let Mode::TypeCommand {
+            cmd,
+            dir,
+            existing,
+            editing,
+            ..
+        } = &self.mode
+        else {
+            return;
+        };
+        // Only the edges are trimmed: the blank line someone left in the middle
+        // of their script is theirs, and the shell does not mind it.
+        let cmd = cmd.text().trim().to_string();
+        if cmd.is_empty() {
+            self.mode = Mode::Message {
+                text: t::cmd_required().into(),
+                error: true,
+            };
+            return;
+        }
+        let dir = dir.text().trim();
+        let dir = if dir.is_empty() {
+            None
+        } else {
+            // The same rule as every other worktree-relative path here.
+            match sync::normalize_dst(dir) {
+                Ok(d) => Some(d),
+                Err(e) => {
                     self.mode = Mode::Message {
-                        text: t::cmd_required().into(),
+                        text: e.to_string(),
                         error: true,
                     };
                     return;
                 }
-                // Editing keeps only_if/timeout/dir, which this screen does not
-                // show: losing them because a typo was fixed would be worse
-                // than not being able to set them here at all.
-                let step = Step::Run(match existing {
-                    Some(prev) => RunStep {
-                        cmd,
-                        ..prev.clone()
-                    },
-                    None => RunStep {
-                        cmd,
-                        when: vec![Phase::Create],
-                        only_if: None,
-                        timeout: DEFAULT_TIMEOUT,
-                        dir: None,
-                    },
-                });
-                let label = t::label_linking().to_string();
-                match editing {
-                    Some(i) => self.start(label, Job::Replace(*i, step)),
-                    None => self.start(label, Job::Add(step)),
-                }
             }
-            KeyCode::Backspace => {
-                if let Mode::TypeCommand { buf, .. } = &mut self.mode {
-                    buf.pop();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Mode::TypeCommand { buf, .. } = &mut self.mode {
-                    buf.push(c);
-                }
-            }
-            _ => {}
+        };
+        // Editing keeps only_if and timeout, which this screen does not show:
+        // losing them because a typo was fixed would be worse than not being
+        // able to set them here at all.
+        let step = Step::Run(match existing {
+            Some(prev) => RunStep {
+                cmd,
+                dir,
+                ..prev.clone()
+            },
+            None => RunStep {
+                cmd,
+                when: vec![Phase::Create],
+                only_if: None,
+                timeout: DEFAULT_TIMEOUT,
+                dir,
+            },
+        });
+        let label = t::label_linking().to_string();
+        match editing {
+            Some(i) => self.start(label, Job::Replace(*i, step)),
+            None => self.start(label, Job::Add(step)),
         }
     }
 
@@ -1054,7 +1132,9 @@ impl App {
                 if let Some(row) = self.selected() {
                     self.mode = match &row.step {
                         Step::Run(r) => Mode::TypeCommand {
-                            buf: r.cmd.clone(),
+                            cmd: TextArea::new(r.cmd.clone()),
+                            dir: TextArea::new(r.dir.clone().unwrap_or_default()),
+                            field: CmdField::Cmd,
                             existing: Some(r.clone()),
                             editing: Some(row.idx),
                         },
@@ -1093,7 +1173,7 @@ impl App {
 
 fn added_message(r: &ops::StepAdded) -> String {
     match &r.step {
-        Step::Run(run) => t::sync_registered_cmd(&run.cmd),
+        Step::Run(run) => t::sync_registered_cmd(&sync::one_line(&run.cmd)),
         step => {
             if r.src_exists {
                 let n = r
@@ -1209,9 +1289,18 @@ fn draw(f: &mut Frame, app: &App) {
             );
             draw_prompt(f, chunks[2], t::label_dest(), buf, true);
         }
-        Mode::TypeCommand { buf, .. } => {
-            draw_cmd_help(f, chunks[0], chunks[1]);
-            draw_prompt(f, chunks[2], t::label_command(), buf, true);
+        Mode::TypeCommand {
+            cmd, dir, field, ..
+        } => {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(PAD),
+                    Span::styled(t::cmd_question(), Style::default().fg(C_BRANCH)),
+                ])),
+                chunks[0],
+            );
+            draw_cmd_editor(f, chunks[1], cmd, *field == CmdField::Cmd);
+            draw_cmd_dir(f, chunks[2], dir, *field == CmdField::Dir);
         }
         Mode::CachePath { buf, .. } => {
             draw_lines(
@@ -1301,6 +1390,7 @@ fn help(app: &App) -> Line<'static> {
         Mode::PickSource { .. } => t::sync_help_source(),
         Mode::TypeDest { kind, .. } if *kind == Kind::Copy => t::sync_help_dest_copy(),
         Mode::TypeDest { .. } => t::sync_help_dest(),
+        Mode::TypeCommand { field, .. } if *field == CmdField::Dir => t::sync_help_cmd_dir(),
         Mode::TypeCommand { .. } => t::sync_help_cmd(),
         Mode::CachePath { .. } => t::sync_help_cache_path(),
         Mode::CacheSharing { .. } => t::sync_help_cache_mode(),
@@ -1319,7 +1409,7 @@ fn cols(app: &App) -> (usize, usize) {
     let src = app
         .rows
         .iter()
-        .map(|r| r.step.subject().chars().count())
+        .map(|r| r.step.subject_line().chars().count())
         .chain(std::iter::once(22))
         .max()
         .unwrap_or(22)
@@ -1425,7 +1515,7 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(kind_color(&r.step)),
             ));
             spans.push(Span::raw(" "));
-            let src_cell = fit(&r.step.subject(), sw);
+            let src_cell = fit(&r.step.subject_line(), sw);
             spans.extend(
                 highlighted(&src_cell, &s.indices, C_LOCAL)
                     .into_iter()
@@ -1612,17 +1702,34 @@ fn draw_run_detail(f: &mut Frame, area: Rect, run: &RunStep) {
         format!("{}s", run.timeout.as_secs()),
         C_TEXT,
     ));
-    if let Some(dir) = &run.dir {
-        top.extend(field("dir", dir.clone(), C_PATH));
-    }
+    // Always shown, blank or not: where a command runs is half of what it does,
+    // and "it ran somewhere else" is a confusing thing to have to deduce.
+    top.extend(field(
+        t::label_run_dir(),
+        run.dir
+            .clone()
+            .unwrap_or_else(|| t::run_dir_root().to_string()),
+        C_PATH,
+    ));
 
     let mut bottom = vec![Span::raw(PAD)];
+    // The row above shows only the first line of a script; say how much of it
+    // is not on screen.
+    let lines = run.cmd.lines().filter(|l| !l.trim().is_empty()).count();
+    if lines > 1 {
+        bottom.extend(field(
+            t::label_command(),
+            format!("{lines} lines"),
+            C_BRANCH,
+        ));
+    }
     match &run.only_if {
         Some(cond) => bottom.extend(field(t::detail_only_if(), cond.clone(), C_LOCAL)),
-        None => bottom.push(Span::styled(
+        None if lines <= 1 => bottom.push(Span::styled(
             t::cmd_more_in_toml(),
             Style::default().fg(C_DIM),
         )),
+        None => {}
     }
     f.render_widget(
         Paragraph::new(vec![Line::from(top), Line::from(bottom)]),
@@ -1795,27 +1902,96 @@ fn draw_cache_modes(f: &mut Frame, area: Rect, cursor: usize) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_cmd_help(f: &mut Frame, top: Rect, body: Rect) {
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(PAD),
-            Span::styled(t::cmd_question(), Style::default().fg(C_BRANCH)),
-        ])),
-        top,
-    );
-    let lines = vec![
-        Line::from(Span::raw("")),
-        Line::from(vec![
+/// The command itself: as many lines as the user wants, with the caret drawn in
+/// place so the arrow keys have something to point at.
+///
+/// The hints occupy the space the script has not claimed yet, and step aside as
+/// soon as it has — an empty screen needs the explanation more than a full one.
+fn draw_cmd_editor(f: &mut Frame, area: Rect, cmd: &TextArea, focused: bool) {
+    let (cur_line, cur_col) = cmd.cursor_line_col();
+    let total = cmd.line_count();
+    // A blank line under the script, so the hint below cannot be misread as the
+    // next line of it.
+    let hint_h = if cmd.is_blank() { 3 } else { 2 };
+    let cap = (area.height as usize).saturating_sub(hint_h).max(1);
+    let (start, end) = visible_window(total, cur_line, cap);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(cap + hint_h);
+    for (i, text) in cmd.lines().enumerate().take(end).skip(start) {
+        let mut spans = vec![Span::styled(
+            // A gutter, so a blank line still reads as a line of the script.
+            format!("{:>3} ", i + 1),
+            Style::default().fg(C_DIM),
+        )];
+        if focused && i == cur_line {
+            let split = text
+                .char_indices()
+                .nth(cur_col)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            spans.push(Span::styled(
+                text[..split].to_string(),
+                Style::default().fg(C_TEXT),
+            ));
+            spans.push(Span::styled("▏", Style::default().fg(C_POINTER)));
+            spans.push(Span::styled(
+                text[split..].to_string(),
+                Style::default().fg(C_TEXT),
+            ));
+        } else {
+            spans.push(Span::styled(text.to_string(), Style::default().fg(C_TEXT)));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::raw("")));
+    if cmd.is_blank() {
+        lines.push(Line::from(vec![
             Span::raw(PAD),
             Span::styled(t::cmd_hint(), Style::default().fg(C_DIM)),
             Span::styled("npm ci", Style::default().fg(C_CREATE)),
-        ]),
-        Line::from(vec![
-            Span::raw(PAD),
-            Span::styled(t::cmd_more_in_toml(), Style::default().fg(C_DIM)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::raw(PAD),
+        Span::styled(
+            if cmd.is_blank() {
+                t::cmd_multiline_hint()
+            } else {
+                t::cmd_more_in_toml()
+            },
+            Style::default().fg(C_DIM),
+        ),
+    ]));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The working directory, in the prompt slot every other screen types into.
+/// Dim and unfocused until `^d`, so it reads as an answerable question rather
+/// than another thing to fill in.
+fn draw_cmd_dir(f: &mut Frame, area: Rect, dir: &TextArea, focused: bool) {
+    if focused {
+        return draw_prompt(f, area, t::label_run_dir(), dir.text(), true);
+    }
+    let value = if dir.text().trim().is_empty() {
+        t::run_dir_root().to_string()
+    } else {
+        dir.text().to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} ", t::label_run_dir()),
+                Style::default().fg(C_DIM),
+            ),
+            Span::styled("› ", Style::default().fg(C_DIM)),
+            Span::styled(value, Style::default().fg(C_PATH)),
+            Span::styled(
+                format!("   {}", t::run_dir_edit_hint()),
+                Style::default().fg(C_DIM),
+            ),
+        ])),
+        area,
+    );
 }
 
 fn draw_prompt(f: &mut Frame, area: Rect, label: &str, value: &str, caret: bool) {
@@ -1843,9 +2019,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(match step.dst() {
                 Some(dst) => format!(
                     "'{}' and undo (worktree)/{dst} everywhere ? y/N",
-                    step.subject()
+                    step.subject_line()
                 ),
-                None => format!("'{}' ? y/N", step.subject()),
+                None => format!("'{}' ? y/N", step.subject_line()),
             }),
         ]),
         Mode::Working { label, frame, .. } => Line::from(vec![
