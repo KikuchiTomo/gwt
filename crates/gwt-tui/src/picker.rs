@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gwt_core::Repo;
 
-use crate::term::{enter_inline, leave_inline};
+use crate::term::{enter_inline, leave_inline, released};
 use state::{App, BaseNote, BranchPurpose, Mode, SyncOp};
 
 #[derive(Debug)]
@@ -22,6 +22,15 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
     let result = (|| -> Result<PickerOutcome> {
         let mut app = App::new(repo)?;
         loop {
+            // A recipe with a command in it gets the terminal to itself: the
+            // picker steps out of the way, the command prints where it can be
+            // read, and the viewport is built again on the way back.
+            if let Some(fg) = app.foreground.take() {
+                released(&mut term, height, |survives| {
+                    app.run_foreground(fg, survives)
+                })?;
+                continue;
+            }
             term.draw(|f| ui::draw(f, &mut app))?;
             // The delete/sync animations are self-driven, not key-driven: keep
             // ticking (and redrawing) on a timer until the work finishes.

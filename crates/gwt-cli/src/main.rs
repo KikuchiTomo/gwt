@@ -240,6 +240,21 @@ Example:
   pnpm install --frozen-lockfile
   pnpm run build' --dir packages/web";
 
+const SYNC_MOVE_ABOUT: &str = "Move a step to another position in the recipe.
+
+The recipe is an ordered list, and the order is the schedule: the `link` that
+puts .env in place has to run before the command that reads it, and a `cache`
+has to be mounted before the build that fills it.
+
+Both numbers are positions as `sync ls` prints them, counting from 1. The step
+lands *at* TO, and everything between the two slides over to make room.
+
+The same move is J / K (or shift + ↑↓) in `git wt sync`.
+
+Example:
+  git wt sync ls
+  git wt sync move 3 1        # the third step now runs first";
+
 #[derive(Subcommand, Debug)]
 enum CacheOp {
     /// Show every bucket: size, and which worktrees use it.
@@ -383,6 +398,16 @@ enum SyncOp {
     /// Show every step, with both bases spelled out, plus its health.
     #[command(alias = "list")]
     Ls,
+    /// Move a step to another position — the order is the order it runs in.
+    #[command(alias = "mv", long_about = SYNC_MOVE_ABOUT)]
+    Move {
+        /// The step to move, numbered as `sync ls` numbers it.
+        #[arg(value_name = "FROM")]
+        from: usize,
+        /// Where it should end up.
+        #[arg(value_name = "TO")]
+        to: usize,
+    },
     /// Re-apply the recipe to every existing worktree.
     #[command(alias = "relink")]
     Apply {
@@ -605,6 +630,7 @@ fn run_sync(layout: &BareLayout, cwd: &Path, op: Option<SyncOp>) -> Result<()> {
     match op {
         None => gwt_tui::run_sync_manager(layout)?,
         Some(SyncOp::Ls) => commands::sync::ls(layout)?,
+        Some(SyncOp::Move { from, to }) => commands::sync::move_step(layout, from, to)?,
         Some(SyncOp::Rm { key }) => commands::sync::remove(layout, &key)?,
         Some(SyncOp::Apply { run }) => commands::sync::apply(layout, run)?,
         Some(SyncOp::Edit) => commands::sync::edit(layout)?,

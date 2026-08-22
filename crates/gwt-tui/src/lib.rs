@@ -2,6 +2,7 @@ pub mod display;
 pub mod editor;
 pub mod fuzzy;
 pub mod picker;
+mod screen;
 pub mod sync_ui;
 mod term;
 pub mod theme;

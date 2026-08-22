@@ -9,6 +9,7 @@ use gwt_core::sync;
 use gwt_core::{ops, t, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
 
 use crate::fuzzy;
+use crate::screen::Screen;
 use crate::theme::{KeyRow, KeySection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +201,43 @@ pub enum Mode {
     },
 }
 
+/// Run one creation job to completion. The worker thread and the foreground
+/// path differ only in who is watching, so the work itself lives here once.
+fn build_worktree(
+    layout: Option<BareLayout>,
+    repo: Repo,
+    job: CreateJob,
+    report: sync::Reporter,
+) -> std::result::Result<PathBuf, String> {
+    match (layout, job) {
+        (Some(l), CreateJob::New { base, branch, dir }) => {
+            ops::new(&l, &base, &branch, &dir, report).map_err(|e| e.to_string())
+        }
+        (Some(l), CreateJob::Adopt { branch, dir }) => {
+            ops::add(&l, &branch, &dir, report).map_err(|e| e.to_string())
+        }
+        (Some(l), CreateJob::AdoptExisting { branch, dir }) => {
+            ops::add_existing_branch(&l, &branch, &dir, report).map_err(|e| e.to_string())
+        }
+        (Some(l), CreateJob::RecreateFromRemote { branch, dir }) => {
+            ops::recreate_branch_from_remote(&l, &branch, &dir, report).map_err(|e| e.to_string())
+        }
+        (Some(l), CreateJob::Recreate { dir, branch, base }) => {
+            ops::recreate_worktree(&l, &dir, &branch, base.as_deref(), report)
+                .map_err(|e| e.to_string())
+        }
+        (_, CreateJob::PlainNew { path, branch }) => repo
+            .add_worktree(&path, &branch, true)
+            .map(|_| path)
+            .map_err(|e| e.to_string()),
+        (_, CreateJob::PlainRemote { path, remote_ref }) => repo
+            .add_worktree_from_remote(&path, &remote_ref)
+            .map(|_| path)
+            .map_err(|e| e.to_string()),
+        (None, _) => Err("not a bare-style worktree root".to_string()),
+    }
+}
+
 /// What the worker thread sends back while a worktree is being built.
 pub enum CreateMsg {
     Line(String),
@@ -290,6 +328,18 @@ pub struct App<'a> {
     pub branch_filter: String,
     pub filtered_branches: Vec<Scored>,
     pub branch_cursor: usize,
+
+    /// Work that wants the terminal to itself. The main loop takes it, tears
+    /// the viewport down and runs it, because a spinner cannot show what a
+    /// command is doing — see [`App::start_create`].
+    pub foreground: Option<ForegroundJob>,
+}
+
+/// A creation whose recipe runs a command, so it cannot be animated: the
+/// command owns the screen for as long as it takes.
+pub struct ForegroundJob {
+    pub label: String,
+    pub job: CreateJob,
 }
 
 impl<'a> App<'a> {
@@ -326,6 +376,7 @@ impl<'a> App<'a> {
             branch_filter: String::new(),
             filtered_branches: Vec::new(),
             branch_cursor: 0,
+            foreground: None,
         };
         s.refilter_worktrees();
         Ok(s)
@@ -1053,9 +1104,22 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Kick off the git call on a worker thread and switch to the spinner.
     /// Build a worktree off the UI thread, streaming the recipe's output back.
+    ///
+    /// Unless the recipe has a command to run, in which case there is nothing
+    /// to stream it *into*: `npm ci` writes more in a second than the status
+    /// line holds, and the interesting part is never the last line. Those runs
+    /// are handed to the main loop, which puts the TUI away first.
     pub fn start_create(&mut self, label: String, job: CreateJob) {
+        if self
+            .layout
+            .as_ref()
+            .is_some_and(|l| sync::has_commands(l, sync::Phase::Create))
+        {
+            self.mode = Mode::List;
+            self.foreground = Some(ForegroundJob { label, job });
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let layout = self.layout.clone();
         let repo = (*self.repo).clone();
@@ -1078,35 +1142,7 @@ impl<'a> App<'a> {
                     let _ = out.send(m);
                 }
             };
-            let res: std::result::Result<PathBuf, String> = match (layout, job) {
-                (Some(l), CreateJob::New { base, branch, dir }) => {
-                    ops::new(&l, &base, &branch, &dir, &mut report).map_err(|e| e.to_string())
-                }
-                (Some(l), CreateJob::Adopt { branch, dir }) => {
-                    ops::add(&l, &branch, &dir, &mut report).map_err(|e| e.to_string())
-                }
-                (Some(l), CreateJob::AdoptExisting { branch, dir }) => {
-                    ops::add_existing_branch(&l, &branch, &dir, &mut report)
-                        .map_err(|e| e.to_string())
-                }
-                (Some(l), CreateJob::RecreateFromRemote { branch, dir }) => {
-                    ops::recreate_branch_from_remote(&l, &branch, &dir, &mut report)
-                        .map_err(|e| e.to_string())
-                }
-                (Some(l), CreateJob::Recreate { dir, branch, base }) => {
-                    ops::recreate_worktree(&l, &dir, &branch, base.as_deref(), &mut report)
-                        .map_err(|e| e.to_string())
-                }
-                (_, CreateJob::PlainNew { path, branch }) => repo
-                    .add_worktree(&path, &branch, true)
-                    .map(|_| path)
-                    .map_err(|e| e.to_string()),
-                (_, CreateJob::PlainRemote { path, remote_ref }) => repo
-                    .add_worktree_from_remote(&path, &remote_ref)
-                    .map(|_| path)
-                    .map_err(|e| e.to_string()),
-                (None, _) => Err("not a bare-style worktree root".to_string()),
-            };
+            let res = build_worktree(layout, repo, job, &mut report);
             let _ = tx.send(CreateMsg::Done(res));
         });
         self.mode = Mode::Creating {
@@ -1116,6 +1152,35 @@ impl<'a> App<'a> {
             frame: 0,
             rx,
         };
+    }
+
+    /// Build the worktree with the TUI out of the way, so the recipe's commands
+    /// print straight to the terminal. Called by the main loop, which has
+    /// already torn the viewport down and will build it back.
+    pub fn run_foreground(&mut self, fg: ForegroundJob, output_survives: bool) {
+        let layout = self.layout.clone();
+        let repo = (*self.repo).clone();
+        let mut screen = Screen::new();
+        Screen::banner(&fg.label);
+        let res = {
+            let _screen_is_ours = sync::lease_screen();
+            let mut report = |ev: sync::Event| screen.on(ev);
+            build_worktree(layout, repo, fg.job, &mut report)
+        };
+        screen.finish(output_survives);
+
+        match res {
+            Ok(path) => {
+                let _ = self.refresh_worktrees();
+                match screen.first_failure() {
+                    // The worktree is there either way; a failed step is a
+                    // result to read, not a reason to pretend nothing happened.
+                    Some(w) => self.set_error(format!("{} created, but {w}", path_name(&path))),
+                    None => self.mode = Mode::List,
+                }
+            }
+            Err(e) => self.set_error(e),
+        }
     }
 
     /// Advance the spinner and pick up whatever the worker has said. Returns

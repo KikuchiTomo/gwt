@@ -240,8 +240,8 @@ pub mod t {
 
     // ---- sync manager -----------------------------------------------------
     msg! { SYNC {
-        sync_help => " ↑↓:nav  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q:quit ",
-                     " ↑↓:移動  a:追加  e:変更  d:削除  r:適用  f:絞込  ?:キー  q:終了 ";
+        sync_help => " ↑↓:nav  J/K:reorder  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q:quit ",
+                     " ↑↓:移動  J/K:並替  a:追加  e:変更  d:削除  r:適用  f:絞込  ?:キー  q:終了 ";
         sync_help_filter => " type:filter  esc:clear  ↑↓:nav  enter:done ",
                             " 入力:絞込  esc:解除  ↑↓:移動  enter:確定 ";
         sync_help_kind => " l:link  c:copy  r:run  k:cache   ↑↓:move  enter:pick  esc/q:cancel ",
@@ -360,6 +360,7 @@ pub mod t {
                             "ソースファイルがまだ存在しません";
         src_untouched => "the source file itself is never deleted",
                          "ソースファイル自体は削除されません";
+        screen_return => " press enter to return ", " Enter で戻る ";
     }}
 
     // ---- runtime-formatted messages ---------------------------------------
@@ -520,6 +521,8 @@ pub mod t {
         k_sdel => "remove the step and undo it in every worktree",
                   "手順を削除し全ワークツリーで元に戻す";
         k_sapply => "re-apply the whole recipe", "定義を全ワークツリーに再適用";
+        k_smove => "move the step earlier / later — the order is the order it runs in",
+                   "手順を上下に移動。並び順がそのまま実行順";
         k_squit => "close the manager", "管理画面を閉じる";
     }}
 }

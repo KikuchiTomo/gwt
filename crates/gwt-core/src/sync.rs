@@ -23,6 +23,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -173,6 +174,15 @@ impl Step {
 
     pub fn dst_abs(&self, worktree_dir: &Path) -> Option<PathBuf> {
         self.dst().map(|d| worktree_dir.join(d))
+    }
+
+    /// Whether this step is a command that would fire in `phase`.
+    ///
+    /// This is what decides who owns the terminal: a screen full of `npm ci`
+    /// belongs on the screen, and only the caller knows whether it is in the
+    /// middle of drawing one.
+    pub fn commands_in(&self, phase: Phase) -> bool {
+        matches!(self, Step::Run(r) if r.when.contains(&phase))
     }
 
     fn runs_in(&self, phase: Phase) -> bool {
@@ -560,6 +570,69 @@ pub fn save(layout: &BareLayout, steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
+/// Move the step at `from` so that it becomes the step at `to`, sliding the
+/// rest along. The order is the schedule, so this is how you say "link `.env`
+/// *before* the command that reads it" after the fact.
+///
+/// The `[[step]]` tables are moved whole rather than rewritten in place, so a
+/// comment written above a step travels with that step instead of staying
+/// behind to describe its replacement. Returns `None` if either index is past
+/// the end of the recipe.
+pub fn reorder(layout: &BareLayout, from: usize, to: usize) -> Result<Option<Step>> {
+    // No TOML file yet means a legacy manifest (or nothing): read it the usual
+    // way and write the recipe out, which is what every other edit does too.
+    if !layout.sync_config.exists() {
+        let mut steps = load(layout)?.steps;
+        let Some(step) = take_and_insert(&mut steps, from, to) else {
+            return Ok(None);
+        };
+        save(layout, &steps)?;
+        return Ok(Some(step));
+    }
+
+    let raw = fs::read_to_string(&layout.sync_config)?;
+    let mut doc: toml_edit::DocumentMut =
+        raw.parse()
+            .map_err(|e: toml_edit::TomlError| Error::SyncConfigInvalid {
+                reason: e.to_string(),
+            })?;
+    let Some(array) = doc.get("step").and_then(|i| i.as_array_of_tables()) else {
+        return Ok(None);
+    };
+    let mut tables: Vec<toml_edit::Table> = array.iter().cloned().collect();
+    // A table remembers where in the document it was written, and that is what
+    // decides the order on the way out — reordering the list alone would be
+    // undone the moment we serialized. Keep the slots, move the steps between
+    // them, and anything else the file holds stays where its author put it.
+    let slots: Vec<Option<usize>> = tables.iter().map(|t| t.position()).collect();
+    let Some(table) = take_and_insert(&mut tables, from, to) else {
+        return Ok(None);
+    };
+    let step = step_from_table(to, &table)?;
+
+    let mut rebuilt = toml_edit::ArrayOfTables::new();
+    for (mut t, slot) in tables.into_iter().zip(slots) {
+        if let Some(p) = slot {
+            t.set_position(p);
+        }
+        rebuilt.push(t);
+    }
+    doc["step"] = toml_edit::Item::ArrayOfTables(rebuilt);
+    fs::write(&layout.sync_config, doc.to_string())?;
+    Ok(Some(step))
+}
+
+/// Pull item `from` out and put it back at `to`, or `None` if either index is
+/// out of range. Returns a clone of what moved.
+fn take_and_insert<T: Clone>(items: &mut Vec<T>, from: usize, to: usize) -> Option<T> {
+    if from >= items.len() || to >= items.len() {
+        return None;
+    }
+    let item = items.remove(from);
+    items.insert(to, item.clone());
+    Some(item)
+}
+
 /// Drop an empty, commented recipe into a fresh clone. A file that exists and
 /// explains itself is findable; a feature nobody knows the file name of is not.
 pub fn write_starter(layout: &BareLayout) -> Result<()> {
@@ -730,8 +803,54 @@ pub enum UnlinkOutcome {
     Kept { reason: &'static str },
 }
 
+// ---------------------------------------------------------------------------
+// who owns the terminal
+// ---------------------------------------------------------------------------
+
+/// Set while nothing is drawing on the terminal, so a command may use it.
+static SCREEN_IS_FREE: AtomicBool = AtomicBool::new(false);
+
+/// Hand the terminal to `run` steps until the returned guard is dropped.
+///
+/// It is process-wide because the thing it describes is: there is one terminal,
+/// and a command can only have it while nothing else — the TUI above all — is
+/// painting on it. So the TUI tears its viewport down, takes this, and a
+/// five-minute `npm ci` prints its own progress where it can be read instead of
+/// losing all but the last line to a one-line status.
+///
+/// Without it a command's output is captured and handed to the reporter line by
+/// line, which is what every non-interactive caller wants.
+#[must_use = "output goes back to being captured when the lease drops"]
+pub struct ScreenLease(());
+
+pub fn lease_screen() -> ScreenLease {
+    SCREEN_IS_FREE.store(true, Ordering::SeqCst);
+    ScreenLease(())
+}
+
+impl Drop for ScreenLease {
+    fn drop(&mut self) {
+        SCREEN_IS_FREE.store(false, Ordering::SeqCst);
+    }
+}
+
+fn screen_is_free() -> bool {
+    SCREEN_IS_FREE.load(Ordering::SeqCst)
+}
+
+/// Whether applying the recipe in `phase` would run a command — the question
+/// worth asking before deciding to get out of the way.
+pub fn has_commands(layout: &BareLayout, phase: Phase) -> bool {
+    load(layout)
+        .map(|c| c.steps.iter().any(|s| s.commands_in(phase)))
+        .unwrap_or(false)
+}
+
 /// What the caller learns while a recipe runs. `Output` arrives line by line so
 /// a five-minute `npm ci` shows something other than a frozen terminal.
+///
+/// While a [`ScreenLease`] is held, a command writes straight to the terminal
+/// and no `Output` arrives at all — there is nothing left to relay.
 pub enum Event<'a> {
     StepStart(&'a Step),
     Output(&'a str),
@@ -921,6 +1040,10 @@ fn apply_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    if screen_is_free() {
+        return run_on_screen(cmd, s);
+    }
+
     let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1001,6 +1124,71 @@ fn apply_run(
 enum Pipe {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
+}
+
+/// Run the command with the terminal itself, not a pair of pipes.
+///
+/// Everything a build prints survives the trip this way — colors, progress
+/// bars, the cursor tricks a bundler uses to redraw a line — and a command that
+/// stops to ask something gets a keyboard to be answered from. The caller has
+/// already put the terminal back the way it found it; see [`lease_screen`].
+fn run_on_screen(mut cmd: Command, s: &RunStep) -> Result<Outcome> {
+    // stdout is how `cd "$(git wt)"` learns where to go, so a command must
+    // never reach it. Point it at stderr, which is where the TUI draws anyway.
+    cmd.stdin(Stdio::inherit())
+        .stdout(stderr_stdio())
+        .stderr(Stdio::inherit());
+
+    let started = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Outcome::Failed {
+                detail: e.to_string(),
+            })
+        }
+    };
+
+    // No pipes to drain, so waiting is just waiting. The poll is what keeps the
+    // timeout honest for a command that has stopped making progress.
+    let deadline = started + s.timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Outcome::Ran {
+                code: status.code().unwrap_or(-1),
+                secs: started.elapsed().as_secs(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Outcome::Failed {
+                detail: format!("timed out after {}", format_duration(s.timeout)),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A second handle on our own stderr, for a child that must not touch stdout.
+/// Falling back to `null` drops the output, which is still better than writing
+/// it where a shell is waiting to read a path.
+#[cfg(unix)]
+fn stderr_stdio() -> Stdio {
+    use std::os::fd::AsFd;
+    match std::io::stderr().as_fd().try_clone_to_owned() {
+        Ok(fd) => Stdio::from(fd),
+        Err(_) => Stdio::null(),
+    }
+}
+
+#[cfg(windows)]
+fn stderr_stdio() -> Stdio {
+    use std::os::windows::io::AsHandle;
+    match std::io::stderr().as_handle().try_clone_to_owned() {
+        Ok(h) => Stdio::from(h),
+        Err(_) => Stdio::null(),
+    }
 }
 
 #[cfg(unix)]
@@ -1155,6 +1343,42 @@ timeout = "3m"
         assert_eq!(r.timeout, Duration::from_secs(180));
         assert_eq!(r.when, vec![Phase::Create]);
         assert_eq!(r.only_if.as_deref(), Some("package.json"));
+    }
+
+    fn run_step(cmd: &str, timeout: Duration) -> RunStep {
+        RunStep {
+            cmd: cmd.into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout,
+            dir: None,
+        }
+    }
+
+    /// With the screen handed over there are no pipes to read the result from,
+    /// so the exit code is all we get — it had better be right.
+    #[test]
+    fn a_command_on_the_screen_still_reports_its_exit_code() {
+        let s = run_step("exit 3", Duration::from_secs(30));
+        let outcome = run_on_screen(shell_command(&s.cmd), &s).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Ran { code: 3, .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// And the timeout has to survive the switch too: without pipes to wait on,
+    /// a command that has stopped making progress is otherwise forever.
+    #[test]
+    fn a_command_on_the_screen_still_times_out() {
+        let cmd = if cfg!(windows) {
+            "ping -n 5 127.0.0.1 > NUL"
+        } else {
+            "sleep 5"
+        };
+        let s = run_step(cmd, Duration::from_millis(200));
+        let outcome = run_on_screen(shell_command(&s.cmd), &s).unwrap();
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
     }
 
     #[test]

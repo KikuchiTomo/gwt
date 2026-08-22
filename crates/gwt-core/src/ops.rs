@@ -555,6 +555,15 @@ pub fn sync_replace_at(layout: &BareLayout, idx: usize, step: Step) -> Result<Op
     }))
 }
 
+/// Move the step at `from` to position `to` — both 0-based, both positions in
+/// the recipe as `sync ls` numbers it.
+///
+/// Nothing is re-applied: reordering changes when steps run, never what they
+/// leave behind, and the files already in place are the same files.
+pub fn sync_move(layout: &BareLayout, from: usize, to: usize) -> Result<Option<Step>> {
+    sync::reorder(layout, from, to)
+}
+
 pub fn sync_remove_at(layout: &BareLayout, idx: usize) -> Result<Option<StepRemoved>> {
     let mut steps = sync::load(layout)?.steps;
     if idx >= steps.len() {

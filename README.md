@@ -145,6 +145,7 @@ defines a `gwt` alias **after** the git-wt block, move the block below it.
 | `git wt check <branch> [--fetch]`    | compare local `<branch>` against `origin/<branch>`      |
 | `git wt sync`                        | **interactive** manager for the worktree recipe (below) |
 | `git wt sync add/copy/run/rm/ls`     | same thing, non-interactively                           |
+| `git wt sync move <from> <to>`       | reorder the recipe — the order is the order it runs in  |
 | `git wt sync apply`                  | re-apply the recipe to every worktree                   |
 | `git wt sync edit`                   | open `.gwt/sync.toml` in `$EDITOR`                      |
 | `git wt sync cache <dir>`            | mount a build cache from outside the worktree           |
@@ -356,7 +357,9 @@ A worktree starts with the tracked files and nothing else. The recipe at
 | `cache` | mount a build cache from outside the worktree (see below) |
 
 Order matters, and is preserved: put `.env` in place before the command that
-reads it.
+reads it. It is also editable after the fact — `J` / `K` in `git wt sync`, or
+`git wt sync move <from> <to>` — because the step you needed first is rarely
+the one you thought of first.
 
 ```toml
 version = 1
@@ -429,8 +432,9 @@ apply` re-links and re-copies without re-running anyone's `npm ci`. Ask for it
 with `--run`, or put `apply` in the step's `when`.
 
 The command goes through the shell, from the worktree root, with `GWT_ROOT`,
-`GWT_WORKTREE`, `GWT_WORKTREE_NAME` and `GWT_BRANCH` set. Its output is echoed
-line by line as it arrives, so a slow install is visibly alive.
+`GWT_WORKTREE`, `GWT_WORKTREE_NAME` and `GWT_BRANCH` set. On the command line
+its output is echoed line by line as it arrives, so a slow install is visibly
+alive; from the TUI it gets the terminal to itself (below).
 
 `dir` moves it somewhere else in the worktree — the package that actually needs
 installing, in a monorepo — and the path is relative to that worktree's root
@@ -447,24 +451,31 @@ steps would give you three shells and none of that.
 
 ```
 ╭ git wt sync · 3/3 ─────────────────────────────────────────────────────────╮
-│  KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE  APPLIED│
-│▌ link  secrets/.env                       .env                 ok     2/2   │
-│  copy  secrets/env.sample                 .env.local           ok     2/2   │
-│  run   npm ci                             -                    create   -   │
-│ recipe /repo/.gwt/sync.toml                                                 │
-╰ ↑↓:nav  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q:quit ─────────╯
+│  #  KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE APPLIED│
+│▌ 1  link  secrets/.env                       .env                 ok    2/2  │
+│  2  copy  secrets/env.sample                 .env.local           ok    2/2  │
+│  3  run   npm ci                             -                    create  -  │
+│ recipe /repo/.gwt/sync.toml                                                  │
+╰ ↑↓:nav  J/K:reorder  a:add  e:edit  d:remove  r:apply  f:filter  ?:keys  q ──╯
 ```
 
 | key | action |
 | --- | --- |
 | `a` | add a step — pick `link` / `copy` / `run` / `cache`, then fill it in |
 | `e` | edit the selected step's destination, or its command and directory |
+| `J` / `K`, `shift`+`↑↓` | move the step later / earlier in the recipe |
 | `d` | remove the step and undo it everywhere (asks `y/N`) |
 | `r` | re-apply the recipe to all worktrees |
 | `f` / `/` | filter |
 | `?` | show every key binding |
 | `j/k ↑↓`, `g`/`G` | navigate |
 | `q` / `Esc` | quit |
+
+The `#` column is the position in the recipe, which is the order the steps run
+in — and the number `git wt sync move` takes. `J` and `K` carry the selected
+step up and down it, one place per press, saved as you go. With a filter on they
+step over the neighbour you can *see*, which is the only reading of "move it
+down" that matches what is on the screen.
 
 `a` never asks you to type a source path: for `link` and `copy` it lists the
 real files under the repo root (worktrees and `.bare` excluded) and you pick
@@ -499,9 +510,32 @@ mark to count; for a `cache` it
 shows each bucket with its size and the worktrees sharing it, which is the one
 thing the count cannot say.
 
-Creating a worktree runs on a worker thread, so a recipe with an `npm ci` in it
-shows the command and its output on the status line while it works instead of
-freezing the picker.
+### When the recipe runs a command, it gets the screen
+
+A worktree whose recipe only links and copies is built on a worker thread: the
+picker keeps its spinner, and the whole thing is over in a moment.
+
+A recipe with an `npm ci` in it is a different animal. It runs for minutes and
+prints more in a second than a status line holds — and the interesting part is
+never the last line. So the TUI gets out of the way instead: the viewport comes
+down, the command runs with the real terminal (its own colors, its own progress
+bars, and a keyboard to answer with if it stops to ask), and the picker is drawn
+again underneath the output when it finishes.
+
+```
+creating feature-x
+· npm ci
+added 412 packages in 9s
+  ✓ npm ci (9s)
+```
+
+The same thing happens on `r` in `git wt sync` when a `run` step has `apply` in
+its `when`. Nothing is hidden either way: a step that failed holds the screen
+until you press enter, and so does every run under the alt-screen fallback
+(tmux), where the output would otherwise be wiped by the redraw.
+
+A command's own stdout is redirected to stderr on the way, because stdout is how
+`cd "$(git wt)"` learns where to go.
 
 ### Non-interactively
 
@@ -511,6 +545,7 @@ git wt sync add  secrets/gcp.json config/gcp.json
 git wt sync copy secrets/env.sample .env --render
 git wt sync run  'npm ci' --only-if package.json --timeout 10m
 git wt sync ls
+git wt sync move 3 1                                # 3rd step now runs first
 git wt sync rm   .env
 git wt sync apply [--run]
 git wt sync edit                                    # $EDITOR, then re-parsed
@@ -532,12 +567,17 @@ git wt sync edit                                    # $EDITOR, then re-parsed
 currently carry each step:
 
 ```
-KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE    APPLIED
-----  ---------------------------------  -------------------  -------  -------
-link  secrets/.env                       .env                 ok       2/2
-copy  secrets/env.sample                 .env.local           MISSING  0/2
-run   npm ci                             -                    create   -
+#  KIND  SOURCE (<repo-root>/…) or COMMAND  DEST (<worktree>/…)  STATE    APPLIED
+-  ----  ---------------------------------  -------------------  -------  -------
+1  link  secrets/.env                       .env                 ok       2/2
+2  copy  secrets/env.sample                 .env.local           MISSING  0/2
+3  run   npm ci                             -                    create   -
 ```
+
+The `#` is the position in the recipe, and `git wt sync move 3 1` is how you
+change it: the step lands *at* the second number, everything between the two
+slides over, and comments in a hand-edited `sync.toml` travel with the step they
+were written above.
 
 ## Build caches that outlive the worktree
 

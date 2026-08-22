@@ -26,7 +26,8 @@ use ratatui::Frame;
 
 use crate::editor::TextArea;
 use crate::fuzzy;
-use crate::term::{enter_inline, leave_inline};
+use crate::screen::Screen;
+use crate::term::{enter_inline, leave_inline, released};
 use crate::theme::{
     fit, frame, highlighted, spinner, title_line, trunc_left, visible_window, KeyRow, KeySection,
     C_BRANCH, C_CREATE, C_DIM, C_ERR, C_LOCAL, C_PATH, C_POINTER, C_TEXT, PAD, POINTER,
@@ -187,13 +188,24 @@ struct App {
     filtered: Vec<Scored>,
     cursor: usize,
     mode: Mode,
+    /// An apply that will run commands. It cannot be animated, so the main loop
+    /// takes it, puts the manager away, and lets the commands have the screen.
+    foreground: Option<Phase>,
 }
 
+const HEIGHT: u16 = 18;
+
 pub fn run_sync_manager(layout: &BareLayout) -> Result<()> {
-    let mut term = enter_inline(18)?;
+    let mut term = enter_inline(HEIGHT)?;
     let result = (|| -> Result<()> {
         let mut app = App::new(layout.clone())?;
         loop {
+            if let Some(phase) = app.foreground.take() {
+                released(&mut term, HEIGHT, |survives| {
+                    app.apply_on_screen(phase, survives)
+                })?;
+                continue;
+            }
             term.draw(|f| draw(f, &app))?;
             if matches!(app.mode, Mode::Working { .. }) {
                 app.tick_work();
@@ -225,6 +237,7 @@ impl App {
             filtered: Vec::new(),
             cursor: 0,
             mode: Mode::List,
+            foreground: None,
         };
         s.reload()?;
         Ok(s)
@@ -357,6 +370,65 @@ impl App {
         };
     }
 
+    /// Re-apply the recipe with the manager out of the way, because this pass
+    /// runs commands: a build writes more in a second than a status line holds,
+    /// and the last line of it is never the interesting one.
+    fn apply_on_screen(&mut self, phase: Phase, output_survives: bool) {
+        let mut screen = Screen::new();
+        Screen::banner(t::label_applying());
+        let res = {
+            let _screen_is_ours = sync::lease_screen();
+            let mut report = |ev: sync::Event| screen.on(ev);
+            ops::sync_apply(&self.layout, phase, &mut report)
+        };
+        screen.finish(output_survives);
+
+        let _ = self.reload();
+        self.mode = match res {
+            Ok(visited) => match screen.first_failure() {
+                Some(failed) => Mode::Message {
+                    text: failed.to_string(),
+                    error: true,
+                },
+                None => Mode::Message {
+                    text: t::sync_applied_to(visited.len()),
+                    error: false,
+                },
+            },
+            Err(e) => Mode::Message {
+                text: e.to_string(),
+                error: true,
+            },
+        };
+    }
+
+    /// Move the selected step one place earlier or later in the recipe.
+    ///
+    /// The recipe is a schedule, so this is the whole feature: `.env` has to be
+    /// in place before the command that reads it. While a filter is on, the
+    /// step steps over the neighbour you can *see*, hidden rows and all — the
+    /// alternative is a key that appears to do nothing.
+    fn move_step(&mut self, delta: isize) -> Result<()> {
+        let Some(current) = self.filtered.get(self.cursor) else {
+            return Ok(());
+        };
+        let from = current.idx;
+        let target = self.cursor as isize + delta;
+        if target < 0 || target as usize >= self.filtered.len() {
+            return Ok(());
+        }
+        let target = target as usize;
+        let to = self.filtered[target].idx;
+        if ops::sync_move(&self.layout, from, to)?.is_none() {
+            return Ok(());
+        }
+        self.reload()?;
+        // The filtered view keeps recipe order, so the step that moved is now
+        // the row it swapped with — follow it rather than losing the cursor.
+        self.cursor = target.min(self.filtered.len().saturating_sub(1));
+        Ok(())
+    }
+
     /// Candidate source files: everything under the repo root that is not a
     /// worktree, not the bare dir, and not VCS noise. In practice that is
     /// `secrets/` plus any stray root-level config.
@@ -409,6 +481,10 @@ impl App {
                     KeyRow {
                         keys: "e",
                         desc: t::k_sedit().into(),
+                    },
+                    KeyRow {
+                        keys: "J / K   shift+↑↓",
+                        desc: t::k_smove().into(),
                     },
                     KeyRow {
                         keys: "r",
@@ -1069,7 +1145,18 @@ impl App {
     }
 
     fn handle_list(&mut self, key: KeyEvent, ctrl: bool) -> Result<bool> {
+        // Shift-arrow carries the step with the cursor — the same thing J/K do,
+        // for the half of the world that never learned J/K.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            KeyCode::Down if shift => {
+                self.move_step(1)?;
+                return Ok(false);
+            }
+            KeyCode::Up if shift => {
+                self.move_step(-1)?;
+                return Ok(false);
+            }
             KeyCode::Down => {
                 self.move_cursor(1);
                 return Ok(false);
@@ -1163,7 +1250,17 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.mode = Mode::Keys { scroll: 0 },
-            KeyCode::Char('r') => self.start(t::label_applying().into(), Job::Apply),
+            KeyCode::Char('J') => self.move_step(1)?,
+            KeyCode::Char('K') => self.move_step(-1)?,
+            KeyCode::Char('r') => {
+                // An apply that only repairs files can stay inside the manager;
+                // one that runs a command hands the screen over instead.
+                if sync::has_commands(&self.layout, Phase::Apply) {
+                    self.foreground = Some(Phase::Apply);
+                } else {
+                    self.start(t::label_applying().into(), Job::Apply)
+                }
+            }
             KeyCode::Char('f') | KeyCode::Char('/') => self.filter_active = true,
             _ => {}
         }
@@ -1405,6 +1502,12 @@ fn help(app: &App) -> Line<'static> {
 
 const KIND_W: usize = 5;
 
+/// Width of the `#` column: the recipe is a schedule, and with a filter on,
+/// screen position no longer says where a step sits in it.
+fn order_w(app: &App) -> usize {
+    app.rows.len().to_string().len().max(2)
+}
+
 fn cols(app: &App) -> (usize, usize) {
     let src = app
         .rows
@@ -1432,6 +1535,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let spans = vec![
         Span::raw(PAD),
+        Span::styled(fit("#", order_w(app)), style),
+        Span::raw(" "),
         Span::styled(fit(t::col_kind(), KIND_W), style),
         Span::raw(" "),
         Span::styled(fit(t::col_source(), sw), style),
@@ -1476,6 +1581,7 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let (sw, dw) = cols(app);
+    let ow = order_w(app);
     let cap = area.height as usize;
     let (start, end) = visible_window(app.filtered.len(), app.cursor, cap);
     let total = app.worktrees.len();
@@ -1510,6 +1616,10 @@ fn draw_rows(f: &mut Frame, area: Rect, app: &App) {
                 if cursor { POINTER } else { PAD },
                 Style::default().fg(C_POINTER).add_modifier(Modifier::BOLD),
             )];
+            spans.push(Span::styled(
+                format!("{:>w$} ", r.idx + 1, w = ow),
+                Style::default().fg(C_DIM),
+            ));
             spans.push(Span::styled(
                 fit(r.step.kind(), KIND_W),
                 Style::default().fg(kind_color(&r.step)),

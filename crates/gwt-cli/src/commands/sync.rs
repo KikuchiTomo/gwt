@@ -178,6 +178,24 @@ pub fn remove(layout: &BareLayout, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move a step to another position in the recipe.
+///
+/// Positions are 1-based, the way `sync ls` numbers them, because the number
+/// the user just read is the number they will type. The order is the schedule:
+/// the `link` that puts `.env` in place has to come before the command that
+/// reads it.
+pub fn move_step(layout: &BareLayout, from: usize, to: usize) -> Result<()> {
+    if from == 0 || to == 0 {
+        anyhow::bail!("positions start at 1 (see `git wt sync ls`)");
+    }
+    let Some(step) = ops::sync_move(layout, from - 1, to - 1)? else {
+        anyhow::bail!("no step at #{from} or #{to} (see `git wt sync ls`)");
+    };
+    eprintln!("moved to #{to}: {}", describe(&step));
+    eprintln!();
+    ls(layout)
+}
+
 pub fn apply(layout: &BareLayout, run_commands: bool) -> Result<()> {
     let phase = if run_commands {
         Phase::Create
@@ -263,6 +281,9 @@ pub fn ls(layout: &BareLayout) -> Result<()> {
         })
         .collect();
 
+    // The number is the position in the recipe, which is the order it runs in
+    // — and what `git wt sync move` takes.
+    let iw = rows.len().to_string().len().max(1);
     const H: (&str, &str, &str, &str, &str) = (
         "KIND",
         "SOURCE (<repo-root>/…) or COMMAND",
@@ -285,21 +306,27 @@ pub fn ls(layout: &BareLayout) -> Result<()> {
     );
 
     println!(
-        "{:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
-        H.0, H.1, H.2, H.3, H.4
+        "{:>iw$}  {:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
+        "#", H.0, H.1, H.2, H.3, H.4
     );
     println!(
-        "{:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
+        "{:>iw$}  {:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
+        "-".repeat(iw),
         "-".repeat(kw),
         "-".repeat(sw),
         "-".repeat(dw),
         "-".repeat(tw),
         "-".repeat(H.4.len())
     );
-    for r in &rows {
+    for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
-            r.0, r.1, r.2, r.3, r.4
+            "{:>iw$}  {:<kw$}  {:<sw$}  {:<dw$}  {:<tw$}  {}",
+            i + 1,
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            r.4
         );
     }
     Ok(())

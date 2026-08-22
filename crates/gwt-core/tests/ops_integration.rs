@@ -554,6 +554,92 @@ fn a_run_step_fires_on_create_but_not_on_a_plain_apply() {
     assert_eq!(ran(&marker), ["feature", "feature"]);
 }
 
+/// The recipe is a schedule, so moving a step has to move when it runs — and
+/// `sync ls` numbering is the numbering `sync move` takes.
+#[test]
+fn reordering_the_recipe_reorders_what_runs() {
+    let (_origin, layout) = fixture("reorder");
+    let echo = |what: &str| {
+        Step::Run(RunStep {
+            cmd: if cfg!(windows) {
+                format!("echo {what}>> ran.txt")
+            } else {
+                format!("echo {what} >> ran.txt")
+            },
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(30),
+            dir: None,
+        })
+    };
+    ops::sync_add(&layout, echo("one")).unwrap();
+    ops::sync_add(&layout, echo("two")).unwrap();
+    assert!(sync::has_commands(&layout, Phase::Create));
+    assert!(!sync::has_commands(&layout, Phase::Apply));
+
+    let first = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    let ran = |p: &Path| {
+        std::fs::read_to_string(p.join("ran.txt"))
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ran(&first), ["one", "two"]);
+
+    let moved = ops::sync_move(&layout, 1, 0)
+        .unwrap()
+        .expect("a step moved");
+    assert!(moved.subject().contains("two"));
+    let second = ops::new(&layout, "main", "later", "later", &mut sync::noop).unwrap();
+    assert_eq!(ran(&second), ["two", "one"], "the new order has to hold");
+
+    // Out of range is a `None`, not a panic and not a silent no-op.
+    assert!(ops::sync_move(&layout, 0, 9).unwrap().is_none());
+    assert!(ops::sync_move(&layout, 9, 0).unwrap().is_none());
+}
+
+/// A comment above a step describes *that* step, so it has to travel with it.
+#[test]
+fn a_comment_moves_with_its_step() {
+    let (_origin, layout) = fixture("reorder-comments");
+    std::fs::create_dir_all(&layout.gwt_dir).unwrap();
+    std::fs::write(
+        &layout.sync_config,
+        "version = 1\n\n\
+         # the env file has to be there first\n\
+         [[step]]\n\
+         type = \"link\"\n\
+         src = \"secrets/.env\"\n\
+         dst = \".env\"\n\n\
+         # then the install that reads it\n\
+         [[step]]\n\
+         type = \"run\"\n\
+         cmd = \"true\"\n\
+         when = [\"create\"]\n",
+    )
+    .unwrap();
+
+    ops::sync_move(&layout, 1, 0)
+        .unwrap()
+        .expect("a step moved");
+    let raw = std::fs::read_to_string(&layout.sync_config).unwrap();
+    let at = |needle: &str| {
+        raw.find(needle)
+            .unwrap_or_else(|| panic!("{needle} is gone"))
+    };
+    assert!(
+        at("# then the install") < at("cmd = \"true\"")
+            && at("cmd = \"true\"") < at("# the env file"),
+        "each comment should still sit above its own step:\n{raw}"
+    );
+
+    let steps = sync::load(&layout).unwrap().steps;
+    assert_eq!(steps.len(), 2);
+    assert!(matches!(steps[0], Step::Run(_)));
+    assert!(matches!(steps[1], Step::Link(_)));
+}
+
 /// A multi-line command is one shell script, not a line-at-a-time list: state
 /// set on one line has to still be there on the next, and `dir` has to put the
 /// whole thing somewhere other than the worktree root.

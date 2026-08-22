@@ -80,6 +80,25 @@ fn alt_screen_fallback() -> io::Result<Tui> {
     })
 }
 
+/// Give the real terminal back for as long as `f` runs, then build the TUI
+/// again from scratch.
+///
+/// Built again rather than restored: `f` is a command printing whatever it
+/// likes, so the cursor ends up wherever it left it, and a viewport that still
+/// believed it owned four lines further up would paint over the very output the
+/// user was meant to read.
+/// `f` is told whether what it prints will still be there afterwards: an inline
+/// viewport leaves it above the redrawn frame, but the alt-screen fallback
+/// takes the whole screen back, so anything printed there has to be read before
+/// `f` returns.
+pub fn released<T>(tui: &mut Tui, height: u16, f: impl FnOnce(bool) -> T) -> io::Result<T> {
+    let output_survives = !tui.alt_screen;
+    leave_inline(tui)?;
+    let out = f(output_survives);
+    *tui = enter_inline(height)?;
+    Ok(out)
+}
+
 pub fn leave_inline(tui: &mut Tui) -> io::Result<()> {
     if tui.alt_screen {
         execute!(tui.term.backend_mut(), LeaveAlternateScreen)?;
