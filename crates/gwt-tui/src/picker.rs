@@ -31,9 +31,9 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 })?;
                 continue;
             }
-            // Counts for the metric columns land while the list is already on
-            // screen; take whatever arrived before painting this frame.
-            app.poll_metrics();
+            // Counts, branches, the trunk: whatever a worker has finished with
+            // joins the frame about to be painted. Nothing is waited for.
+            app.poll_background();
             term.draw(|f| ui::draw(f, &mut app))?;
             // The delete/sync animations are self-driven, not key-driven: keep
             // ticking (and redrawing) on a timer until the work finishes.
@@ -62,10 +62,10 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
-            // A frame is only redrawn when something happens, so while counts
+            // A frame is only redrawn when something happens, so while answers
             // are still arriving we look up more often — for the few hundred
             // milliseconds that takes, and not a moment longer.
-            let idle = if app.metrics_loading() { 40 } else { 250 };
+            let idle = if app.is_loading() { 40 } else { 250 };
             if !event::poll(Duration::from_millis(idle))? {
                 continue;
             }
@@ -225,11 +225,11 @@ fn handle_list(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Picker
                 };
             }
         }
-        KeyCode::Char('e') | KeyCode::Char('n') => app.enter_branch_mode(BranchPurpose::NewBase)?,
+        KeyCode::Char('e') | KeyCode::Char('n') => app.enter_branch_mode(BranchPurpose::NewBase),
         KeyCode::Char('E') | KeyCode::Char('N') => {
-            app.enter_branch_mode(BranchPurpose::NewBaseWithPath)?
+            app.enter_branch_mode(BranchPurpose::NewBaseWithPath)
         }
-        KeyCode::Char('r') => app.enter_branch_mode(BranchPurpose::Review)?,
+        KeyCode::Char('r') => app.enter_branch_mode(BranchPurpose::Review),
         // Ctrl-P is nav and was consumed above; a bare p/P is pull/push.
         KeyCode::Char('p') => app.begin_sync(SyncOp::Pull),
         KeyCode::Char('P') => app.begin_sync(SyncOp::Push),
@@ -381,6 +381,7 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
         KeyCode::Char('p') if ctrl => app.branch_move(-1),
         KeyCode::Char('j') if ctrl => app.branch_move(1),
         KeyCode::Char('k') if ctrl => app.branch_move(-1),
+        KeyCode::Enter if app.branches_loading() => {}
         KeyCode::Enter => match app.commit_branch_selection() {
             Ok(true) => {}
             Ok(false) => app.set_error(gwt_core::t::nothing_to_create().into()),

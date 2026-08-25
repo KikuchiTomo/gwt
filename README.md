@@ -186,24 +186,44 @@ and puts `default` first, then the rest alphabetically.
 
 ### It opens now, not in a moment
 
-The picker draws as soon as git can list the worktrees — two git calls, a few
-milliseconds — and never waits on anything else. The `REMOTE`, `DIRTY` and
-`STASH` columns show `·` while they are still being counted and fill in over the
-next moment; the counting runs eight worktrees at a time, because each one is a
-`git status` waiting on the disk rather than on gwt. The columns are reserved at
-full width from the first frame, so nothing shifts under the cursor as they
-arrive, and `Enter` works before any of them land.
+The rule the picker is built on: **no git call ever happens on the UI thread.**
+A git call costs a process, and a process costs milliseconds that land squarely
+between a keypress and the frame that answers it. So the loop draws what it has,
+and what it does not have yet is already on its way.
 
-On a repo with a dozen worktrees that is the difference between ~100 ms and
-~10 ms to the first frame — more on a large repo, where a single `git status`
-can take most of a second. `git wt list` counts the same way and is about twice
-as fast for it.
+- The list appears as soon as git can enumerate the worktrees — two git calls,
+  a few milliseconds — and waits on nothing else.
+- `REMOTE`, `DIRTY` and `STASH` show `·` while they are counted, eight worktrees
+  at a time, because each is a `git status` waiting on the disk rather than on
+  gwt. The columns are reserved at full width from the first frame, so nothing
+  shifts under the cursor as they arrive, and `Enter` works before any land.
+- The branch list and the trunk are fetched from the moment the picker opens,
+  so `n`, `e` and `r` are answered by the next frame rather than by
+  `for-each-ref`. Beat the prefetch and you get the screen anyway, with a line
+  saying the branches are still coming.
+- `git wt --display` refreshes on a worker too, so the dashboard keeps answering
+  the keyboard while it updates.
 
-One more launch cost worth knowing about: the inline viewport starts by asking
-the terminal where the cursor is and waiting up to two seconds for the answer.
-If stdout is not the terminal — `cd "$(git wt)"` captures it, and so does any
-pipe — the question never arrives, so gwt no longer asks it and goes straight to
-the fullscreen fallback instead of stalling for two seconds first.
+Measured on a repo with 13 worktrees and 426 refs, against 0.8.0:
+
+| | before | after |
+| --- | --- | --- |
+| first frame | 104 ms | 12 ms |
+| first frame, stdout captured | 2112 ms | 13 ms |
+| `n` (open the branch list) | 8.0 ms | 0.6 ms |
+| `git wt list` | 95 ms | 41 ms |
+
+More on a large repo, where a single `git status` can take most of a second.
+
+That second row is its own bug: the inline viewport starts by asking the
+terminal where the cursor is and waiting up to two seconds for the answer. If
+stdout is not the terminal — `cd "$(git wt)"` captures it, and so does any pipe
+— the question never arrives, so gwt no longer asks it and goes straight to the
+fullscreen fallback instead of stalling for two seconds first.
+
+What is left is the shell wrapper's own `mktemp`/`cat`/`rm`, about 4 ms, and it
+stays: shaving it means touching the one piece of this tool that must never
+break, for a saving nobody can perceive.
 
 ### Picking a base branch
 

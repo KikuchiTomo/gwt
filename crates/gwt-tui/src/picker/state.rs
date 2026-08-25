@@ -8,6 +8,7 @@ use gwt_core::status::{self, WorktreeMetrics};
 use gwt_core::sync;
 use gwt_core::{ops, t, BranchKind, BranchRef, Repo, Worktree, WorktreeStatus};
 
+use crate::background::Pending;
 use crate::fuzzy;
 use crate::screen::Screen;
 use crate::theme::{KeyRow, KeySection};
@@ -291,6 +292,19 @@ pub struct Scored {
     pub branch_indices: Vec<usize>,
 }
 
+/// Everything the branch screens need, fetched in one go.
+///
+/// Both halves are a git call, and both used to happen on the keystroke that
+/// opened the screen — so `n` sat there for as long as `for-each-ref` took on a
+/// repo with a few hundred refs. They are asked for while the list is drawing
+/// instead, and by the time a hand reaches a key the answer is already here.
+pub struct BranchData {
+    /// Kept as an error rather than raised: a repo whose refs cannot be read is
+    /// news for the screen that wanted them, not a reason to close the picker.
+    pub branches: std::result::Result<Vec<BranchRef>, String>,
+    pub default_branch: Option<String>,
+}
+
 /// What the metric columns know about one worktree.
 ///
 /// The three states are the whole reason the picker opens instantly: the list
@@ -342,11 +356,10 @@ pub struct App<'a> {
     pub mode: Mode,
     /// The repo's trunk. Worth knowing once: it is the branch most new work is
     /// cut from, so it leads the base-branch list instead of being hunted for.
-    /// Read through [`App::ensure_default_branch`] — asking git for it costs a
-    /// round trip that the list itself does not need, so it waits until the
-    /// branch picker is actually opened.
+    /// Filled in when the prefetch lands; see [`BranchData`].
     pub default_branch: Option<String>,
-    default_branch_known: bool,
+    /// Branches and trunk, on their way in from the moment the picker opens.
+    branches: Pending<BranchData>,
 
     pub worktrees: Vec<Worktree>,
     pub metrics: Vec<Measured>,
@@ -384,14 +397,16 @@ impl<'a> App<'a> {
         // is the normal case, and without the layout the picker loses its
         // metrics columns, its base-branch check, and — worst — creates
         // worktrees with a plain `git worktree add` that never runs the recipe.
-        let layout = BareLayout::discover(&repo.cwd).ok();
+        // `repo` already asked git where the common dir is, so this costs a
+        // couple of `stat`s rather than another process.
+        let layout = BareLayout::from_common_dir(&repo.cwd, &repo.common_dir).ok();
         let worktrees = visible_worktrees(repo, layout.as_ref())?;
         let mut s = Self {
             repo,
             layout,
             mode: Mode::List,
             default_branch: None,
-            default_branch_known: false,
+            branches: Pending::default(),
             metrics: Vec::new(),
             metrics_rx: None,
             cols: compute_col_widths(&[], &[]),
@@ -407,6 +422,7 @@ impl<'a> App<'a> {
             foreground: None,
         };
         s.start_metrics();
+        s.start_branch_prefetch();
         s.refilter_worktrees();
         Ok(s)
     }
@@ -481,23 +497,50 @@ impl<'a> App<'a> {
         self.metrics_rx.is_some()
     }
 
-    /// The repo's trunk, asked for once and only when something needs it.
+    /// Ask for the branch list and the trunk now, so the screens that want them
+    /// never have to.
     ///
     /// A bare-style clone copies the remote's HEAD into its own and never grows
     /// an `origin/HEAD` to read; a plain checkout is the other way round. Ask
-    /// whichever one this is — but not before the picker has drawn, because
-    /// nothing on the list screen depends on the answer.
-    pub fn ensure_default_branch(&mut self) {
-        if self.default_branch_known {
-            return;
+    /// whichever one this is — on a worker, where the answer costs nothing.
+    fn start_branch_prefetch(&mut self) {
+        let repo = self.repo.clone();
+        let layout = self.layout.clone();
+        self.branches = Pending::start(move || BranchData {
+            branches: repo.branches().map_err(|e| e.to_string()),
+            default_branch: layout
+                .as_ref()
+                .and_then(|l| l.default_branch().ok())
+                .filter(|b| !b.is_empty())
+                .or_else(|| repo.default_branch()),
+        });
+    }
+
+    /// Take delivery of anything a worker has finished with. `true` when the
+    /// screen has something new to show.
+    pub fn poll_background(&mut self) -> bool {
+        let mut changed = self.poll_metrics();
+        if self.branches.poll() {
+            self.default_branch = self.branches.get().and_then(|d| d.default_branch.clone());
+            // A branch screen opened before the list arrived is still sitting
+            // there with a spinner on it; this is what it was waiting for.
+            if matches!(self.mode, Mode::Branch { .. }) {
+                self.fill_branch_mode();
+            }
+            changed = true;
         }
-        self.default_branch_known = true;
-        self.default_branch = self
-            .layout
-            .as_ref()
-            .and_then(|l| l.default_branch().ok())
-            .filter(|b| !b.is_empty())
-            .or_else(|| self.repo.default_branch());
+        changed
+    }
+
+    /// Whether anything is still on its way in — which is also how often the
+    /// loop should look up from waiting on the keyboard.
+    pub fn is_loading(&self) -> bool {
+        self.metrics_loading() || self.branches.is_pending()
+    }
+
+    /// Whether the branch screen is still waiting on its list.
+    pub fn branches_loading(&self) -> bool {
+        self.branches.is_pending()
     }
 
     pub fn refresh_worktrees(&mut self) -> Result<()> {
@@ -689,16 +732,50 @@ impl<'a> App<'a> {
         true
     }
 
-    pub fn enter_branch_mode(&mut self, purpose: BranchPurpose) -> Result<()> {
-        // The first screen that has any use for the trunk, and the first place
-        // it is worth the round trip.
-        self.ensure_default_branch();
-        let mut all = self.repo.branches()?;
+    /// Open the branch screen, with the list if it has arrived and a spinner if
+    /// it has not. Either way the keystroke is answered by the next frame.
+    pub fn enter_branch_mode(&mut self, purpose: BranchPurpose) {
+        self.branch_filter.clear();
+        self.branch_cursor = 0;
+        self.mode = Mode::Branch {
+            purpose,
+            all: Vec::new(),
+        };
+        self.fill_branch_mode();
+    }
+
+    /// Put the prefetched branches into the open branch screen, in the order
+    /// that screen wants them.
+    fn fill_branch_mode(&mut self) {
+        let Mode::Branch { purpose, all } = &self.mode else {
+            return;
+        };
+        let purpose = *purpose;
+        let (mut list, default) = match self.branches.get() {
+            // Still coming. The screen draws a spinner and this runs again the
+            // moment it lands.
+            None => return,
+            Some(BranchData {
+                branches: Err(e), ..
+            }) => {
+                self.mode = Mode::Message {
+                    text: e.clone(),
+                    error: true,
+                };
+                return;
+            }
+            Some(BranchData {
+                branches: Ok(list),
+                default_branch,
+            }) => (list.clone(), default_branch.clone()),
+        };
+        debug_assert!(all.is_empty(), "the screen fills once");
+
         match purpose {
             BranchPurpose::Review => {
                 // Review picks remote PR branches; hide already-checked-out ones.
-                all.retain(|b| matches!(b.kind, BranchKind::Remote { .. }));
-                all.retain(|b| !b.is_checked_out());
+                list.retain(|b| matches!(b.kind, BranchKind::Remote { .. }));
+                list.retain(|b| !b.is_checked_out());
             }
             BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => {
                 // The user can branch off anything that resolves (local or remote).
@@ -709,18 +786,15 @@ impl<'a> App<'a> {
         // it is the answer often enough that hunting for it is the common case.
         // Then local before remote, then alphabetical.
         let default = match purpose {
-            BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => self.default_branch.clone(),
+            BranchPurpose::NewBase | BranchPurpose::NewBaseWithPath => default,
             // Review is for picking up someone else's branch; the trunk at the
             // top of that list would only be in the way.
             BranchPurpose::Review => None,
         };
-        all.sort_by_key(|b| (branch_rank(b, default.as_deref()), b.short.clone()));
+        list.sort_by_key(|b| (branch_rank(b, default.as_deref()), b.short.clone()));
 
-        self.branch_filter.clear();
-        self.branch_cursor = 0;
-        self.mode = Mode::Branch { purpose, all };
+        self.mode = Mode::Branch { purpose, all: list };
         self.refilter_branches();
-        Ok(())
     }
 
     pub fn enter_name_input(&mut self, base: String, customize_dir: bool, note: Option<BaseNote>) {

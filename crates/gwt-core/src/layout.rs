@@ -81,7 +81,20 @@ impl BareLayout {
         let Ok(raw) = git::run(cwd, ["rev-parse", "--git-common-dir"]) else {
             return Err(at_root);
         };
-        let common = normalize(&cwd.join(raw.trim()));
+        Self::from_common_dir(cwd, Path::new(raw.trim())).map_err(|_| at_root)
+    }
+
+    /// The same answer, for a caller that already knows the common dir.
+    ///
+    /// [`crate::Repo`] asked git for it on the way in, and asking twice is a
+    /// whole process — on the picker's startup path, one the user waits for
+    /// before the first frame.
+    pub fn from_common_dir(cwd: &Path, common_dir: &Path) -> Result<Self> {
+        let at_root = match Self::require(cwd) {
+            Ok(layout) => return Ok(layout),
+            Err(e) => e,
+        };
+        let common = normalize(&cwd.join(common_dir));
         // A plain checkout has a common dir too. Only `.bare` is ours, and only
         // its parent is a root worth reporting an error about.
         if common.file_name() != Some(std::ffi::OsStr::new(BARE_DIR)) {

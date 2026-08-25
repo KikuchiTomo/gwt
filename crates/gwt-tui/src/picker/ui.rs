@@ -777,6 +777,17 @@ fn draw_prompt_list(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_branches(f: &mut Frame, area: Rect, app: &App) {
+    // The list is prefetched from the moment the picker opens, so this is only
+    // ever seen by a hand faster than one `for-each-ref`. It is still worth
+    // drawing: an empty screen would read as a repo with no branches.
+    if app.branches_loading() && app.filtered_branches.is_empty() {
+        let line = Line::from(vec![
+            Span::raw(PAD),
+            Span::styled(t::loading_branches(), Style::default().fg(C_DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let cap = area.height as usize;
     let total = app.branch_total();
     let (start, end) = visible_window(total, app.branch_cursor, cap);
