@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -291,6 +291,35 @@ pub struct Scored {
     pub branch_indices: Vec<usize>,
 }
 
+/// What the metric columns know about one worktree.
+///
+/// The three states are the whole reason the picker opens instantly: the list
+/// is drawn from `git worktree list` alone, every row starts `Pending`, and the
+/// counts arrive over the next few hundred milliseconds without the user having
+/// waited for them. `Unavailable` is the separate case of a repo with no
+/// bare-style layout, where there is nothing to count in the first place.
+#[derive(Debug, Clone, Default)]
+pub enum Measured {
+    #[default]
+    Pending,
+    Unavailable,
+    Known(WorktreeMetrics),
+}
+
+impl Measured {
+    pub fn known(&self) -> Option<&WorktreeMetrics> {
+        match self {
+            Measured::Known(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Whether this row has a column to fill at all, counted or not yet.
+    fn countable(&self) -> bool {
+        !matches!(self, Measured::Unavailable)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ColWidths {
     pub name: usize,
@@ -313,10 +342,17 @@ pub struct App<'a> {
     pub mode: Mode,
     /// The repo's trunk. Worth knowing once: it is the branch most new work is
     /// cut from, so it leads the base-branch list instead of being hunted for.
+    /// Read through [`App::ensure_default_branch`] — asking git for it costs a
+    /// round trip that the list itself does not need, so it waits until the
+    /// branch picker is actually opened.
     pub default_branch: Option<String>,
+    default_branch_known: bool,
 
     pub worktrees: Vec<Worktree>,
-    pub metrics: Vec<Option<WorktreeMetrics>>,
+    pub metrics: Vec<Measured>,
+    /// Counts still on their way in from [`status::spawn`]. `None` once they
+    /// have all landed, which is also what stops the redraw loop spinning.
+    metrics_rx: Option<Receiver<(usize, WorktreeMetrics)>>,
     pub cols: ColWidths,
     pub filter: String,
     pub filter_active: bool,
@@ -350,24 +386,16 @@ impl<'a> App<'a> {
         // worktrees with a plain `git worktree add` that never runs the recipe.
         let layout = BareLayout::discover(&repo.cwd).ok();
         let worktrees = visible_worktrees(repo, layout.as_ref())?;
-        let metrics = compute_metrics(layout.as_ref(), &worktrees);
-        let cols = compute_col_widths(&worktrees, &metrics);
-        // A bare-style clone copies the remote's HEAD into its own, and never
-        // grows an `origin/HEAD` to read; a plain checkout is the other way
-        // round. Ask whichever one this is.
-        let default_branch = layout
-            .as_ref()
-            .and_then(|l| l.default_branch().ok())
-            .filter(|b| !b.is_empty())
-            .or_else(|| repo.default_branch());
         let mut s = Self {
             repo,
             layout,
             mode: Mode::List,
-            default_branch,
+            default_branch: None,
+            default_branch_known: false,
+            metrics: Vec::new(),
+            metrics_rx: None,
+            cols: compute_col_widths(&[], &[]),
             worktrees,
-            metrics,
-            cols,
             filter: String::new(),
             filter_active: false,
             filtered_wt: Vec::new(),
@@ -378,14 +406,103 @@ impl<'a> App<'a> {
             branch_cursor: 0,
             foreground: None,
         };
+        s.start_metrics();
         s.refilter_worktrees();
         Ok(s)
     }
 
+    /// Hand the counting to a worker and let the list draw itself now.
+    fn start_metrics(&mut self) {
+        let Some(layout) = self.layout.as_ref() else {
+            // No bare layout: nothing to count against, and the columns say so
+            // rather than sitting empty forever.
+            self.metrics = vec![Measured::Unavailable; self.worktrees.len()];
+            self.metrics_rx = None;
+            self.cols = compute_col_widths(&self.worktrees, &self.metrics);
+            return;
+        };
+        let targets: Vec<status::Target> = self
+            .worktrees
+            .iter()
+            .map(|w| {
+                let branch = w.short_branch();
+                // A detached head reads as "(abc1234)" and is nobody's branch.
+                let named = (!branch.starts_with('(')).then_some(branch);
+                (w.path.clone(), named)
+            })
+            .collect();
+        self.metrics = vec![Measured::Pending; targets.len()];
+        self.metrics_rx = Some(status::spawn(layout, targets));
+        self.cols = compute_col_widths(&self.worktrees, &self.metrics);
+    }
+
+    /// Take whatever the counting worker has finished with. `true` when the
+    /// screen has something new to show.
+    pub fn poll_metrics(&mut self) -> bool {
+        let Some(rx) = self.metrics_rx.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok((i, m)) => {
+                    if let Some(slot) = self.metrics.get_mut(i) {
+                        *slot = Measured::Known(m);
+                        changed = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Whatever never arrived is not coming: a worktree git
+                    // could not read has no counts, and the row should stop
+                    // waiting for them.
+                    for slot in &mut self.metrics {
+                        if matches!(slot, Measured::Pending) {
+                            *slot = Measured::Known(WorktreeMetrics::default());
+                            changed = true;
+                        }
+                    }
+                    self.metrics_rx = None;
+                    break;
+                }
+            }
+        }
+        if changed {
+            // A count can be wider than its header ("↑12 ↓3"), so the columns
+            // are re-measured as they fill; they only ever grow, so the list
+            // does not jitter while it loads.
+            self.cols = compute_col_widths(&self.worktrees, &self.metrics);
+        }
+        changed
+    }
+
+    /// Whether counts are still coming in.
+    pub fn metrics_loading(&self) -> bool {
+        self.metrics_rx.is_some()
+    }
+
+    /// The repo's trunk, asked for once and only when something needs it.
+    ///
+    /// A bare-style clone copies the remote's HEAD into its own and never grows
+    /// an `origin/HEAD` to read; a plain checkout is the other way round. Ask
+    /// whichever one this is — but not before the picker has drawn, because
+    /// nothing on the list screen depends on the answer.
+    pub fn ensure_default_branch(&mut self) {
+        if self.default_branch_known {
+            return;
+        }
+        self.default_branch_known = true;
+        self.default_branch = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.default_branch().ok())
+            .filter(|b| !b.is_empty())
+            .or_else(|| self.repo.default_branch());
+    }
+
     pub fn refresh_worktrees(&mut self) -> Result<()> {
         self.worktrees = visible_worktrees(self.repo, self.layout.as_ref())?;
-        self.metrics = compute_metrics(self.layout.as_ref(), &self.worktrees);
-        self.cols = compute_col_widths(&self.worktrees, &self.metrics);
+        self.start_metrics();
         // Indices are no longer valid after the list changes shape.
         self.selected.clear();
         self.refilter_worktrees();
@@ -573,6 +690,9 @@ impl<'a> App<'a> {
     }
 
     pub fn enter_branch_mode(&mut self, purpose: BranchPurpose) -> Result<()> {
+        // The first screen that has any use for the trunk, and the first place
+        // it is worth the round trip.
+        self.ensure_default_branch();
         let mut all = self.repo.branches()?;
         match purpose {
             BranchPurpose::Review => {
@@ -1639,13 +1759,16 @@ pub const MAX_REMOTE: usize = 9; // "↑99 ↓99"
 pub const MAX_DIRTY: usize = 5;
 pub const MAX_STASH: usize = 4;
 
-fn compute_col_widths(worktrees: &[Worktree], metrics: &[Option<WorktreeMetrics>]) -> ColWidths {
+fn compute_col_widths(worktrees: &[Worktree], metrics: &[Measured]) -> ColWidths {
     let mut name = H_NAME.chars().count();
     let mut branch = H_BRANCH.chars().count();
     let mut remote = 0usize;
     let mut dirty = 0usize;
     let mut stash = 0usize;
-    let any_metrics = metrics.iter().any(|m| m.is_some());
+    // Reserved as soon as there is anything to count, not once the counting is
+    // done: a column that appears late shoves the whole row sideways under the
+    // user's cursor.
+    let any_metrics = metrics.iter().any(Measured::countable);
     if any_metrics {
         remote = H_REMOTE.chars().count();
         dirty = H_DIRTY.chars().count();
@@ -1654,7 +1777,7 @@ fn compute_col_widths(worktrees: &[Worktree], metrics: &[Option<WorktreeMetrics>
     for (w, m) in worktrees.iter().zip(metrics.iter()) {
         name = name.max(w.name().chars().count());
         branch = branch.max(w.short_branch().chars().count());
-        if let Some(m) = m {
+        if let Some(m) = m.known() {
             remote = remote.max(remote_plain(m).chars().count());
             dirty = dirty.max(dirty_plain(m).chars().count());
             stash = stash.max(m.stash.to_string().chars().count());
@@ -1682,28 +1805,6 @@ pub fn dirty_plain(m: &WorktreeMetrics) -> String {
         None => "?".into(),
         Some(n) => n.to_string(),
     }
-}
-
-fn compute_metrics(
-    layout: Option<&BareLayout>,
-    worktrees: &[Worktree],
-) -> Vec<Option<WorktreeMetrics>> {
-    let Some(layout) = layout else {
-        return vec![None; worktrees.len()];
-    };
-    let stashes: HashMap<String, u32> = status::stash_map(layout).unwrap_or_default();
-    worktrees
-        .iter()
-        .map(|w| {
-            let branch = w.short_branch();
-            let b = if branch.starts_with('(') {
-                None
-            } else {
-                Some(branch.as_str())
-            };
-            Some(status::collect(layout, &w.path, b, &stashes))
-        })
-        .collect()
 }
 
 #[cfg(test)]

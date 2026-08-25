@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use gwt_core::status::WorktreeMetrics;
 use gwt_core::{BranchKind, BranchRef, Worktree, WorktreeStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,7 +19,8 @@ use gwt_core::ops::BaseStatus;
 
 use super::state::{
     dirty_plain, path_name, remote_plain, App, BaseNote, BranchPurpose, ColWidths, ConflictAction,
-    ConflictChoice, Mode, NameStage, SyncOp, H_BRANCH, H_DIRTY, H_NAME, H_PATH, H_REMOTE, H_STASH,
+    ConflictChoice, Measured, Mode, NameStage, SyncOp, H_BRANCH, H_DIRTY, H_NAME, H_PATH, H_REMOTE,
+    H_STASH,
 };
 
 /// Per-row state while a delete batch is running, for styling the list.
@@ -452,7 +452,10 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &App) {
         .map(|i| {
             let scored = &app.filtered_wt[i];
             let w = &app.worktrees[scored.idx];
-            let m = app.metrics.get(scored.idx).and_then(Option::as_ref);
+            let m = app
+                .metrics
+                .get(scored.idx)
+                .unwrap_or(&Measured::Unavailable);
             let mark = del.and_then(|(paths, idx, _)| del_mark(&w.path, paths, idx));
             let frame = del.map(|(_, _, fr)| fr).unwrap_or(0);
             worktree_line(
@@ -496,7 +499,7 @@ fn del_mark(path: &Path, paths: &[PathBuf], index: usize) -> Option<DelMark> {
 #[allow(clippy::too_many_arguments)]
 fn worktree_line(
     w: &Worktree,
-    m: Option<&WorktreeMetrics>,
+    m: &Measured,
     cols: &ColWidths,
     path_budget: usize,
     cursor: bool,
@@ -532,11 +535,8 @@ fn worktree_line(
         let (dt, dc) = dirty_cell(m);
         spans.push(Span::styled(fit(&dt, cols.dirty), Style::default().fg(dc)));
         spans.push(Span::raw(" "));
-        let stash = m.map(|m| m.stash).unwrap_or(0);
-        spans.push(Span::styled(
-            fit(&stash.to_string(), cols.stash),
-            Style::default().fg(if stash == 0 { C_DIM } else { C_BRANCH }),
-        ));
+        let (st, sc) = stash_cell(m);
+        spans.push(Span::styled(fit(&st, cols.stash), Style::default().fg(sc)));
     }
     spans.push(Span::raw(" "));
     let path_str = trunc_left(&w.path.display().to_string(), path_budget);
@@ -580,9 +580,16 @@ fn lead_glyphs(
     (ptr, ptr_style, mark, mark_style)
 }
 
-fn remote_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
-    let Some(m) = m else {
-        return ("—".into(), C_DIM);
+/// What a column shows before its count has arrived.
+///
+/// A dot, not a spinner: eight of them animating in a column would pull the eye
+/// away from the list the user opened this to read, and they are gone within a
+/// few hundred milliseconds anyway.
+const PENDING: &str = "·";
+
+fn remote_cell(m: &Measured) -> (String, Color) {
+    let Some(m) = m.known() else {
+        return (pending_or_dash(m), C_DIM);
     };
     let text = remote_plain(m);
     let color = match m.ahead_behind {
@@ -595,9 +602,9 @@ fn remote_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
     (text, color)
 }
 
-fn dirty_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
-    let Some(m) = m else {
-        return ("?".into(), C_DIM);
+fn dirty_cell(m: &Measured) -> (String, Color) {
+    let Some(m) = m.known() else {
+        return (pending_or_dash(m), C_DIM);
     };
     let text = dirty_plain(m);
     let color = match m.dirty {
@@ -606,6 +613,21 @@ fn dirty_cell(m: Option<&WorktreeMetrics>) -> (String, Color) {
         Some(_) => C_ERR,
     };
     (text, color)
+}
+
+fn stash_cell(m: &Measured) -> (String, Color) {
+    match m.known() {
+        None => (pending_or_dash(m), C_DIM),
+        Some(m) if m.stash == 0 => ("0".into(), C_DIM),
+        Some(m) => (m.stash.to_string(), C_BRANCH),
+    }
+}
+
+fn pending_or_dash(m: &Measured) -> String {
+    match m {
+        Measured::Pending => PENDING.into(),
+        _ => "—".into(),
+    }
 }
 
 fn color_for_status(s: WorktreeStatus) -> Style {

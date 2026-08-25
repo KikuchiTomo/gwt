@@ -1,7 +1,7 @@
 // TUIs draw to stderr so the picker can print the chosen path on stdout
 // for shell `cd "$(git wt)"` integrations.
 
-use std::io::{self, Stderr};
+use std::io::{self, IsTerminal, Stderr};
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -54,7 +54,13 @@ pub fn leave_fullscreen(tui: &mut Tui) -> io::Result<()> {
 /// doesn't get bitten by "cursor position could not be read".
 pub fn enter_inline(height: u16) -> io::Result<Tui> {
     enable_raw_mode()?;
-    if std::env::var_os("TMUX").is_some() {
+    // Building the inline viewport starts by asking the terminal where the
+    // cursor is — `ESC[6n` written to STDOUT — and then waiting a full two
+    // seconds for a reply. If stdout is not the terminal, the question never
+    // gets there, so the reply never comes: `cd "$(git wt)"` captures stdout,
+    // and so does any pipe, and every one of those launches used to sit for two
+    // seconds before falling back to exactly what we do here anyway.
+    if std::env::var_os("TMUX").is_some() || !io::stdout().is_terminal() {
         return alt_screen_fallback();
     }
     match Terminal::with_options(

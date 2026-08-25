@@ -184,6 +184,27 @@ remembering the one-line footer.
 The list hides `.bare` and the repo root — neither is somewhere you can work —
 and puts `default` first, then the rest alphabetically.
 
+### It opens now, not in a moment
+
+The picker draws as soon as git can list the worktrees — two git calls, a few
+milliseconds — and never waits on anything else. The `REMOTE`, `DIRTY` and
+`STASH` columns show `·` while they are still being counted and fill in over the
+next moment; the counting runs eight worktrees at a time, because each one is a
+`git status` waiting on the disk rather than on gwt. The columns are reserved at
+full width from the first frame, so nothing shifts under the cursor as they
+arrive, and `Enter` works before any of them land.
+
+On a repo with a dozen worktrees that is the difference between ~100 ms and
+~10 ms to the first frame — more on a large repo, where a single `git status`
+can take most of a second. `git wt list` counts the same way and is about twice
+as fast for it.
+
+One more launch cost worth knowing about: the inline viewport starts by asking
+the terminal where the cursor is and waiting up to two seconds for the answer.
+If stdout is not the terminal — `cd "$(git wt)"` captures it, and so does any
+pipe — the question never arrives, so gwt no longer asks it and goes straight to
+the fullscreen fallback instead of stalling for two seconds first.
+
 ### Picking a base branch
 
 `e` / `n` open the branch list with the **default branch first**, tagged
@@ -431,19 +452,57 @@ pull` cannot bring one in. A recipe is something you wrote on this machine.
 apply` re-links and re-copies without re-running anyone's `npm ci`. Ask for it
 with `--run`, or put `apply` in the step's `when`.
 
-The command goes through the shell, from the worktree root, with `GWT_ROOT`,
-`GWT_WORKTREE`, `GWT_WORKTREE_NAME` and `GWT_BRANCH` set. On the command line
-its output is echoed line by line as it arrives, so a slow install is visibly
-alive; from the TUI it gets the terminal to itself (below).
+The command runs with `GWT_ROOT`, `GWT_WORKTREE`, `GWT_WORKTREE_NAME` and
+`GWT_BRANCH` set, plus `GWT_SYNC=1` — a marker for an rc file that wants to keep
+its heavier startup for terminals a person is actually looking at.
 
 `dir` moves it somewhere else in the worktree — the package that actually needs
 installing, in a monorepo — and the path is relative to that worktree's root
 like every other `dst`.
 
 A `cmd` with newlines in it is **one shell script**, not a line-at-a-time list:
-it reaches `sh -c` whole, so `set -e` holds for the rest of it and a variable
+it reaches the shell whole, so `set -e` holds for the rest of it and a variable
 set on one line is still there on the next. Writing it as three separate `run`
 steps would give you three shells and none of that.
+
+### It runs the way you would run it
+
+A directory that pins its toolchain — rbenv, nodenv, pyenv, nvm, asdf, mise —
+does it from an *interactive* rc file. `sh -c "bundle install"` reads no rc at
+all, so the shims never reach `PATH`, and `nvm`, which is a shell function and
+nothing else, does not exist. That is the old "works when I type it, fails from
+the recipe" bug, and it is why a `run` step now starts **your** shell:
+
+- **Your `$SHELL`, with the flags your terminal uses** — interactive, and login
+  too on macOS, where terminals start login shells. So `~/.zshrc`, `~/.bashrc`
+  and `config.fish` run, exactly as they do in a new tab.
+- **The environment another project pinned is dropped.** Launch gwt from a shell
+  with a virtualenv active, or from inside `bundle exec`, and `BUNDLE_GEMFILE`,
+  `GEM_HOME`, `RUBYOPT`, `RBENV_VERSION`, `VIRTUAL_ENV` and friends are
+  inherited — and they outrank the `.ruby-version` in the worktree being set up.
+  A new terminal never has them, so neither does the command. (Only ever when
+  the rc that would set them for real is about to run.)
+- **It `cd`s in rather than starting there**, so `chpwd` hooks fire and direnv,
+  mise and the `.nvmrc` switchers get their chance to notice where they are.
+
+With no terminal in sight — a script, a git hook, CI — an interactive shell has
+nothing to be interactive on and bash would open by complaining about job
+control, so the login shell runs instead.
+
+Per step, `shell` says otherwise:
+
+```toml
+[[step]]
+type = "run"
+cmd = "npm ci"
+shell = "auto"    # default: your shell, the way your terminal starts it
+# shell = "login"           # login shell only — skip a slow interactive rc
+# shell = "posix"           # plain `sh -c`, environment untouched (pre-0.9)
+# shell = "bash -euo pipefail"   # or name one; `-c` is appended if missing
+```
+
+`GWT_SYNC_SHELL` sets the same thing for one machine, and applies only to steps
+that did not choose for themselves.
 
 ### The interactive manager
 
@@ -534,6 +593,12 @@ its `when`. Nothing is hidden either way: a step that failed holds the screen
 until you press enter, and so does every run under the alt-screen fallback
 (tmux), where the output would otherwise be wiped by the redraw.
 
+On the command line there is no viewport to take down, so a command gets the
+terminal there too — the same colors, the same progress bars, the same chance to
+be answered, and the interactive shell that comes with having a terminal at all.
+Piped into a file or run by CI there is nothing to hand over, so gwt goes back to
+echoing the output line by line as it arrives.
+
 A command's own stdout is redirected to stderr on the way, because stdout is how
 `cd "$(git wt)"` learns where to go.
 
@@ -544,6 +609,7 @@ git wt sync add  secrets/.env .env                  # link (alias: sync link)
 git wt sync add  secrets/gcp.json config/gcp.json
 git wt sync copy secrets/env.sample .env --render
 git wt sync run  'npm ci' --only-if package.json --timeout 10m
+git wt sync run  'make setup' --shell posix          # plain `sh -c`
 git wt sync ls
 git wt sync move 3 1                                # 3rd step now runs first
 git wt sync rm   .env

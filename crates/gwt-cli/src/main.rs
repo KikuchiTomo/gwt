@@ -356,6 +356,11 @@ enum SyncOp {
         /// The command line, run through the shell.
         #[arg(value_name = "COMMAND")]
         cmd: String,
+        /// Which shell runs it: auto (your $SHELL, login + interactive, so
+        /// rbenv/nvm/asdf/mise are set up as usual), login (no interactive rc),
+        /// posix (plain `sh -c`), or a shell to use ("bash -euo pipefail").
+        #[arg(long, value_name = "SHELL", default_value = "auto")]
+        shell: String,
         /// Only run where this path exists inside the worktree.
         #[arg(long, value_name = "PATH")]
         only_if: Option<String>,
@@ -468,6 +473,7 @@ fn step_from(op: &SyncOp, layout: &BareLayout, cwd: &Path) -> Result<gwt_core::s
             timeout,
             dir,
             when,
+            shell,
         } => {
             let mut phases = Vec::new();
             for w in when {
@@ -485,6 +491,7 @@ fn step_from(op: &SyncOp, layout: &BareLayout, cwd: &Path) -> Result<gwt_core::s
                 timeout: gwt_core::sync::parse_timeout(timeout)
                     .ok_or_else(|| anyhow::anyhow!("--timeout looks like 30s, 10m or 1h"))?,
                 dir: dir.clone(),
+                shell: gwt_core::Shell::parse(shell).unwrap_or_default(),
             })
         }
         _ => unreachable!("not a step-producing subcommand"),
@@ -580,6 +587,19 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+
+    // Nothing left draws a viewport of its own except the sync manager, so the
+    // terminal — if this is one — belongs to whatever the recipe runs. That is
+    // what lets a command print its own progress, ask a question and be
+    // answered, and get the interactive shell that sets up rbenv and friends.
+    // The manager is a TUI and hands the screen over itself.
+    let manager = matches!(
+        cli.command.as_ref(),
+        Some(Cmd::Sync { op: None }) | Some(Cmd::Secret { op: None })
+    );
+    let _screen = (!manager)
+        .then(gwt_core::sync::lease_screen_if_terminal)
+        .flatten();
 
     // Everything else requires the bare-style layout — found from wherever the
     // user happens to be standing, which is usually inside a worktree.

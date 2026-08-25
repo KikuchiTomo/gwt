@@ -31,6 +31,9 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 })?;
                 continue;
             }
+            // Counts for the metric columns land while the list is already on
+            // screen; take whatever arrived before painting this frame.
+            app.poll_metrics();
             term.draw(|f| ui::draw(f, &mut app))?;
             // The delete/sync animations are self-driven, not key-driven: keep
             // ticking (and redrawing) on a timer until the work finishes.
@@ -59,7 +62,11 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
-            if !event::poll(Duration::from_millis(250))? {
+            // A frame is only redrawn when something happens, so while counts
+            // are still arriving we look up more often — for the few hundred
+            // milliseconds that takes, and not a moment longer.
+            let idle = if app.metrics_loading() { 40 } else { 250 };
+            if !event::poll(Duration::from_millis(idle))? {
                 continue;
             }
             if let Event::Key(key) = event::read()? {
