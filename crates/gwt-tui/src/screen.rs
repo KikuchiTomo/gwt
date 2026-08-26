@@ -62,6 +62,13 @@ impl Screen {
         }
     }
 
+    /// Something went wrong beside the recipe — a base branch that refused to
+    /// fast-forward, say. Same weight as a failed step: the worktree still
+    /// exists, and this is the part worth reading afterwards.
+    pub fn warn(&mut self, text: String) {
+        self.fail(text);
+    }
+
     fn fail(&mut self, text: String) {
         eprintln!("  ✗ {text}");
         self.failures.push(text);

@@ -9,7 +9,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use gwt_core::Repo;
 
 use crate::term::{enter_inline, leave_inline, released};
-use state::{App, BaseNote, BranchPurpose, Mode, SyncOp};
+use state::{App, BranchPurpose, Mode, SyncOp};
 
 #[derive(Debug)]
 pub enum PickerOutcome {
@@ -52,16 +52,6 @@ pub fn run_picker(repo: &Repo, height: u16) -> Result<PickerOutcome> {
                 std::thread::sleep(Duration::from_millis(70));
                 continue;
             }
-            if matches!(app.mode, Mode::CheckingBase { .. }) {
-                app.tick_base_check();
-                std::thread::sleep(Duration::from_millis(70));
-                continue;
-            }
-            if matches!(app.mode, Mode::UpdatingBase { .. }) {
-                app.tick_base_update();
-                std::thread::sleep(Duration::from_millis(70));
-                continue;
-            }
             // A frame is only redrawn when something happens, so while answers
             // are still arriving we look up more often — for the few hundred
             // milliseconds that takes, and not a moment longer.
@@ -88,16 +78,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             handle_confirm_delete(app, key);
             Ok(None)
         }
-        // Deletion and sync are animated from the main loop; swallow stray keys.
-        Mode::Deleting { .. }
-        | Mode::Syncing { .. }
-        | Mode::Creating { .. }
-        | Mode::CheckingBase { .. }
-        | Mode::UpdatingBase { .. } => Ok(None),
-        Mode::ConfirmBasePull { .. } => {
-            handle_confirm_base_pull(app, key, ctrl);
-            Ok(None)
-        }
+        // Deletion, sync and creation are animated from the main loop; swallow
+        // stray keys.
+        Mode::Deleting { .. } | Mode::Syncing { .. } | Mode::Creating { .. } => Ok(None),
         Mode::ConfirmSync { .. } => {
             handle_confirm_sync(app, key);
             Ok(None)
@@ -114,7 +97,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<PickerOutcome>> {
             Ok(None)
         }
         Mode::Message { .. } => {
-            app.mode = Mode::List;
+            app.cancel_to_list();
             Ok(None)
         }
     }
@@ -278,44 +261,14 @@ fn handle_confirm_sync(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The one prompt here that defaults to *yes*: you asked for a worktree off this
-/// branch, and a fast-forward is what you almost always meant. `n` still gets
-/// you the branch exactly as it stands, and esc backs out of the whole thing.
-fn handle_confirm_base_pull(app: &mut App, key: KeyEvent, ctrl: bool) {
-    let Mode::ConfirmBasePull {
-        base,
-        customize_dir,
-        status,
-    } = &app.mode
-    else {
-        return;
-    };
-    let (base, customize_dir, branch) = (base.clone(), *customize_dir, status.branch.clone());
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-            app.begin_base_update(base, customize_dir)
-        }
-        KeyCode::Esc => app.mode = Mode::List,
-        KeyCode::Char('c') if ctrl => app.mode = Mode::List,
-        _ => app.enter_name_input(
-            base,
-            customize_dir,
-            Some(BaseNote {
-                text: gwt_core::t::base_pull_skipped(&branch),
-                error: false,
-            }),
-        ),
-    }
-}
-
 fn handle_conflict(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<PickerOutcome>> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = Mode::List;
+            app.cancel_to_list();
             return Ok(None);
         }
         KeyCode::Char('c') if ctrl => {
-            app.mode = Mode::List;
+            app.cancel_to_list();
             return Ok(None);
         }
         KeyCode::Down | KeyCode::Tab => app.conflict_move(1),
@@ -359,7 +312,7 @@ fn handle_confirm_action(app: &mut App, key: KeyEvent) -> Result<Option<PickerOu
                 Err(e) => app.set_error(e.to_string()),
             }
         }
-        _ => app.mode = Mode::List,
+        _ => app.cancel_to_list(),
     }
     Ok(None)
 }
@@ -368,11 +321,11 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
     // Branch picker is filter-first (fzf style); typing always edits the query.
     match key.code {
         KeyCode::Esc => {
-            app.mode = Mode::List;
+            app.cancel_to_list();
             return Ok(None);
         }
         KeyCode::Char('c') if ctrl => {
-            app.mode = Mode::List;
+            app.cancel_to_list();
             return Ok(None);
         }
         KeyCode::Down => app.branch_move(1),
@@ -399,7 +352,10 @@ fn handle_branch(app: &mut App, key: KeyEvent, ctrl: bool) -> Result<Option<Pick
 fn handle_new_name(app: &mut App, key: KeyEvent, ctrl: bool) {
     match key.code {
         KeyCode::Esc => app.back_or_cancel_new_name(),
-        KeyCode::Char('c') if ctrl => app.mode = Mode::List,
+        KeyCode::Char('c') if ctrl => app.cancel_to_list(),
+        // The base check lands here while the name is being typed; `^f` is the
+        // answer to it. Ctrl, because every plain key is text.
+        KeyCode::Char('f') if ctrl => app.toggle_base_ff(),
         KeyCode::Enter => match app.commit_new_name() {
             Ok(true) => {}
             Ok(false) => app.set_error(gwt_core::t::name_required().into()),

@@ -219,16 +219,13 @@ pub mod t {
         name_two_step_hint => "  → enter branch name, then worktree dir name",
                               "  → ブランチ名を入力後、ディレクトリ名を入力";
         branch_tag_default => "default", "既定";
-        checking_base => " checking the base branch against origin… ",
-                         " 基点ブランチと origin を比較中… ";
-        updating_base => " updating the base branch… ", " 基点ブランチを更新中… ";
-        base_pull_help => " y/enter: pull first   n: use it as-is   esc: cancel ",
-                          " y/enter: 先に pull   n: そのまま使う   esc: 中止 ";
-        base_pull_question => "pull it before branching?", "分岐する前に pull しますか？";
+        base_checking => "checking it against origin…", "origin と比較中…";
+        base_current => "up to date with origin", "origin と同じ状態です";
         base_pull_ff_note => "fast-forward only — nothing is merged or rebased",
                              "fast-forward のみ。merge も rebase もしません";
-        title_base_behind => "the base branch is behind origin",
-                             "基点ブランチが origin より遅れています";
+        base_ff_skip_hint => "^f: branch from it as it stands",
+                             "^f: そのまま基点にする";
+        base_ff_undo_hint => "^f: fast-forward it first", "^f: 先に fast-forward する";
         title_worktree_exists => "worktree already exists", "ワークツリーが既に存在します";
         title_branch_exists => "branch already exists", "ブランチが既に存在します";
         title_confirm => "confirm", "確認";
@@ -410,6 +407,31 @@ pub mod t {
         )
     }
 
+    /// What the name prompt says while a stale base is waiting to be branched
+    /// from: the fast-forward is queued, and it happens on create.
+    pub fn base_will_ff(branch: &str) -> String {
+        pick(
+            format!("{branch} will be fast-forwarded before the branch is cut"),
+            format!("分岐する前に {branch} を fast-forward します"),
+        )
+    }
+
+    /// The same line while the fast-forward is actually running, mixed in with
+    /// the recipe's own output.
+    pub fn base_ff_running(branch: &str) -> String {
+        pick(
+            format!("fast-forwarding {branch} from origin…"),
+            format!("{branch} を origin から fast-forward 中…"),
+        )
+    }
+
+    pub fn base_ff_failed(branch: &str, detail: &str) -> String {
+        pick(
+            format!("{branch} could not be fast-forwarded — {detail}"),
+            format!("{branch} を fast-forward できませんでした — {detail}"),
+        )
+    }
+
     pub fn cache_key_question(path: &str) -> String {
         pick(
             format!("which files decide who may share '{path}'?"),
@@ -511,6 +533,8 @@ pub mod t {
         k_new => "new worktree from a base branch", "基点ブランチから新規作成";
         k_new_dir => "same, but choose the directory name too", "同上 + ディレクトリ名も指定";
         k_review => "review a remote branch", "リモートブランチをレビュー";
+        k_base_ff => "on the name prompt: keep or skip the base fast-forward",
+                     "名前入力中: 基点の fast-forward を切り替える";
         k_filter => "filter the list", "一覧を絞り込む";
         k_quit => "close the picker", "ピッカーを閉じる";
         k_help => "show this help", "このヘルプを表示";
