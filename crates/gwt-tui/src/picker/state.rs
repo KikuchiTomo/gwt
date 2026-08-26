@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -26,12 +27,49 @@ pub enum NameStage {
     Dir,
 }
 
-/// What happened to the base branch on the way to this screen, carried along so
-/// the name prompt can say so instead of the news being lost behind a spinner.
-#[derive(Debug, Clone)]
-pub struct BaseNote {
-    pub text: String,
-    pub error: bool,
+/// The base-branch check, running *alongside* the name prompt instead of in
+/// front of it.
+///
+/// Asking origin about the base costs a network round trip, and it used to cost
+/// it on the keystroke that picked the branch: a spinner first, the name prompt
+/// afterwards. Nothing about typing a branch name depends on the answer, so the
+/// prompt opens on that keystroke and this fills in underneath it. By the time
+/// a name has been typed the answer is, in practice, already there.
+pub struct BaseCheck {
+    pub base: String,
+    pub frame: usize,
+    pub state: BaseState,
+    rx: Option<Receiver<std::result::Result<Option<ops::BaseStatus>, String>>>,
+}
+
+#[derive(Clone)]
+pub enum BaseState {
+    /// origin has not answered yet.
+    Checking,
+    /// Nothing to say: the base is current, or there is nothing to compare it
+    /// against (a remote ref, no local branch, no origin counterpart).
+    Current,
+    /// The base has fallen behind origin. `ff` is what happens when the name is
+    /// committed; it starts *on* — the answer the old y/N prompt defaulted to —
+    /// and `^f` turns it off without interrupting anything.
+    Behind {
+        status: Box<ops::BaseStatus>,
+        ff: bool,
+    },
+    /// The check itself failed. A base we could not measure is still a base you
+    /// can branch from, so this is a note rather than a dead end.
+    Failed(String),
+}
+
+impl BaseCheck {
+    /// Whether a fast-forward will run when the worktree is created.
+    pub fn will_ff(&self) -> bool {
+        matches!(self.state, BaseState::Behind { ff: true, .. })
+    }
+
+    pub fn is_checking(&self) -> bool {
+        self.rx.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,49 +141,30 @@ pub enum Mode {
         paths: Vec<PathBuf>,
         force: bool,
     },
-    /// In-progress bulk delete: one worktree is removed every `DELETE_STEPS`
-    /// ticks while a spinner animates, so the operation reads as live progress.
+    /// In-progress bulk delete. The removals run on a worker and report back
+    /// one at a time; the spinner and the progress bar animate off that, so a
+    /// worktree git takes a second to unlink does not take the frame with it.
     Deleting {
         paths: Vec<PathBuf>,
         force: bool,
+        /// How many have been removed — also the row the spinner sits on.
         index: usize,
         frame: usize,
-        step: usize,
         errors: Vec<String>,
+        rx: Receiver<DeleteMsg>,
     },
     Branch {
         purpose: BranchPurpose,
         all: Vec<BranchRef>,
     },
+    /// The name prompt. What origin has to say about the base arrives here
+    /// while it is open — see [`BaseCheck`].
     NewName {
         base: String,
         buf: String,
         dir_buf: String,
         customize_dir: bool,
         stage: NameStage,
-        note: Option<BaseNote>,
-    },
-    /// Asking origin whether the chosen base branch is still current. This talks
-    /// to the network, so it runs on a worker thread like every other git call
-    /// that might not come back promptly.
-    CheckingBase {
-        base: String,
-        customize_dir: bool,
-        frame: usize,
-        rx: Receiver<std::result::Result<Option<ops::BaseStatus>, String>>,
-    },
-    /// The base branch is behind origin — offer to fast-forward it first, so a
-    /// new branch does not start life already out of date.
-    ConfirmBasePull {
-        base: String,
-        customize_dir: bool,
-        status: Box<ops::BaseStatus>,
-    },
-    UpdatingBase {
-        base: String,
-        customize_dir: bool,
-        frame: usize,
-        rx: Receiver<std::result::Result<String, String>>,
     },
     Message {
         text: String,
@@ -209,9 +228,21 @@ fn build_worktree(
     repo: Repo,
     job: CreateJob,
     report: sync::Reporter,
+    warn: &mut dyn FnMut(String),
 ) -> std::result::Result<PathBuf, String> {
     match (layout, job) {
-        (Some(l), CreateJob::New { base, branch, dir }) => {
+        (
+            Some(l),
+            CreateJob::New {
+                base,
+                branch,
+                dir,
+                ff_base,
+            },
+        ) => {
+            if ff_base {
+                fast_forward_base(&l, &base, report, warn);
+            }
             ops::new(&l, &base, &branch, &dir, report).map_err(|e| e.to_string())
         }
         (Some(l), CreateJob::Adopt { branch, dir }) => {
@@ -223,7 +254,18 @@ fn build_worktree(
         (Some(l), CreateJob::RecreateFromRemote { branch, dir }) => {
             ops::recreate_branch_from_remote(&l, &branch, &dir, report).map_err(|e| e.to_string())
         }
-        (Some(l), CreateJob::Recreate { dir, branch, base }) => {
+        (
+            Some(l),
+            CreateJob::Recreate {
+                dir,
+                branch,
+                base,
+                ff_base,
+            },
+        ) => {
+            if let (true, Some(base)) = (ff_base, base.as_deref()) {
+                fast_forward_base(&l, base, report, warn);
+            }
             ops::recreate_worktree(&l, &dir, &branch, base.as_deref(), report)
                 .map_err(|e| e.to_string())
         }
@@ -237,6 +279,34 @@ fn build_worktree(
             .map_err(|e| e.to_string()),
         (None, _) => Err("not a bare-style worktree root".to_string()),
     }
+}
+
+/// Fast-forward the base branch, narrating it, on the way to branching off it.
+///
+/// This used to be its own screen with its own spinner, sitting between the
+/// branch list and the name prompt. It is a step of the creation now: the user
+/// has finished asking for things by the time it runs, so it belongs with the
+/// rest of the waiting rather than in front of the next question.
+///
+/// Never fatal. A base that has diverged cannot be fast-forwarded, and that is
+/// worth saying — but it is still a base you can branch from, so the creation
+/// carries on and the refusal is reported at the end.
+fn fast_forward_base(
+    layout: &BareLayout,
+    base: &str,
+    report: sync::Reporter,
+    warn: &mut dyn FnMut(String),
+) {
+    report(sync::Event::Output(&t::base_ff_running(base)));
+    match ops::update_base_branch(layout, base) {
+        Ok(msg) => report(sync::Event::Output(&msg)),
+        Err(e) => warn(t::base_ff_failed(base, &e.to_string())),
+    }
+}
+
+/// One removal's result on its way back from the delete worker.
+pub struct DeleteMsg {
+    pub error: Option<String>,
 }
 
 /// What the worker thread sends back while a worktree is being built.
@@ -253,6 +323,9 @@ pub enum CreateJob {
         base: String,
         branch: String,
         dir: String,
+        /// Fast-forward `base` onto origin first. Decided on the name prompt,
+        /// where the check that answers it has been running all along.
+        ff_base: bool,
     },
     Adopt {
         branch: String,
@@ -270,6 +343,7 @@ pub enum CreateJob {
         dir: String,
         branch: String,
         base: Option<String>,
+        ff_base: bool,
     },
     /// No bare-style layout: plain `git worktree add`, no recipe to run.
     PlainNew {
@@ -360,6 +434,13 @@ pub struct App<'a> {
     pub default_branch: Option<String>,
     /// Branches and trunk, on their way in from the moment the picker opens.
     branches: Pending<BranchData>,
+    /// What origin says about the base branch, arriving while the name prompt
+    /// is already open. `None` outside the create flow.
+    pub base: Option<BaseCheck>,
+    /// A re-read of `git worktree list` after something changed the set. It is
+    /// a git call like any other, so the list keeps showing what it has until
+    /// the new answer lands.
+    reload: Pending<std::result::Result<Vec<Worktree>, String>>,
 
     pub worktrees: Vec<Worktree>,
     pub metrics: Vec<Measured>,
@@ -407,6 +488,8 @@ impl<'a> App<'a> {
             mode: Mode::List,
             default_branch: None,
             branches: Pending::default(),
+            base: None,
+            reload: Pending::default(),
             metrics: Vec::new(),
             metrics_rx: None,
             cols: compute_col_widths(&[], &[]),
@@ -529,13 +612,25 @@ impl<'a> App<'a> {
             }
             changed = true;
         }
+        if self.reload.poll() {
+            if let Some(Ok(list)) = self.reload.get() {
+                self.worktrees = list.clone();
+                self.start_metrics();
+                self.refilter_worktrees();
+            }
+            changed = true;
+        }
+        changed |= self.poll_base();
         changed
     }
 
     /// Whether anything is still on its way in — which is also how often the
     /// loop should look up from waiting on the keyboard.
     pub fn is_loading(&self) -> bool {
-        self.metrics_loading() || self.branches.is_pending()
+        self.metrics_loading()
+            || self.branches.is_pending()
+            || self.reload.is_pending()
+            || self.base.as_ref().is_some_and(BaseCheck::is_checking)
     }
 
     /// Whether the branch screen is still waiting on its list.
@@ -543,13 +638,23 @@ impl<'a> App<'a> {
         self.branches.is_pending()
     }
 
-    pub fn refresh_worktrees(&mut self) -> Result<()> {
-        self.worktrees = visible_worktrees(self.repo, self.layout.as_ref())?;
-        self.start_metrics();
-        // Indices are no longer valid after the list changes shape.
+    /// Re-read the worktree list after something changed it — on a worker.
+    ///
+    /// Every caller is a finished operation handing the screen back, and the
+    /// screen it hands back is the list. Enumerating worktrees is a git call
+    /// like any other, so it does not get to sit in the middle of that: the
+    /// list is drawn from what we already have and corrects itself a few
+    /// milliseconds later, when [`poll_background`](Self::poll_background)
+    /// takes delivery.
+    pub fn refresh_worktrees(&mut self) {
+        // Indices are no longer valid after the list changes shape, and the
+        // stale ones must not survive even the one frame before it does.
         self.selected.clear();
-        self.refilter_worktrees();
-        Ok(())
+        let repo = self.repo.clone();
+        let layout = self.layout.clone();
+        self.reload = Pending::start(move || {
+            visible_worktrees(&repo, layout.as_ref()).map_err(|e| e.to_string())
+        });
     }
 
     pub fn refilter_worktrees(&mut self) {
@@ -659,58 +764,74 @@ impl<'a> App<'a> {
             self.mode = Mode::List;
             return;
         }
+        // `git worktree remove` walks the tree and then unlinks it; on a big
+        // node_modules that is not a frame's worth of work. The worker does the
+        // removals and reports each one, so the bar moves while it happens
+        // rather than jumping a notch every time the UI thread comes back.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = (*self.repo).clone();
+        let targets = paths.clone();
+        std::thread::spawn(move || {
+            for path in targets {
+                let error = repo
+                    .remove_worktree(&path, force)
+                    .err()
+                    .map(|e| format!("{}: {}", path_name(&path), e));
+                // A closed channel means the picker is gone; stop working for it.
+                if tx.send(DeleteMsg { error }).is_err() {
+                    return;
+                }
+            }
+        });
         self.mode = Mode::Deleting {
             paths,
             force,
             index: 0,
             frame: 0,
-            step: 0,
             errors: Vec::new(),
+            rx,
         };
     }
 
-    /// Advance the delete animation by one tick. Removes the next worktree once
-    /// its warm-up frames have elapsed. Returns `true` when the batch is done.
+    /// Advance the delete animation and take whatever the worker has finished
+    /// with. Returns `true` when the batch is done.
     pub fn tick_delete(&mut self) -> bool {
-        // The spinner advances on every tick regardless of work done.
-        if let Mode::Deleting { frame, .. } = &mut self.mode {
-            *frame = frame.wrapping_add(1);
-        }
-        let (index, len, step) = match &self.mode {
+        let done = match &mut self.mode {
             Mode::Deleting {
-                paths, index, step, ..
-            } => (*index, paths.len(), *step),
+                paths,
+                index,
+                frame,
+                errors,
+                rx,
+                ..
+            } => {
+                // The spinner advances on every tick regardless of work done.
+                *frame = frame.wrapping_add(1);
+                loop {
+                    match rx.try_recv() {
+                        Ok(DeleteMsg { error }) => {
+                            if let Some(e) = error {
+                                errors.push(e);
+                            }
+                            *index += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        // The worker is finished, or died mid-batch. Either way
+                        // nothing more is coming and the count says where it got.
+                        Err(TryRecvError::Disconnected) => {
+                            *index = paths.len();
+                            break;
+                        }
+                    }
+                }
+                *index >= paths.len()
+            }
             _ => return true,
         };
-        if index >= len {
-            return self.finish_delete();
-        }
-        // Show the spinner on the target for a few frames before acting.
-        if step + 1 < DELETE_STEPS {
-            if let Mode::Deleting { step, .. } = &mut self.mode {
-                *step += 1;
-            }
+        if !done {
             return false;
         }
-        let (path, force) = match &self.mode {
-            Mode::Deleting { paths, force, .. } => (paths[index].clone(), *force),
-            _ => return true,
-        };
-        let res = self.repo.remove_worktree(&path, force);
-        if let Mode::Deleting {
-            index,
-            step,
-            errors,
-            ..
-        } = &mut self.mode
-        {
-            if let Err(e) = res {
-                errors.push(format!("{}: {}", path_name(&path), e));
-            }
-            *index += 1;
-            *step = 0;
-        }
-        false
+        self.finish_delete()
     }
 
     fn finish_delete(&mut self) -> bool {
@@ -719,7 +840,7 @@ impl<'a> App<'a> {
             _ => Vec::new(),
         };
         // refresh_worktrees also drops the now-stale selection.
-        let _ = self.refresh_worktrees();
+        self.refresh_worktrees();
         if errors.is_empty() {
             self.mode = Mode::List;
         } else {
@@ -797,17 +918,6 @@ impl<'a> App<'a> {
         self.refilter_branches();
     }
 
-    pub fn enter_name_input(&mut self, base: String, customize_dir: bool, note: Option<BaseNote>) {
-        self.mode = Mode::NewName {
-            base,
-            buf: String::new(),
-            dir_buf: String::new(),
-            customize_dir,
-            stage: NameStage::Branch,
-            note,
-        };
-    }
-
     /// Returns Ok(true) on completion, Ok(false) on no-op (empty input or
     /// advanced from branch to dir stage).
     pub fn commit_new_name(&mut self) -> Result<bool> {
@@ -818,7 +928,6 @@ impl<'a> App<'a> {
                 dir_buf,
                 customize_dir,
                 stage,
-                ..
             } => (
                 base.clone(),
                 buf.trim().to_string(),
@@ -861,6 +970,11 @@ impl<'a> App<'a> {
                 base,
                 branch: branch.clone(),
                 dir,
+                // Whatever the base check settled on while the name was being
+                // typed. It has had the whole prompt to arrive; if it somehow
+                // has not, the base goes in as it stands rather than the
+                // creation waiting on it.
+                ff_base: self.base.as_ref().is_some_and(BaseCheck::will_ff),
             }
         } else {
             CreateJob::PlainNew {
@@ -892,6 +1006,13 @@ impl<'a> App<'a> {
                 return;
             }
         }
+        self.cancel_to_list();
+    }
+
+    /// Back out of the create flow. The base check goes with it — its answer
+    /// was only ever about the branch that is no longer being made.
+    pub fn cancel_to_list(&mut self) {
+        self.base = None;
         self.mode = Mode::List;
     }
 
@@ -993,13 +1114,13 @@ impl<'a> App<'a> {
 
         match purpose {
             BranchPurpose::NewBase => {
-                // Step 1 done — the base is settled, so ask origin whether it is
-                // still current before the name prompt. ops::new runs on commit.
-                self.begin_base_check(b.short.clone(), false);
+                // Step 1 done — the base is settled, so the name prompt opens
+                // now and origin is asked about the base underneath it.
+                self.enter_name_input(b.short.clone(), false);
                 Ok(true)
             }
             BranchPurpose::NewBaseWithPath => {
-                self.begin_base_check(b.short.clone(), true);
+                self.enter_name_input(b.short.clone(), true);
                 Ok(true)
             }
             BranchPurpose::Review => {
@@ -1089,6 +1210,10 @@ impl<'a> App<'a> {
                         keys: "r",
                         desc: t::k_review().into(),
                     },
+                    KeyRow {
+                        keys: "^f",
+                        desc: t::k_base_ff().into(),
+                    },
                 ],
             },
             KeySection {
@@ -1143,132 +1268,84 @@ impl<'a> App<'a> {
 
     // ---- the base branch ---------------------------------------------------
 
-    /// Ask origin whether the chosen base branch is still current.
+    /// Open the name prompt and ask origin about the base at the same time.
     ///
     /// Branching from a `main` that is a week old is the mistake this catches,
     /// and it is only catchable *here*: once the worktree exists, rebasing it is
-    /// a real job. Without the layout there is no bare dir to fetch through, so
-    /// that case goes straight on to the name prompt.
-    pub fn begin_base_check(&mut self, base: String, customize_dir: bool) {
+    /// a real job. But catching it never needed the user to wait — the question
+    /// is about the base, and typing a name for the new branch does not depend
+    /// on the answer. So the prompt opens on the keystroke and the answer joins
+    /// it, rather than the other way round.
+    ///
+    /// Without the layout there is no bare dir to fetch through, so there is
+    /// simply nothing to check.
+    pub fn enter_name_input(&mut self, base: String, customize_dir: bool) {
+        self.mode = Mode::NewName {
+            base: base.clone(),
+            buf: String::new(),
+            dir_buf: String::new(),
+            customize_dir,
+            stage: NameStage::Branch,
+        };
         let Some(layout) = self.layout.clone() else {
-            return self.enter_name_input(base, customize_dir, None);
+            self.base = None;
+            return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let probe = base.clone();
         std::thread::spawn(move || {
             let _ = tx.send(ops::base_status(&layout, &probe).map_err(|e| e.to_string()));
         });
-        self.mode = Mode::CheckingBase {
+        self.base = Some(BaseCheck {
             base,
-            customize_dir,
             frame: 0,
-            rx,
-        };
-    }
-
-    /// Advance the spinner; move on once origin has answered. Returns `true`
-    /// when the check is over, whichever way it went.
-    pub fn tick_base_check(&mut self) -> bool {
-        let (base, customize_dir, outcome) = match &mut self.mode {
-            Mode::CheckingBase {
-                base,
-                customize_dir,
-                frame,
-                rx,
-            } => {
-                *frame = frame.wrapping_add(1);
-                let outcome = match rx.try_recv() {
-                    Ok(res) => Some(res),
-                    Err(TryRecvError::Empty) => None,
-                    // Nothing came back, so we know nothing about the base —
-                    // which is the same position as "it looks up to date".
-                    Err(TryRecvError::Disconnected) => Some(Ok(None)),
-                };
-                (base.clone(), *customize_dir, outcome)
-            }
-            _ => return true,
-        };
-        let Some(res) = outcome else {
-            return false;
-        };
-        match res {
-            Ok(Some(status)) => {
-                self.mode = Mode::ConfirmBasePull {
-                    base,
-                    customize_dir,
-                    status: Box::new(status),
-                }
-            }
-            // Up to date, or nothing to compare against.
-            Ok(None) => self.enter_name_input(base, customize_dir, None),
-            // A base we could not measure is still a base you can branch from;
-            // say what went wrong on the next screen rather than stopping here.
-            Err(e) => self.enter_name_input(
-                base,
-                customize_dir,
-                Some(BaseNote {
-                    text: e,
-                    error: true,
-                }),
-            ),
-        }
-        true
-    }
-
-    /// Fast-forward the base branch, then carry on to the name prompt.
-    pub fn begin_base_update(&mut self, base: String, customize_dir: bool) {
-        let Some(layout) = self.layout.clone() else {
-            return self.enter_name_input(base, customize_dir, None);
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let branch = base.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(ops::update_base_branch(&layout, &branch).map_err(|e| e.to_string()));
+            state: BaseState::Checking,
+            rx: Some(rx),
         });
-        self.mode = Mode::UpdatingBase {
-            base,
-            customize_dir,
-            frame: 0,
-            rx,
-        };
     }
 
-    pub fn tick_base_update(&mut self) -> bool {
-        let (base, customize_dir, outcome) = match &mut self.mode {
-            Mode::UpdatingBase {
-                base,
-                customize_dir,
-                frame,
-                rx,
-            } => {
-                *frame = frame.wrapping_add(1);
-                let outcome = match rx.try_recv() {
-                    Ok(res) => Some(res),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => {
-                        Some(Err("the update task ended unexpectedly".to_string()))
-                    }
-                };
-                (base.clone(), *customize_dir, outcome)
-            }
-            _ => return true,
-        };
-        let Some(res) = outcome else {
+    /// Advance the base spinner and take origin's answer if it has arrived.
+    /// `true` when the frame has something new to show.
+    fn poll_base(&mut self) -> bool {
+        let Some(check) = self.base.as_mut() else {
             return false;
         };
-        // Either way the base is usable, so both answers are a note on the name
-        // prompt rather than a screen of their own. A refused fast-forward is
-        // the interesting one: the branch has diverged and wants a real shell.
-        let note = match res {
-            Ok(text) => BaseNote { text, error: false },
-            Err(e) => BaseNote {
-                text: e,
-                error: true,
-            },
+        let Some(rx) = check.rx.as_ref() else {
+            return false;
         };
-        let _ = self.refresh_worktrees();
-        self.enter_name_input(base, customize_dir, Some(note));
+        let res = match rx.try_recv() {
+            Ok(res) => res,
+            Err(TryRecvError::Empty) => {
+                check.frame = check.frame.wrapping_add(1);
+                return true;
+            }
+            // Nothing came back, so we know nothing about the base — which is
+            // the same position as "it looks up to date".
+            Err(TryRecvError::Disconnected) => Ok(None),
+        };
+        check.rx = None;
+        check.state = match res {
+            Ok(Some(status)) => BaseState::Behind {
+                status: Box::new(status),
+                ff: true,
+            },
+            Ok(None) => BaseState::Current,
+            Err(e) => BaseState::Failed(e),
+        };
         true
+    }
+
+    /// `^f` on the name prompt: keep the fast-forward, or branch from the base
+    /// exactly as it stands. Free to press at any point before the name is
+    /// committed, because nothing has happened yet.
+    pub fn toggle_base_ff(&mut self) {
+        if let Some(BaseCheck {
+            state: BaseState::Behind { ff, .. },
+            ..
+        }) = self.base.as_mut()
+        {
+            *ff = !*ff;
+        }
     }
 
     // ---- pull / push -------------------------------------------------------
@@ -1305,6 +1382,9 @@ impl<'a> App<'a> {
     /// line holds, and the interesting part is never the last line. Those runs
     /// are handed to the main loop, which puts the TUI away first.
     pub fn start_create(&mut self, label: String, job: CreateJob) {
+        // The job carries whatever the check decided; nothing after this point
+        // is still asking about the base.
+        self.base = None;
         if self
             .layout
             .as_ref()
@@ -1319,6 +1399,7 @@ impl<'a> App<'a> {
         let repo = (*self.repo).clone();
         std::thread::spawn(move || {
             let out = tx.clone();
+            let out2 = tx.clone();
             let mut report = |ev: sync::Event| {
                 let msg = match ev {
                     // Only commands are worth narrating; a symlink appearing is
@@ -1336,7 +1417,10 @@ impl<'a> App<'a> {
                     let _ = out.send(m);
                 }
             };
-            let res = build_worktree(layout, repo, job, &mut report);
+            let mut warn = |w: String| {
+                let _ = out2.send(CreateMsg::Warn(w));
+            };
+            let res = build_worktree(layout, repo, job, &mut report, &mut warn);
             let _ = tx.send(CreateMsg::Done(res));
         });
         self.mode = Mode::Creating {
@@ -1354,18 +1438,23 @@ impl<'a> App<'a> {
     pub fn run_foreground(&mut self, fg: ForegroundJob, output_survives: bool) {
         let layout = self.layout.clone();
         let repo = (*self.repo).clone();
-        let mut screen = Screen::new();
+        // Both the recipe's commentary and a refused fast-forward print to the
+        // same screen, in the order they happen; a cell is what lets two
+        // closures share it.
+        let screen = RefCell::new(Screen::new());
         Screen::banner(&fg.label);
         let res = {
             let _screen_is_ours = sync::lease_screen();
-            let mut report = |ev: sync::Event| screen.on(ev);
-            build_worktree(layout, repo, fg.job, &mut report)
+            let mut report = |ev: sync::Event| screen.borrow_mut().on(ev);
+            let mut warn = |w: String| screen.borrow_mut().warn(w);
+            build_worktree(layout, repo, fg.job, &mut report, &mut warn)
         };
+        let screen = screen.into_inner();
         screen.finish(output_survives);
 
         match res {
             Ok(path) => {
-                let _ = self.refresh_worktrees();
+                self.refresh_worktrees();
                 match screen.first_failure() {
                     // The worktree is there either way; a failed step is a
                     // result to read, not a reason to pretend nothing happened.
@@ -1414,7 +1503,7 @@ impl<'a> App<'a> {
         };
         match res {
             Ok(path) => {
-                let _ = self.refresh_worktrees();
+                self.refresh_worktrees();
                 match warn {
                     // The worktree is there either way; a failed step is a
                     // result to read, not a reason to pretend nothing happened.
@@ -1478,7 +1567,7 @@ impl<'a> App<'a> {
         let name = path_name(&path);
         match res {
             Ok(msg) => {
-                let _ = self.refresh_worktrees();
+                self.refresh_worktrees();
                 self.set_info(format!("{} {}: {msg}", op.verb(), name));
             }
             Err(e) => self.set_error(format!("{} {name} ({branch}) failed — {e}", op.verb())),
@@ -1667,12 +1756,12 @@ impl<'a> App<'a> {
         action: ConflictAction,
     ) -> Result<Option<PathBuf>> {
         let Some(layout) = self.layout.clone() else {
-            self.mode = Mode::List;
+            self.cancel_to_list();
             return Ok(None);
         };
         match action {
             ConflictAction::Cancel => {
-                self.mode = Mode::List;
+                self.cancel_to_list();
                 Ok(None)
             }
             ConflictAction::GoToWorktree => {
@@ -1706,12 +1795,16 @@ impl<'a> App<'a> {
                 Ok(None)
             }
             ConflictAction::RecreateWorktree => {
+                // The base check survived the detour through the conflict menu,
+                // so the answer given on the name prompt still holds here.
+                let ff_base = self.base.as_ref().is_some_and(BaseCheck::will_ff);
                 self.start_create(
                     format!("{} {}", t::creating(), pending.dir),
                     CreateJob::Recreate {
                         dir: pending.dir.clone(),
                         branch: pending.branch.clone(),
                         base: pending.base.clone(),
+                        ff_base,
                     },
                 );
                 Ok(None)
@@ -1754,10 +1847,6 @@ pub fn branch_rank(b: &BranchRef, default: Option<&str>) -> u8 {
         BranchKind::Remote { .. } => 2,
     }
 }
-
-/// Ticks each worktree lingers on the spinner before it is actually removed.
-/// Gives the delete a visible, animated "working…" beat even when git is fast.
-pub const DELETE_STEPS: usize = 3;
 
 /// Score a worktree row against the query.
 ///

@@ -8,6 +8,7 @@
 //! and shown in its own column rather than inferred from the row.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -160,11 +161,13 @@ enum Mode {
         idx: usize,
         step: Step,
     },
-    /// Removing or applying touches every worktree, so it gets a spinner too.
+    /// Removing or applying touches every worktree, so it runs on a worker and
+    /// gets a spinner. A recipe with a dozen worktrees under it is not a
+    /// frame's worth of work, and the spinner has to keep turning while it is.
     Working {
         label: String,
         frame: usize,
-        job: Job,
+        rx: Receiver<std::result::Result<String, String>>,
     },
     Message {
         text: String,
@@ -301,67 +304,34 @@ impl App {
     }
 
     fn start(&mut self, label: String, job: Job) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let layout = self.layout.clone();
+        std::thread::spawn(move || {
+            // A closed channel means the manager is gone; the work is already
+            // done by then either way.
+            let _ = tx.send(run_job(&layout, job));
+        });
         self.mode = Mode::Working {
             label,
             frame: 0,
-            job,
+            rx,
         };
     }
 
-    /// One spinner beat, then run the job. These are local filesystem walks over
-    /// a handful of worktrees, so a single blocking beat is honest and simple.
+    /// Advance the spinner and take the worker's answer if it has landed.
     fn tick_work(&mut self) {
-        let (frame_no, ()) = match &mut self.mode {
-            Mode::Working { frame, .. } => {
+        let outcome = match &mut self.mode {
+            Mode::Working { frame, rx, .. } => {
                 *frame = frame.wrapping_add(1);
-                (*frame, ())
+                match rx.try_recv() {
+                    Ok(res) => res,
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        Err("the task ended unexpectedly".to_string())
+                    }
+                }
             }
             _ => return,
-        };
-        if frame_no < 2 {
-            return;
-        }
-        let Mode::Working { job, .. } = &self.mode else {
-            return;
-        };
-        let outcome = match job {
-            Job::Add(step) => ops::sync_add(&self.layout, step.clone())
-                .map(|r| added_message(&r))
-                .map_err(|e| e.to_string()),
-            Job::Replace(idx, step) => ops::sync_replace_at(&self.layout, *idx, step.clone())
-                .map_err(|e| e.to_string())
-                .and_then(|opt| match opt {
-                    None => Err(t::sync_no_entry(&step.subject_line())),
-                    Some(r) => Ok(added_message(&r)),
-                }),
-            Job::Remove(idx) => ops::sync_remove_at(&self.layout, *idx)
-                .map_err(|e| e.to_string())
-                .and_then(|opt| match opt {
-                    None => Err(t::sync_no_entry("")),
-                    Some(r) => {
-                        let removed = r
-                            .unlinked
-                            .iter()
-                            .filter(|(_, o)| *o == UnlinkOutcome::Removed)
-                            .count();
-                        let kept: Vec<String> = r
-                            .unlinked
-                            .iter()
-                            .filter(|(_, o)| matches!(o, UnlinkOutcome::Kept { .. }))
-                            .map(|(p, _)| name_of(p))
-                            .collect();
-                        let mut msg = t::sync_removed(&r.step.subject_line(), removed);
-                        if !kept.is_empty() {
-                            // A real file where the link was is worth naming.
-                            msg.push_str(&t::sync_kept_real(&kept.join(", ")));
-                        }
-                        Ok(msg)
-                    }
-                }),
-            // The manager repairs files; it does not re-run anyone's build.
-            Job::Apply => ops::sync_apply(&self.layout, Phase::Apply, &mut sync::noop)
-                .map(|v| t::sync_applied_to(v.len()))
-                .map_err(|e| e.to_string()),
         };
         let _ = self.reload();
         self.mode = match outcome {
@@ -1266,6 +1236,55 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+}
+
+/// One manager job, run away from the draw loop.
+///
+/// `apply` and `remove` touch every worktree the recipe covers; `add` can seed
+/// a build cache. None of that belongs on the thread that answers the keyboard.
+fn run_job(layout: &BareLayout, job: Job) -> std::result::Result<String, String> {
+    match job {
+        Job::Add(step) => ops::sync_add(layout, step)
+            .map(|r| added_message(&r))
+            .map_err(|e| e.to_string()),
+        Job::Replace(idx, step) => {
+            let subject = step.subject_line();
+            ops::sync_replace_at(layout, idx, step)
+                .map_err(|e| e.to_string())
+                .and_then(|opt| match opt {
+                    None => Err(t::sync_no_entry(&subject)),
+                    Some(r) => Ok(added_message(&r)),
+                })
+        }
+        Job::Remove(idx) => ops::sync_remove_at(layout, idx)
+            .map_err(|e| e.to_string())
+            .and_then(|opt| match opt {
+                None => Err(t::sync_no_entry("")),
+                Some(r) => {
+                    let removed = r
+                        .unlinked
+                        .iter()
+                        .filter(|(_, o)| *o == UnlinkOutcome::Removed)
+                        .count();
+                    let kept: Vec<String> = r
+                        .unlinked
+                        .iter()
+                        .filter(|(_, o)| matches!(o, UnlinkOutcome::Kept { .. }))
+                        .map(|(p, _)| name_of(p))
+                        .collect();
+                    let mut msg = t::sync_removed(&r.step.subject_line(), removed);
+                    if !kept.is_empty() {
+                        // A real file where the link was is worth naming.
+                        msg.push_str(&t::sync_kept_real(&kept.join(", ")));
+                    }
+                    Ok(msg)
+                }
+            }),
+        // The manager repairs files; it does not re-run anyone's build.
+        Job::Apply => ops::sync_apply(layout, Phase::Apply, &mut sync::noop)
+            .map(|v| t::sync_applied_to(v.len()))
+            .map_err(|e| e.to_string()),
     }
 }
 
