@@ -9,28 +9,41 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::background::Pending;
 use crate::term::{enter_fullscreen, leave_fullscreen};
 
 pub fn run_display(repo: &Repo, refresh_every: Duration) -> Result<()> {
     let mut term = enter_fullscreen()?;
     let result = (|| -> Result<()> {
-        let mut last = Instant::now() - refresh_every;
         let mut worktrees: Vec<Worktree> = Vec::new();
         let mut error: Option<String> = None;
+        // The refresh is a git call, and a git call in the draw loop is a
+        // dashboard that stops answering the keyboard every time it updates.
+        // It runs on a worker instead; the frame draws the last answer until
+        // the next one lands.
+        let mut listing = spawn_list(repo);
+        let mut last = Instant::now();
         loop {
-            if last.elapsed() >= refresh_every {
-                match repo.list_worktrees() {
-                    Ok(v) => {
-                        worktrees = v;
+            if listing.poll() {
+                match listing.get() {
+                    Some(Ok(v)) => {
+                        worktrees = v.clone();
                         error = None;
                     }
-                    Err(e) => error = Some(e.to_string()),
+                    Some(Err(e)) => error = Some(e.clone()),
+                    None => {}
                 }
                 last = Instant::now();
             }
+            if !listing.is_pending() && last.elapsed() >= refresh_every {
+                listing = spawn_list(repo);
+            }
             term.draw(|f| draw(f, repo, &worktrees, error.as_deref()))?;
 
-            if event::poll(Duration::from_millis(200))? {
+            // Look up often while an answer is in flight, and settle back to a
+            // quiet idle once it has landed.
+            let idle = if listing.is_pending() { 10 } else { 200 };
+            if event::poll(Duration::from_millis(idle))? {
                 if let Event::Key(k) = event::read()? {
                     if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
                         return Ok(());
@@ -41,6 +54,11 @@ pub fn run_display(repo: &Repo, refresh_every: Duration) -> Result<()> {
     })();
     leave_fullscreen(&mut term)?;
     result
+}
+
+fn spawn_list(repo: &Repo) -> Pending<std::result::Result<Vec<Worktree>, String>> {
+    let repo = repo.clone();
+    Pending::start(move || repo.list_worktrees().map_err(|e| e.to_string()))
 }
 
 fn draw(f: &mut Frame, repo: &Repo, worktrees: &[Worktree], error: Option<&str>) {

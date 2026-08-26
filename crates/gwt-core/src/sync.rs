@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use crate::cache::{self, BindOutcome, CacheMode, CacheStep};
 use crate::error::{Error, Result};
 use crate::layout::{strip_slash, BareLayout};
+use crate::shell::{self, Shell};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -98,6 +99,11 @@ pub struct RunStep {
     pub timeout: Duration,
     /// Working directory, relative to the worktree root. Defaults to its root.
     pub dir: Option<String>,
+    /// Which shell runs it. The default starts the user's own, the way their
+    /// terminal starts it, so a directory that pins its toolchain with rbenv,
+    /// nvm, asdf or mise behaves the way it does when they type the command
+    /// themselves. See [`crate::shell`].
+    pub shell: Shell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,12 +437,17 @@ fn step_from_table(idx: usize, t: &toml_edit::Table) -> Result<Step> {
                     parse_timeout(&s).ok_or_else(|| at("`timeout` looks like 30s, 10m or 1h"))?
                 }
             };
+            let shell = match string("shell") {
+                None => Shell::default(),
+                Some(s) => Shell::parse(&s).unwrap_or_default(),
+            };
             Ok(Step::Run(RunStep {
                 cmd,
                 when,
                 only_if: string("only_if"),
                 timeout,
                 dir: string("dir"),
+                shell,
             }))
         }
         "cache" => {
@@ -681,7 +692,7 @@ fn write_step(t: &mut toml_edit::Table, step: &Step) {
     let keep: &[&str] = match step {
         Step::Link(_) => &["type", "src", "dst"],
         Step::Copy(_) => &["type", "src", "dst", "overwrite", "render"],
-        Step::Run(_) => &["type", "cmd", "when", "only_if", "timeout", "dir"],
+        Step::Run(_) => &["type", "cmd", "when", "only_if", "timeout", "dir", "shell"],
         Step::Cache(_) => &["type", "path", "mode", "key", "seed", "env"],
     };
     let stale: Vec<String> = t
@@ -724,6 +735,13 @@ fn write_step(t: &mut toml_edit::Table, step: &Step) {
                 None => {
                     t.remove("dir");
                 }
+            }
+            // Only spelled out when it is not the default: a recipe should read
+            // as the list of things somebody decided, not as a form.
+            if s.shell.is_default() {
+                t.remove("shell");
+            } else {
+                t["shell"] = toml_edit::value(s.shell.as_str());
             }
         }
         Step::Cache(c) => {
@@ -836,6 +854,46 @@ impl Drop for ScreenLease {
 
 fn screen_is_free() -> bool {
     SCREEN_IS_FREE.load(Ordering::SeqCst)
+}
+
+/// Take the screen for `run` steps when gwt has one to give.
+///
+/// The plain CLI has no viewport to tear down, so if it is talking to a
+/// terminal then the terminal is already the command's for the asking — and a
+/// command that has one prints its own colours and progress, can be answered
+/// when it stops to ask, and gets an *interactive* shell (which is where
+/// `~/.zshrc` sets up rbenv and friends; see [`crate::shell`]). Piped into a
+/// file or run by CI there is nothing to hand over, so output goes back to
+/// being captured line by line.
+pub fn lease_screen_if_terminal() -> Option<ScreenLease> {
+    terminal_is_ours().then(lease_screen)
+}
+
+/// Whether gwt is attached to a terminal a command could be given.
+///
+/// Three things have to hold, and the third is the one that is easy to miss:
+/// stderr is where a command's output would land, stdin is what it would be
+/// answered from, and the terminal has to be this session's *controlling*
+/// terminal. A process detached with `setsid` can still have both of the first
+/// two and none of the third, and an interactive shell handed that combination
+/// opens by printing "cannot set terminal process group" before it runs a
+/// thing. `/dev/tty` is the same question the shell itself asks.
+fn terminal_is_ours() -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    controlling_terminal()
+}
+
+#[cfg(unix)]
+fn controlling_terminal() -> bool {
+    fs::File::open("/dev/tty").is_ok()
+}
+
+#[cfg(windows)]
+fn controlling_terminal() -> bool {
+    true
 }
 
 /// Whether applying the recipe in `phase` would run a command — the question
@@ -1030,9 +1088,11 @@ fn apply_run(
         });
     }
 
-    let mut cmd = shell_command(&s.cmd);
-    cmd.current_dir(&dir)
-        .env("GWT_ROOT", &layout.root)
+    // A command that is getting the terminal can have an interactive shell;
+    // one whose output we are about to capture line by line cannot.
+    let on_screen = screen_is_free() && terminal_is_ours();
+    let mut cmd = shell_command(&s.shell, &s.cmd, &layout.root, &dir, on_screen);
+    cmd.env("GWT_ROOT", &layout.root)
         .env("GWT_WORKTREE", worktree_dir)
         .env("GWT_WORKTREE_NAME", worktree_name(worktree_dir))
         .env("GWT_BRANCH", branch_of(worktree_dir))
@@ -1191,17 +1251,33 @@ fn stderr_stdio() -> Stdio {
     }
 }
 
-#[cfg(unix)]
-fn shell_command(cmd: &str) -> Command {
-    let mut c = Command::new("sh");
-    c.arg("-c").arg(cmd);
-    c
-}
-
-#[cfg(windows)]
-fn shell_command(cmd: &str) -> Command {
-    let mut c = Command::new("cmd");
-    c.arg("/C").arg(cmd);
+/// Build the invocation for one `run` step.
+///
+/// Everything that makes a command behave the way it does when a person types
+/// it lives here: which shell it is, whether that shell reads the rc files that
+/// set up rbenv and friends, the `cd` that lets a `chpwd` hook notice where we
+/// are, and the environment left pinned to whichever project gwt was launched
+/// from. [`crate::shell`] explains why each of those matters.
+fn shell_command(shell: &Shell, cmd: &str, root: &Path, dir: &Path, on_screen: bool) -> Command {
+    let plan = shell::plan(shell, on_screen);
+    let mut c = Command::new(&plan.program);
+    c.args(&plan.args).arg(shell::script(&plan, cmd));
+    // The prologue `cd`s in from outside so the hook fires; without one, the
+    // working directory is simply where we start.
+    c.current_dir(shell::start_dir(&plan, root, dir))
+        .env(shell::STEP_DIR_VAR, dir)
+        // A marker for an rc file that wants to keep its heavier startup for
+        // the terminals a human is actually looking at.
+        .env("GWT_SYNC", "1");
+    if plan.reads_rc {
+        shell::unpin(&mut c);
+        if plan.interactive {
+            // Powerlevel10k's instant prompt paints a prompt on startup, and
+            // with the screen leased to the command that lands in the middle of
+            // its output. Nobody is going to type at this shell.
+            c.env("POWERLEVEL9K_INSTANT_PROMPT", "off");
+        }
+    }
     c
 }
 
@@ -1345,6 +1421,12 @@ timeout = "3m"
         assert_eq!(r.only_if.as_deref(), Some("package.json"));
     }
 
+    /// The plain `sh -c` form, so these tests measure the waiting and not
+    /// whatever shell the machine running them happens to prefer.
+    fn posix_command(cmd: &str) -> Command {
+        shell_command(&Shell::Posix, cmd, Path::new("."), Path::new("."), false)
+    }
+
     fn run_step(cmd: &str, timeout: Duration) -> RunStep {
         RunStep {
             cmd: cmd.into(),
@@ -1352,6 +1434,7 @@ timeout = "3m"
             only_if: None,
             timeout,
             dir: None,
+            shell: Shell::Posix,
         }
     }
 
@@ -1360,7 +1443,7 @@ timeout = "3m"
     #[test]
     fn a_command_on_the_screen_still_reports_its_exit_code() {
         let s = run_step("exit 3", Duration::from_secs(30));
-        let outcome = run_on_screen(shell_command(&s.cmd), &s).unwrap();
+        let outcome = run_on_screen(posix_command(&s.cmd), &s).unwrap();
         assert!(
             matches!(outcome, Outcome::Ran { code: 3, .. }),
             "{outcome:?}"
@@ -1377,7 +1460,7 @@ timeout = "3m"
             "sleep 5"
         };
         let s = run_step(cmd, Duration::from_millis(200));
-        let outcome = run_on_screen(shell_command(&s.cmd), &s).unwrap();
+        let outcome = run_on_screen(posix_command(&s.cmd), &s).unwrap();
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
     }
 
@@ -1466,6 +1549,7 @@ timeout = "3m"
             only_if: None,
             timeout: DEFAULT_TIMEOUT,
             dir: Some("api".into()),
+            shell: Shell::default(),
         });
         let mut table = toml_edit::Table::new();
         write_step(&mut table, &step);
@@ -1482,6 +1566,7 @@ timeout = "3m"
             only_if: None,
             timeout: DEFAULT_TIMEOUT,
             dir: None,
+            shell: Shell::default(),
         });
         assert_eq!(step.subject_line(), "set -e …");
         assert_eq!(step.cmd_lines(), 3);

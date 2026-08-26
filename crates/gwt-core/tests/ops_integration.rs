@@ -9,6 +9,7 @@ use gwt_core::cache::{self, CacheMode, CacheStep};
 use gwt_core::layout::BareLayout;
 use gwt_core::ops;
 use gwt_core::sync::{self, CopyStep, LinkStep, Phase, RunStep, Step};
+use gwt_core::Shell;
 
 /// Unique-enough scratch dir without pulling in a tempdir crate.
 fn scratch(tag: &str) -> PathBuf {
@@ -530,6 +531,9 @@ fn a_run_step_fires_on_create_but_not_on_a_plain_apply() {
             only_if: None,
             timeout: std::time::Duration::from_secs(30),
             dir: None,
+            // Pinned to `sh -c`: these prove when a step runs and where,
+            // not which shell runs it.
+            shell: Shell::Posix,
         }),
     )
     .unwrap();
@@ -570,6 +574,9 @@ fn reordering_the_recipe_reorders_what_runs() {
             only_if: None,
             timeout: std::time::Duration::from_secs(30),
             dir: None,
+            // Pinned to `sh -c`: these prove when a step runs and where,
+            // not which shell runs it.
+            shell: Shell::Posix,
         })
     };
     ops::sync_add(&layout, echo("one")).unwrap();
@@ -655,6 +662,9 @@ fn a_multi_line_command_runs_as_one_script_in_the_directory_it_names() {
         only_if: None,
         timeout: std::time::Duration::from_secs(30),
         dir: Some("sub".into()),
+        // Pinned to `sh -c`: these prove when a step runs and where,
+        // not which shell runs it.
+        shell: Shell::Posix,
     });
     ops::sync_add(&layout, step.clone()).unwrap();
 
@@ -692,6 +702,9 @@ fn a_failing_run_step_is_reported_without_destroying_the_worktree() {
             only_if: None,
             timeout: std::time::Duration::from_secs(30),
             dir: None,
+            // Pinned to `sh -c`: these prove when a step runs and where,
+            // not which shell runs it.
+            shell: Shell::Posix,
         }),
     )
     .unwrap();
@@ -1058,4 +1071,105 @@ fn cache_data_never_lands_inside_a_worktree() {
         "{target:?} should be under .gwt/cache"
     );
     assert!(!target.starts_with(&a), "and not inside the worktree");
+}
+
+/// The bug this whole `shell` business exists for.
+///
+/// A directory that pins its toolchain — rbenv, nodenv, nvm, asdf, mise — does
+/// it from an *interactive* rc file, so `sh -c "bundle install"` gets a PATH
+/// with no shims on it and fails with "command not found", while the very same
+/// line typed into the very same directory works. The recipe has to run the
+/// command the way a person runs it: their shell, their rc, their hooks.
+///
+/// A private `--rcfile` stands in for `~/.bashrc` so the test proves the
+/// mechanism without depending on the machine it runs on.
+#[test]
+#[cfg(unix)]
+fn a_command_is_run_by_a_shell_that_read_the_users_rc() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return; // Nothing to reproduce a shell rc with.
+    }
+    let (_origin, layout) = fixture("run-rc");
+
+    // The "toolchain": a command that exists only for a shell whose rc put it
+    // on PATH — exactly the shape of an rbenv shim directory.
+    let bin = layout.root.join("toolchain");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("fake-bundle");
+    std::fs::write(&shim, "#!/bin/sh\npwd\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(&rc, format!("export PATH=\"{}:$PATH\"\n", bin.display())).unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            cmd: "fake-bundle > ran.txt".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(30),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    let ran = std::fs::read_to_string(wt.join("ran.txt")).expect(
+        "the command found nothing to run: the shell never read the rc that sets up the toolchain",
+    );
+    // And it ran in the worktree — the prologue's `cd` is what puts it there,
+    // and what gives a chpwd hook (direnv, mise) something to fire on.
+    assert!(
+        same_path(Path::new(ran.trim()), &wt),
+        "the command ran in {ran:?}, not in the worktree at {}",
+        wt.display()
+    );
+}
+
+/// The environment a `bundle exec` or an activated virtualenv leaves behind
+/// points at whatever project gwt was launched from, and it outranks the
+/// `.ruby-version` sitting in the worktree being set up. A person opening a new
+/// terminal never sees it, so neither should the recipe.
+#[test]
+#[cfg(unix)]
+fn an_activation_from_another_project_does_not_follow_the_command_in() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return;
+    }
+    let (_origin, layout) = fixture("run-unpin");
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(&rc, "\n").unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            cmd: "echo \"[${BUNDLE_GEMFILE-}][${RUBYOPT-}]\" > ran.txt".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(30),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    // Stand in for a gwt launched from inside another project's bundle.
+    std::env::set_var("BUNDLE_GEMFILE", "/somewhere/else/Gemfile");
+    std::env::set_var("RUBYOPT", "-rbundler/setup");
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop);
+    std::env::remove_var("BUNDLE_GEMFILE");
+    std::env::remove_var("RUBYOPT");
+
+    let ran = std::fs::read_to_string(wt.unwrap().join("ran.txt")).unwrap();
+    assert_eq!(
+        ran.trim(),
+        "[][]",
+        "another project's bundle followed the command into this worktree"
+    );
 }

@@ -236,6 +236,7 @@ pub mod t {
                           "bare リポジトリには同期するブランチがありません";
         name_required => "name is required", "名前を入力してください";
         nothing_to_create => "nothing to create", "作成対象がありません";
+        loading_branches => "reading branches…", "ブランチを読み込み中…";
     }}
 
     // ---- sync manager -----------------------------------------------------

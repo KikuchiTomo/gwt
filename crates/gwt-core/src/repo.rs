@@ -13,16 +13,35 @@ pub struct Repo {
 
 impl Repo {
     pub fn discover(cwd: &Path) -> Result<Self> {
-        let common_dir = git::run(cwd, ["rev-parse", "--git-common-dir"])
-            .map_err(|_| Error::NotARepo(cwd.to_path_buf()))?
-            .trim()
-            .to_string();
+        // `rev-parse` answers as many questions as it is asked, one line each,
+        // and the picker cannot draw anything until both are answered — so ask
+        // once. Inside a bare checkout `--show-toplevel` fails, and it fails
+        // for the whole command, which is what the second attempt is for.
+        let both = git::run(cwd, ["rev-parse", "--git-common-dir", "--show-toplevel"]);
+        let (common, top) = match &both {
+            Ok(raw) => {
+                let mut lines = raw.lines();
+                (lines.next(), lines.next())
+            }
+            Err(_) => (None, None),
+        };
+        let common_dir = match common {
+            Some(c) => c.trim().to_string(),
+            None => git::run(cwd, ["rev-parse", "--git-common-dir"])
+                .map_err(|_| Error::NotARepo(cwd.to_path_buf()))?
+                .trim()
+                .to_string(),
+        };
         let common_dir = absolutize(cwd, Path::new(&common_dir));
 
-        // Inside a bare checkout `--show-toplevel` fails; treat as no worktree.
-        let current_worktree = git::run(cwd, ["rev-parse", "--show-toplevel"])
-            .ok()
-            .map(|s| PathBuf::from(s.trim()));
+        // Inside a bare checkout there is no worktree to be standing in.
+        let current_worktree = match top {
+            Some(t) => Some(PathBuf::from(t.trim())),
+            None if both.is_ok() => None,
+            None => git::run(cwd, ["rev-parse", "--show-toplevel"])
+                .ok()
+                .map(|s| PathBuf::from(s.trim())),
+        };
 
         Ok(Self {
             cwd: cwd.to_path_buf(),

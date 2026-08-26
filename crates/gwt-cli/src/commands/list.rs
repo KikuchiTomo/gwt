@@ -1,6 +1,6 @@
 use anyhow::Result;
 use gwt_core::layout::BareLayout;
-use gwt_core::status::{ahead_behind, dirty_count, stash_map, AheadBehind};
+use gwt_core::status::{self, AheadBehind, WorktreeMetrics};
 use gwt_core::worktree::WorktreeStatus;
 use gwt_core::Repo;
 
@@ -26,39 +26,44 @@ struct Row {
 pub fn run(layout: &BareLayout) -> Result<()> {
     let repo = Repo::discover(&layout.root)?;
     let worktrees = repo.list_worktrees()?;
-    let stashes = stash_map(layout).unwrap_or_default();
+    let visible: Vec<_> = worktrees
+        .iter()
+        .filter(|w| w.status != WorktreeStatus::Bare && w.path != layout.root)
+        .collect();
+
+    // Every row costs a `git status` and a `rev-list`, and they wait on the
+    // filesystem rather than on us — so they run together. On a repo with a
+    // dozen worktrees that is the difference between a table that appears and
+    // one you watch being built.
+    let targets: Vec<status::Target> = visible
+        .iter()
+        .map(|w| {
+            let branch = w.short_branch();
+            // ahead/behind only makes sense for a real branch, not a detached
+            // HEAD, which reads as "(abc1234)".
+            let named = (!branch.starts_with('(')).then_some(branch);
+            (w.path.clone(), named)
+        })
+        .collect();
+    let mut metrics = vec![WorktreeMetrics::default(); targets.len()];
+    for (i, m) in status::spawn(layout, targets) {
+        if let Some(slot) = metrics.get_mut(i) {
+            *slot = m;
+        }
+    }
 
     let mut rows = Vec::new();
-    for w in &worktrees {
-        if w.status == WorktreeStatus::Bare || w.path == layout.root {
-            continue;
-        }
-        let branch = w.short_branch();
-        let branch_for_remote = w.branch.as_ref().and_then(|_| {
-            // ahead/behind only makes sense for an actual branch ref, not detached HEAD.
-            if branch.starts_with('(') {
-                None
-            } else {
-                Some(branch.as_str())
-            }
-        });
-        let ab = branch_for_remote.and_then(|b| ahead_behind(layout, b).ok().flatten());
-        let (remote_plain, remote) = format_remote(ab);
-        let dirty_n = dirty_count(&w.path).ok();
-        let (dirty_plain, dirty) = format_dirty(dirty_n);
-        let stash = stashes
-            .get(branch.as_str())
-            .copied()
-            .unwrap_or(0)
-            .to_string();
+    for (w, m) in visible.iter().zip(metrics) {
+        let (remote_plain, remote) = format_remote(m.ahead_behind);
+        let (dirty_plain, dirty) = format_dirty(m.dirty);
         rows.push(Row {
             name: w.name(),
-            branch,
+            branch: w.short_branch(),
             remote,
             remote_plain,
             dirty,
             dirty_plain,
-            stash,
+            stash: m.stash.to_string(),
         });
     }
 

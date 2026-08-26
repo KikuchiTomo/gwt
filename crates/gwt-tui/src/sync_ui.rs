@@ -959,6 +959,7 @@ impl App {
                 only_if: None,
                 timeout: DEFAULT_TIMEOUT,
                 dir,
+                shell: Default::default(),
             },
         });
         let label = t::label_linking().to_string();

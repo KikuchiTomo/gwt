@@ -4,11 +4,21 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 
-fn git_bin() -> Result<std::path::PathBuf> {
-    which::which("git").map_err(|_| Error::GitNotFound)
+/// Where `git` lives, looked up once.
+///
+/// This is called for every single git invocation, and the picker opens with a
+/// good handful of them; each `which` is a walk of every directory on `PATH`,
+/// which on a machine with a long PATH costs more than the git call it is about
+/// to make.
+fn git_bin() -> Result<&'static Path> {
+    static BIN: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| which::which("git").ok())
+        .as_deref()
+        .ok_or(Error::GitNotFound)
 }
 
 pub fn run<I, S>(cwd: &Path, args: I) -> Result<String>
