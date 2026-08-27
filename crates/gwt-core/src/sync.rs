@@ -1271,12 +1271,11 @@ fn shell_command(shell: &Shell, cmd: &str, root: &Path, dir: &Path, on_screen: b
         .env("GWT_SYNC", "1");
     if plan.reads_rc {
         shell::unpin(&mut c);
-        if plan.interactive {
-            // Powerlevel10k's instant prompt paints a prompt on startup, and
-            // with the screen leased to the command that lands in the middle of
-            // its output. Nobody is going to type at this shell.
-            c.env("POWERLEVEL9K_INSTANT_PROMPT", "off");
-        }
+        // Powerlevel10k's instant prompt paints a prompt on startup, and with
+        // the screen leased to the command that lands in the middle of its
+        // output. Nobody is going to type at this shell — and that holds for
+        // the `~/.zshrc` a login shell sources on its way in, too.
+        c.env("POWERLEVEL9K_INSTANT_PROMPT", "off");
     }
     c
 }

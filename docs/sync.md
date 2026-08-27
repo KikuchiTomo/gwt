@@ -106,8 +106,21 @@ the recipe" bug, and it is why a `run` step starts **your** shell:
 - **It `cd`s in rather than starting there**, so `chpwd` hooks fire and direnv,
   mise and the `.nvmrc` switchers get their chance to notice where they are.
 
-With no terminal in sight — a script, a git hook, CI — an interactive shell has
-nothing to be interactive on, so the login shell runs instead.
+With no terminal in sight — a script, a git hook, CI, output on its way into a
+pipe — an interactive shell has nothing to be interactive on, so a login shell
+runs instead, and it sources your interactive rc itself (`~/.zshrc`, or
+`$ZDOTDIR/.zshrc`; `~/.bashrc` for bash) before it `cd`s in. A login shell alone
+would not: zsh reads `~/.zshrc` only when it is interactive, and bash skips
+`~/.bashrc` outright — and on macOS `/etc/zprofile` runs `path_helper`, which
+pushes the rbenv shims we inherited *behind* `/usr/bin`. That combination is how
+`bundle install` ends up as `/usr/bin/bundle` on the system Ruby, failing with
+
+```
+Could not find 'bundler' (2.5.6) required by your Gemfile.lock.
+```
+
+while the same line typed in the same directory works. Whatever the rc prints on
+its way through is dropped, so it cannot get mixed into the step's own output.
 
 Per step, `shell` says otherwise:
 
