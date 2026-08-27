@@ -230,6 +230,51 @@ fn user_shell(wants_interactive_rc: bool, terminal: bool) -> Plan {
     )
 }
 
+/// A shell we know how to start the way a terminal would.
+#[cfg(not(windows))]
+struct Known {
+    /// The file name `$SHELL` ends in.
+    name: &'static str,
+    dialect: Dialect,
+    /// The rc it reads *only* when interactive, written as a shell word for
+    /// the prologue to expand — a login shell standing in for an interactive
+    /// one has to source this itself. `None` for a shell that reads its config
+    /// either way and so misses nothing.
+    interactive_rc: Option<&'static str>,
+}
+
+/// Every shell whose rc files are worth reading, and everything that differs
+/// between them, in one place: which dialect its prologue is written in and
+/// which rc a login shell of its own would skip are the same piece of
+/// knowledge, and splitting them across two `match`es is how they drift.
+#[cfg(not(windows))]
+const KNOWN: &[Known] = &[
+    Known {
+        name: "zsh",
+        dialect: Dialect::Posix,
+        // `~/.zshenv` is allowed to move it, and it runs before we could look.
+        interactive_rc: Some("${ZDOTDIR:-$HOME}/.zshrc"),
+    },
+    Known {
+        name: "bash",
+        dialect: Dialect::Posix,
+        interactive_rc: Some("$HOME/.bashrc"),
+    },
+    Known {
+        name: "fish",
+        dialect: Dialect::Fish,
+        // fish reads config.fish whether or not it is interactive.
+        interactive_rc: None,
+    },
+];
+
+#[cfg(not(windows))]
+impl Known {
+    fn named(name: &str) -> Option<&'static Known> {
+        KNOWN.iter().find(|k| k.name == name)
+    }
+}
+
 /// The flags that start `raw` the way a terminal would.
 ///
 /// `wants_interactive_rc` is the difference between [`Shell::Auto`], which is
@@ -242,14 +287,11 @@ fn flags_for(raw: &OsStr, wants_interactive_rc: bool, terminal: bool) -> Plan {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // Only the shells whose rc files are worth reading, and that we know how to
-    // ask for one. Anything else — /bin/sh, dash, a login shell set to
+    // Anything we do not know — /bin/sh, dash, a login shell set to
     // /usr/sbin/nologin — has no interactive setup to reproduce, so the plain
     // POSIX invocation is both faithful and safer.
-    let (dialect, rc) = match name.as_str() {
-        "bash" | "zsh" => (Dialect::Posix, true),
-        "fish" => (Dialect::Fish, true),
-        _ => return posix_plan(),
+    let Some(known) = Known::named(&name) else {
+        return posix_plan();
     };
     // Which rc files run is decided by exactly these two flags, and `-l` is not
     // simply "more": bash *skips* ~/.bashrc for a login shell, which is where
@@ -270,27 +312,15 @@ fn flags_for(raw: &OsStr, wants_interactive_rc: bool, terminal: bool) -> Plan {
     Plan {
         program: raw.to_os_string(),
         args,
-        dialect,
-        reads_rc: rc,
+        dialect: known.dialect,
+        reads_rc: true,
         interactive,
         // The login shell is standing in for an interactive one, so it has to
         // read what one would have read.
         source_rc: (wants_interactive_rc && !interactive)
-            .then(|| interactive_rc(&name))
-            .flatten(),
-    }
-}
-
-/// Where the shell keeps the rc it reads only when interactive.
-///
-/// fish is absent on purpose: it reads `config.fish` whether or not it is
-/// interactive, so there is nothing a login shell of its own would miss.
-#[cfg(not(windows))]
-fn interactive_rc(name: &str) -> Option<String> {
-    match name {
-        "zsh" => Some("${ZDOTDIR:-$HOME}/.zshrc".into()),
-        "bash" => Some("$HOME/.bashrc".into()),
-        _ => None,
+            .then_some(known.interactive_rc)
+            .flatten()
+            .map(str::to_string),
     }
 }
 
