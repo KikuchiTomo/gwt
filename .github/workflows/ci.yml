@@ -63,3 +63,13 @@ jobs:
             python3 .github/scripts/picker_pty_test.py --bin target/debug/git-wt --shell "$shell"
             python3 .github/scripts/picker_pty_test.py --bin target/debug/git-wt --shell "$shell" --hostile
           done
+      # The other half of the same problem: a `run` step has to find the
+      # toolchain the user's rc sets up even when there is no terminal for the
+      # shell to be interactive on. Which rc a shell reads is not something a
+      # Rust test can assert, and on macOS `path_helper` is in there too.
+      - name: run a recipe with no terminal in sight
+        run: |
+          set -euo pipefail
+          for shell in zsh bash; do
+            python3 .github/scripts/sync_rc_test.py --bin target/debug/git-wt --shell "$shell"
+          done
