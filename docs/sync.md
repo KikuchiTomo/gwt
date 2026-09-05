@@ -106,12 +106,9 @@ the recipe" bug, and it is why a `run` step starts **your** shell:
 - **It `cd`s in rather than starting there**, so `chpwd` hooks fire and direnv,
   mise and the `.nvmrc` switchers get their chance to notice where they are.
 
-With no terminal in sight — a script, a git hook, CI, output on its way into a
-pipe — the step gets a terminal of its own to be interactive on, so all of the
-above stays true. This matters more than it sounds: a shell will not simply take
-your word for it. `bash -i` on a pipe opens by printing `no job control in this
-shell`, `zsh -i` complains twice about `zle`, and the rc files ask the question
-directly and believe the answer — the stock Debian `~/.bashrc` opens with
+This holds with no terminal in sight — a script, a git hook, CI, output on its
+way into a pipe. The rc files decide what to set up by asking whether the shell
+is interactive, and the stock Debian `~/.bashrc` opens with
 
 ```sh
 case $- in
@@ -120,17 +117,24 @@ case $- in
 esac
 ```
 
-and returns before a single line of rbenv, nvm or asdf setup has run. On a
-terminal there is nothing to argue about: the shell is interactive because it is.
+which returns before a single line of rbenv, nvm or asdf setup has run. `-i` is
+what answers that question, and it needs no terminal to do it.
 
-Two shells still will not reach the interactive rc even then, and for those the
-rc is sourced explicitly before the `cd`: bash started as a login shell, which
-is what macOS terminals do, reads `~/.bash_profile` and never `~/.bashrc`; and
-on Windows, where there is no terminal to hand out, a login shell stands in and
-zsh would read `~/.zshrc` only when interactive. Left alone, that is how
-`bundle install` ends up as `/usr/bin/bundle` on the system Ruby — on macOS
-`/etc/zprofile` runs `path_helper` and pushes the shims you inherited *behind*
-`/usr/bin` — failing with
+Deliberately *no* terminal, in fact. A shell with one is interactive in the
+fuller sense — free to stop and ask you something — and on a fresh Ubuntu that
+is not hypothetical: `/etc/zsh/zshrc` runs `compinit`, `compinit` dislikes a
+completion directory, and it stops on `Ignore insecure directories and continue
+[y] or abort compinit [n]?` waiting for a keystroke that is never coming. With
+no terminal the same prompt cannot be asked, zsh says so and carries on, and the
+step runs. Nothing reads from stdin either, so a command that stops to ask gets
+end-of-file at once and takes its default, the way it would in any script.
+
+One shell still will not reach the interactive rc: bash started as a *login*
+shell reads `~/.bash_profile` and never `~/.bashrc`, however interactive it is —
+and a login shell is what macOS terminals start. So `~/.bashrc` is sourced for
+it, before the `cd`. Left alone, that is how `bundle install` ends up as
+`/usr/bin/bundle` on the system Ruby — `/etc/zprofile` runs `path_helper` and
+pushes the shims you inherited *behind* `/usr/bin` — failing with
 
 ```
 Could not find 'bundler' (2.5.6) required by your Gemfile.lock.
@@ -139,11 +143,9 @@ Could not find 'bundler' (2.5.6) required by your Gemfile.lock.
 while the same line typed in the same directory works.
 
 Whatever your shell says on its way in and out — an rc that echoes something, a
-message of the day, a login shell's parting word from `~/.zlogout` — is kept out
-of the step's output, which is the command's and nothing else. Nothing reads
-from the step's stdin either: a command that stops to ask a question gets
-end-of-file at once and carries on with its default, rather than waiting out the
-timeout for an answer nobody is there to give.
+message of the day, the note an interactive shell makes about the terminal it
+could not find, a login shell's parting word from `~/.zlogout` — is kept out of
+the step's output, which is the command's and nothing else.
 
 Per step, `shell` says otherwise:
 

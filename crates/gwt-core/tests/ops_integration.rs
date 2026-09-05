@@ -1218,10 +1218,10 @@ fn an_interactive_only_rc_still_sets_up_the_toolchain_with_no_terminal_in_sight(
     ops::sync_add(
         &layout,
         Step::Run(RunStep {
-            // Both halves of the answer: the toolchain the rc was supposed to
-            // set up, and the terminal that is the reason it ran at all. Only
-            // the `echo` is ever redirected — `[ -t 1 ]` inside a redirected
-            // group would be asking about the file, not about the terminal.
+            // Both halves of the bargain: the toolchain the rc sets up, and
+            // the absence of the terminal that would let a shell stop and ask
+            // for something. Only the `echo` is redirected — `[ -t 1 ]` inside
+            // a redirected group would be asking about the file.
             cmd: "fake-bundle > ran.txt 2>&1\nif [ -t 1 ]; then echo on-a-terminal >> ran.txt; else echo no-terminal >> ran.txt; fi"
                 .into(),
             when: vec![Phase::Create],
@@ -1241,14 +1241,15 @@ fn an_interactive_only_rc_still_sets_up_the_toolchain_with_no_terminal_in_sight(
         Some("the-right-bundle"),
         "the rc returned early, so the shell never believed it was interactive"
     );
-    // `-i` on the command line is enough to fool the check above, and nothing
-    // else. A `$SHELL` that gets its flags from the platform cannot be handed
-    // one, and an rc that asks the terminal directly is not fooled at all — so
-    // the terminal has to be real.
+    // And it did that without a terminal, which is the other half of the
+    // bargain. A terminal would make the shell interactive in the fuller sense
+    // — free to stop and ask, as zsh's `compinit` does about completion
+    // directories it dislikes — and there is nobody here to answer, so the step
+    // would do nothing at all until its timeout.
     assert_eq!(
         lines.get(1).copied(),
-        Some("on-a-terminal"),
-        "the step ran with no terminal, which is what makes an rc give up"
+        Some("no-terminal"),
+        "a terminal is somewhere to be asked a question nobody is here to answer"
     );
 }
 
@@ -1294,6 +1295,51 @@ fn the_shells_own_chatter_stays_out_of_the_steps_output() {
         seen,
         vec!["the-only-line".to_string()],
         "the shell's startup and shutdown are not the step's output"
+    );
+}
+
+/// The same question, asked the way a prompt actually asks it.
+///
+/// `/dev/tty` goes to the terminal whatever stdin was pointed at, so pointing
+/// stdin at `/dev/null` is not on its own an answer. zsh's `compinit` is the
+/// one that finds this — on a machine whose completion directories look
+/// insecure it stops to ask — and a step that stops to ask here waits out its
+/// whole timeout, because nobody is at the other end and never will be.
+#[test]
+#[cfg(unix)]
+fn a_prompt_on_dev_tty_is_answered_too_rather_than_waiting_out_the_timeout() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return;
+    }
+    let (_origin, layout) = fixture("run-devtty");
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(&rc, "\n").unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            cmd: "read -r answer < /dev/tty; echo \"[${answer-}]\" > ran.txt".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(20),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the step sat on the terminal waiting for an answer nobody was going to give"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("ran.txt"))
+            .unwrap_or_default()
+            .trim(),
+        "[]"
     );
 }
 

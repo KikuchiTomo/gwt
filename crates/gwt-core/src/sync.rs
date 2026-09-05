@@ -1088,26 +1088,12 @@ fn apply_run(
         });
     }
 
-    // What this step's shell looks like when it has a terminal — which is the
-    // only way it reads the rc files that set up rbenv and friends.
-    let want = shell::plan(&s.shell, true);
+    let plan = shell::plan(&s.shell);
+    // A step that is getting the real terminal is read by the person watching
+    // it; everything else is read here, one joined stream with the shell's own
+    // startup fenced off. See [`crate::stream`].
     let on_screen = screen_is_free() && terminal_is_ours();
-    // Not getting the real terminal, but needing one: open a terminal of its
-    // own. See [`crate::pty`] — this is what makes the interactive shell above
-    // available to a script, a git hook, CI, or the manager holding the screen.
-    let pty = match on_screen || !want.interactive {
-        true => None,
-        false => open_pty(),
-    };
-    let plan = match on_screen || pty.is_some() {
-        true => want,
-        // No terminal to be had, so fall back to the login shell that sources
-        // the interactive rc itself.
-        false => shell::plan(&s.shell, false),
-    };
-    // Only the pty path can tell the shell's own noise from the command's, so
-    // it is the only one that fences the output.
-    let fence = pty.as_ref().map(|_| shell::Fence::new());
+    let fence = (!on_screen && plan.cds()).then(shell::Fence::new);
     let mut cmd = shell_command(&plan, &s.cmd, &layout.root, &dir, fence.as_ref());
     cmd.env("GWT_ROOT", &layout.root)
         .env("GWT_WORKTREE", worktree_dir)
@@ -1121,8 +1107,8 @@ fn apply_run(
         return run_on_screen(cmd, s);
     }
     #[cfg(unix)]
-    if let (Some(pty), Some(fence)) = (pty, fence) {
-        return run_on_pty(cmd, s, pty, fence, report);
+    if let Some(fence) = fence {
+        return run_captured(cmd, s, fence, report);
     }
 
     let started = Instant::now();
@@ -1236,41 +1222,44 @@ enum Pipe {
     Err(std::process::ChildStderr),
 }
 
-/// Open a terminal for a step to run on, if this platform has one to give.
-#[cfg(unix)]
-fn open_pty() -> Option<crate::pty::Pty> {
-    crate::pty::open().ok()
-}
-
-#[cfg(not(unix))]
-fn open_pty() -> Option<()> {
-    None
-}
-
-/// Run the command on a pty: a real interactive shell, with its output read
-/// back rather than shown.
+/// Run the command with its two streams joined, and read the result back.
 ///
-/// The shape is the pipe path's, with three differences that all come from the
-/// far end being a terminal instead of two pipes. There is one stream, not two,
-/// because that is what a terminal is. The bytes are terminal bytes, so
-/// [`crate::pty::Lines`] turns them back into lines. And the shell is a session
-/// leader — `setsid` is how it took the terminal — so a timeout can end the
-/// whole session rather than the shell that was waiting on it.
+/// The joining is the point: an interactive shell's own startup goes to stderr
+/// while the command's output goes to stdout, and only one stream can be
+/// fenced. Sharing a single pipe puts them in the order they happened in, so
+/// the marker the script prints before the command really does divide the two.
+/// See [`crate::stream`], which also explains why there is no terminal here.
 #[cfg(unix)]
-fn run_on_pty(
+fn run_captured(
     mut cmd: Command,
     s: &RunStep,
-    pty: crate::pty::Pty,
     fence: shell::Fence,
     report: Reporter,
 ) -> Result<Outcome> {
-    use crate::pty;
+    use crate::stream;
 
-    if let Err(e) = pty.attach(&mut cmd) {
-        return Ok(Outcome::Failed {
-            detail: e.to_string(),
-        });
-    }
+    // One pipe, two handles on its writing end: stdout and stderr both land in
+    // it, in the order the shell actually said them.
+    let reader = match stream::pipe() {
+        Ok((reader, writer)) => match writer.try_clone() {
+            Ok(second) => {
+                cmd.stdout(writer).stderr(second);
+                reader
+            }
+            Err(e) => {
+                return Ok(Outcome::Failed {
+                    detail: e.to_string(),
+                })
+            }
+        },
+        Err(e) => {
+            return Ok(Outcome::Failed {
+                detail: e.to_string(),
+            })
+        }
+    };
+    stream::detach(&mut cmd);
+
     let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1281,36 +1270,22 @@ fn run_on_pty(
         }
     };
     let pid = child.id();
-    let (mut reader, control) = match pty.split() {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(Outcome::Failed {
-                detail: e.to_string(),
-            });
-        }
-    };
+    // Ours has to go, or the read below never sees the end of anything: the
+    // pipe stays open as long as any writer does, and we are one.
+    drop(cmd);
 
-    // The read has to happen off this thread: a pty has no end-of-file until
-    // the last writer goes, and a command that has stopped making progress
-    // would otherwise take the timeout with it.
-    //
-    // And it has to keep reading to the very end, long after the closing marker
-    // has said there is nothing left worth reporting. A terminal drains before
-    // it is let go, so a shell exiting with nobody reading its pty stops
-    // half-way out — the child sits in the kernel's exit path forever, and the
-    // wait for it never returns. `Lines` throws away what arrives after the
-    // marker; the reading itself is what lets the shell finish.
+    // Off this thread, because a command that has stopped making progress would
+    // otherwise take the timeout with it.
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        let mut lines = pty::Lines::new(fence);
+        let mut reader = reader;
+        let mut lines = stream::Lines::new(fence);
         let mut buf = [0u8; 8192];
         let mut send = |l: &str| {
             let _ = tx.send(l.to_string());
         };
         loop {
-            match pty::read(&mut reader, &mut buf) {
+            match stream::read(&mut reader, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => lines.feed(&buf[..n], &mut send),
             }
@@ -1318,13 +1293,8 @@ fn run_on_pty(
         lines.finish(&mut send);
     });
 
-    // A shell that has exited is not the same as output that has all arrived:
-    // the reader is a thread behind, and the terminal can outlive the shell.
-    // So once the shell is gone we stop on the reader, or on a moment's silence.
-    const DRAIN: Duration = Duration::from_millis(250);
     let deadline = started + s.timeout;
     let mut timed_out = false;
-    let mut gone: Option<Instant> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1332,27 +1302,19 @@ fn run_on_pty(
             break;
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(line) => {
-                report(Event::Output(&line));
-                // Still talking, so the silence has not started yet.
-                gone = gone.map(|_| Instant::now());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => match gone {
-                None => {
-                    if child.try_wait()?.is_some() {
-                        gone = Some(Instant::now());
-                    }
+            Ok(line) => report(Event::Output(&line)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if child.try_wait()?.is_some() {
+                    break;
                 }
-                Some(at) if at.elapsed() >= DRAIN => break,
-                Some(_) => {}
-            },
-            // The reader saw the closing marker, or the terminal closed: either
-            // way there is nothing further to report.
+            }
+            // Every writer is gone, so there is nothing further to report.
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    // The reader can finish before the shell does, so the wait for it is still
-    // the step's timeout and not an open-ended one.
+    // The pipe closing is not the shell exiting — it still has an `exit` and,
+    // for a login shell, a logout file to get through — so this wait is bounded
+    // by the same deadline as everything else rather than being open-ended.
     let status = match timed_out {
         false => wait_by(&mut child, deadline)?,
         true => None,
@@ -1360,12 +1322,9 @@ fn run_on_pty(
     let Some(status) = status else {
         // Everything the step started shares the shell's session, so this
         // reaches the compiler it was blocked on and not just the shell.
-        control.kill_group(pid);
+        stream::kill_group(pid);
         let _ = child.kill();
-        // Bounded, because this is the path for a step that was already not
-        // behaving; a reap that hangs here would replace one stuck step with a
-        // stuck gwt.
-        let _ = wait_by(&mut child, Instant::now() + DRAIN);
+        let _ = wait_by(&mut child, Instant::now() + Duration::from_millis(250));
         return Ok(Outcome::Failed {
             detail: format!("timed out after {}", format_duration(s.timeout)),
         });
@@ -1622,7 +1581,7 @@ timeout = "3m"
     /// whatever shell the machine running them happens to prefer.
     fn posix_command(cmd: &str) -> Command {
         shell_command(
-            &shell::plan(&Shell::Posix, false),
+            &shell::plan(&Shell::Posix),
             cmd,
             Path::new("."),
             Path::new("."),
