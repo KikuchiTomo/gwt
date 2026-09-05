@@ -15,28 +15,23 @@
 //!    start the user's own `$SHELL` with the flags their terminal starts it
 //!    with: interactive, and login too where that is what terminals do.
 //!
-//!    Which leaves the question of what "interactive" means with nobody
-//!    watching — a script, a git hook, CI, output on its way into a pipe. It is
-//!    not a flag we get to assert: an rc file asks whether the shell is
-//!    interactive and believes the answer, and the stock Debian `~/.bashrc`
-//!    *returns* on the spot when it is not. So rather than argue, the step is
-//!    given a terminal of its own to be interactive on — see [`crate::pty`],
-//!    which is what makes the paragraph above true everywhere rather than only
-//!    in front of a person.
+//!    `-i` is what carries that, and it needs no terminal to do it: it is what
+//!    puts `i` in `$-` and makes `[[ -o interactive ]]` true, which is the
+//!    question the rc files actually ask. A terminal would be the fuller
+//!    answer, and it is the wrong one — see [`crate::stream`], where a shell
+//!    that can be *asked* something turns a recipe into a wait for an answer
+//!    nobody is there to give.
 //!
-//!    What is left after that is the shells that will not read the interactive
-//!    rc even so, and there are two. Where there is no pty to be had — Windows
-//!    — a *login* shell is all that remains, and a login shell is not a quieter
-//!    interactive one: zsh reads `~/.zshrc` only when it is interactive. And
-//!    bash skips `~/.bashrc` for a login shell however interactive it is, which
-//!    is not a corner case but the normal way macOS starts a terminal. Either
-//!    way `PATH` ends up without the shims, and on macOS worse than untouched,
-//!    because `/etc/zprofile` runs `path_helper` and rebuilds `PATH` with the
-//!    system directories first — so the shims we inherited move *behind*
-//!    `/usr/bin`, `bundle` becomes `/usr/bin/bundle` on the system Ruby 2.6,
-//!    and it cannot find the bundler its `Gemfile.lock` asks for. So whichever
-//!    rc the shell will not reach, the prologue sources for it — see
-//!    [`Plan::source_rc`].
+//!    What is left is the shell that will not read the interactive rc even so:
+//!    bash skips `~/.bashrc` for a login shell however interactive it is, and a
+//!    login shell is the normal way macOS starts a terminal, so this is not a
+//!    corner case there but the usual one. `PATH` then ends up without the
+//!    shims, and worse than untouched, because `/etc/zprofile` runs
+//!    `path_helper` and rebuilds `PATH` with the system directories first — so
+//!    the shims we inherited move *behind* `/usr/bin`, `bundle` becomes
+//!    `/usr/bin/bundle` on the system Ruby 2.6, and it cannot find the bundler
+//!    its `Gemfile.lock` asks for. So an rc the shell will not reach, the
+//!    prologue sources for it — see [`Plan::source_rc`].
 //!
 //! 2. **The environment was pinned to another directory.** If gwt was launched
 //!    from a shell sitting in another project — with a virtualenv activated, or
@@ -64,9 +59,8 @@ use std::process::Command;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Shell {
     /// The user's `$SHELL`, started the way their terminal starts it, so every
-    /// rc file that sets up a version manager runs. With no terminal to be
-    /// interactive on — a script, a hook, CI — the step is given one of its
-    /// own; only where that is impossible does it fall back to a login shell.
+    /// rc file that sets up a version manager runs — interactive whether or not
+    /// anyone is watching, since that is the question the rc files ask.
     #[default]
     Auto,
     /// The user's `$SHELL` as a login shell only. For a setup that lives in
@@ -182,13 +176,15 @@ pub const STEP_DIR_VAR: &str = "GWT_STEP_DIR";
 /// Two markers written around the command, so the step's output is the
 /// command's and nothing else.
 ///
-/// On a pty there is one stream, and everything the shell says on its way in
-/// and out of the session lands in the middle of it: a `~/.zshrc` that echoes
-/// which architecture it just detected, an MOTD, a version manager announcing
-/// itself, and — because a login shell runs `~/.zlogout` on the way out —
-/// prezto's parting fortune, printed *after* the command has finished. None of
-/// that is the step's output, and a log that opens with "So long and thanks for
-/// all the fish" is a log nobody reads twice.
+/// A step's two streams are read as one (see [`crate::stream`]), and everything
+/// the shell says on its way in and out of the session lands in the middle of
+/// it: a `~/.zshrc` that echoes which architecture it just detected, an MOTD, a
+/// version manager announcing itself, the complaints an interactive shell makes
+/// about the terminal it could not find, and — because a login shell runs
+/// `~/.zlogout` on the way out — prezto's parting fortune, printed *after* the
+/// command has finished. None of that is the step's output, and a log that
+/// opens with "So long and thanks for all the fish" is a log nobody reads
+/// twice.
 ///
 /// So the script says where the command starts and where it ends, and the
 /// reader keeps what is between. The nonce is what keeps a command that happens
@@ -233,20 +229,18 @@ impl Default for Fence {
 
 /// Resolve which shell to start.
 ///
-/// `interactive_ok` says whether the command is getting a terminal — the real
-/// one, or a pty opened for it. An interactive shell without either is not just
-/// pointless: bash opens it by printing "cannot set terminal process group" and
-/// "no job control in this shell", straight into the middle of the output the
-/// step is there to produce. Only then is the login shell what runs.
+/// [`Shell::Auto`] is after everything a terminal would have set up, so it asks
+/// for the interactive rc; [`Shell::Login`] asked for the login rc on purpose
+/// and gets that and no more.
 ///
 /// `$GWT_SYNC_SHELL` overrides [`Shell::Auto`] only: a step that names a shell
 /// has a reason to, and a machine-wide preference must not silently hand a
 /// POSIX script to fish.
-pub fn plan(shell: &Shell, interactive_ok: bool) -> Plan {
+pub fn plan(shell: &Shell) -> Plan {
     match shell {
         Shell::Auto | Shell::Login => match env_override() {
-            Some(s) if *shell == Shell::Auto => plan(&s, interactive_ok),
-            _ => user_shell(*shell == Shell::Auto, interactive_ok),
+            Some(s) if *shell == Shell::Auto => plan(&s),
+            _ => user_shell(*shell == Shell::Auto),
         },
         Shell::Posix => posix_plan(),
         // Spelled out by hand, so it is taken at its word — `-i` included.
@@ -284,18 +278,17 @@ fn posix_plan() -> Plan {
 
 /// `$SHELL`, started the way a terminal starts it.
 #[cfg(windows)]
-fn user_shell(_wants_interactive_rc: bool, _terminal: bool) -> Plan {
+fn user_shell(_wants_interactive_rc: bool) -> Plan {
     // Windows has no login/interactive rc for the shell a recipe would use, so
     // there is nothing to reproduce: `cmd /C` *is* the faithful answer.
     posix_plan()
 }
 
 #[cfg(not(windows))]
-fn user_shell(wants_interactive_rc: bool, terminal: bool) -> Plan {
+fn user_shell(wants_interactive_rc: bool) -> Plan {
     flags_for(
         &std::env::var_os("SHELL").unwrap_or_default(),
         wants_interactive_rc,
-        terminal,
     )
 }
 
@@ -363,7 +356,7 @@ impl Known {
 /// for the login rc on purpose. `terminal` is whether there is one to be
 /// interactive on.
 #[cfg(not(windows))]
-fn flags_for(raw: &OsStr, wants_interactive_rc: bool, terminal: bool) -> Plan {
+fn flags_for(raw: &OsStr, wants_interactive_rc: bool) -> Plan {
     let name = Path::new(raw)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -380,7 +373,7 @@ fn flags_for(raw: &OsStr, wants_interactive_rc: bool, terminal: bool) -> Plan {
     // terminals actually start — a login shell on macOS, a plain interactive
     // one elsewhere. With no terminal to be interactive on, a login shell is
     // what we fall back to.
-    let interactive = wants_interactive_rc && terminal;
+    let interactive = wants_interactive_rc;
     let login = !interactive || cfg!(target_os = "macos");
     let mut args: Vec<OsString> = Vec::with_capacity(3);
     if login {
@@ -494,10 +487,9 @@ pub fn script(plan: &Plan, cmd: &str, fence: Option<&Fence>) -> String {
     let mut s = String::new();
     match plan.dialect {
         Dialect::Posix => {
-            // Job control puts the command in a process group of its own, where
-            // a killed shell leaves it running — and on a pty job control is
-            // real, so this is no longer hypothetical. Off, everything the step
-            // started shares one group and the timeout can end all of it.
+            // Job control would put the command in a process group of its
+            // own, where a killed shell leaves it running. Off, everything the
+            // step started shares one group and the timeout can end all of it.
             if plan.interactive {
                 s.push_str("set +m 2>/dev/null\n");
             }
@@ -704,7 +696,7 @@ mod tests {
 
     #[test]
     fn posix_is_the_old_behaviour_exactly() {
-        let p = plan(&Shell::Posix, true);
+        let p = plan(&Shell::Posix);
         assert!(!p.reads_rc, "sh -c reads no rc, so nothing may be stripped");
         assert_eq!(
             script(&p, "npm ci", None),
@@ -726,14 +718,15 @@ mod tests {
     }
 
     /// `-l` is not "more rc": bash skips ~/.bashrc for a login shell, and that
-    /// is exactly where Linux puts rbenv, nvm and asdf. So the flags follow the
-    /// platform, and an interactive shell is only asked for when there is a
-    /// terminal for it to be interactive on.
+    /// is exactly where Linux puts rbenv, nvm and asdf. So the flags follow
+    /// what the platform's own terminals start, and nothing else — there is no
+    /// quieter variant to fall back to, because `-i` needs no terminal to make
+    /// a shell interactive.
     #[test]
     #[cfg(not(windows))]
-    fn the_flags_follow_the_platform_and_the_terminal() {
-        let flags = |sh: &str, terminal: bool| {
-            flags_for(OsStr::new(sh), true, terminal)
+    fn the_flags_follow_the_platform() {
+        let flags = |sh: &str| {
+            flags_for(OsStr::new(sh), true)
                 .args
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -744,25 +737,26 @@ mod tests {
         } else {
             vec!["-i", "-c"]
         };
-        assert_eq!(flags("/bin/zsh", true), want);
-        // No terminal — a script, a hook, CI — so the login shell it is: still
-        // an rc, and none of bash's job-control complaints.
-        assert_eq!(flags("/bin/zsh", false), vec!["-l", "-c"]);
+        assert_eq!(flags("/bin/zsh"), want);
+        assert_eq!(flags("/bin/bash"), want);
     }
 
-    /// The whole point of the login-shell fallback is the setup a terminal
-    /// would have run, and `-l` alone does not get it: zsh reads `~/.zshrc`
-    /// only when interactive, and bash skips `~/.bashrc` for a login shell. So
-    /// the prologue sources it — before the `cd`, so the `chpwd` hooks it
-    /// installs are there when the `cd` fires.
+    /// Whatever the shell will not read for itself, the prologue reads for it —
+    /// and it goes before the `cd`, so the `chpwd` hooks the rc installs are in
+    /// place when the `cd` fires.
     #[test]
     #[cfg(not(windows))]
-    fn a_login_shell_standing_in_for_a_terminal_reads_the_interactive_rc() {
-        let p = flags_for(OsStr::new("/bin/zsh"), true, false);
-        assert_eq!(p.source_rc.as_deref(), Some("${ZDOTDIR:-$HOME}/.zshrc"));
+    fn an_rc_the_shell_will_not_reach_is_sourced_by_the_prologue() {
+        // bash as a login shell is the case that needs it, so ask for one.
+        let p = flags_for(OsStr::new("/bin/bash"), false);
+        let mut p = Plan {
+            source_rc: Some("$HOME/.bashrc".into()),
+            ..p
+        };
+        p.interactive = true;
         let s = script(&p, "bundle install", None);
         let sourced = s
-            .find("[ -r \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"")
+            .find("[ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"")
             .unwrap_or_else(|| panic!("{s:?}"));
         assert!(
             sourced < s.find("\\cd --").unwrap(),
@@ -770,21 +764,12 @@ mod tests {
         );
         assert!(s.ends_with("bundle install"), "{s:?}");
 
-        assert_eq!(
-            flags_for(OsStr::new("/bin/bash"), true, false)
-                .source_rc
-                .as_deref(),
-            Some("$HOME/.bashrc")
-        );
-        // An interactive zsh reads it on its own, and sourcing it twice is not
-        // what a new terminal does.
-        assert_eq!(
-            flags_for(OsStr::new("/bin/zsh"), true, true).source_rc,
-            None
-        );
+        // An interactive zsh reads ~/.zshrc on its own, login or not, and
+        // sourcing it twice is not what a new terminal does.
+        assert_eq!(flags_for(OsStr::new("/bin/zsh"), true).source_rc, None);
         // fish reads config.fish either way, so there is nothing to make up for.
         assert_eq!(
-            flags_for(OsStr::new("/usr/local/bin/fish"), true, false).source_rc,
+            flags_for(OsStr::new("/usr/local/bin/fish"), true).source_rc,
             None
         );
     }
@@ -797,7 +782,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn an_interactive_bash_login_shell_still_has_to_be_handed_bashrc() {
-        let p = flags_for(OsStr::new("/bin/bash"), true, true);
+        let p = flags_for(OsStr::new("/bin/bash"), true);
         let is_login = p.args.iter().any(|a| a == "-l");
         assert_eq!(is_login, cfg!(target_os = "macos"));
         assert!(p.interactive, "there is a terminal, so it is interactive");
@@ -809,10 +794,7 @@ mod tests {
 
         // zsh is the contrast that makes the rule visible: it reads ~/.zshrc
         // whenever it is interactive, `-l` or not.
-        assert_eq!(
-            flags_for(OsStr::new("/bin/zsh"), true, true).source_rc,
-            None
-        );
+        assert_eq!(flags_for(OsStr::new("/bin/zsh"), true).source_rc, None);
     }
 
     /// `shell = "login"` is a choice — an interactive rc too slow or too chatty
@@ -820,13 +802,11 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn an_explicit_login_shell_is_the_login_rc_and_nothing_more() {
-        for terminal in [true, false] {
-            let p = flags_for(OsStr::new("/bin/zsh"), false, terminal);
-            assert_eq!(p.args, vec![OsString::from("-l"), OsString::from("-c")]);
-            assert!(!p.interactive);
-            assert_eq!(p.source_rc, None, "asked for login, got login");
-            assert!(!script(&p, "npm ci", None).contains(".zshrc"));
-        }
+        let p = flags_for(OsStr::new("/bin/zsh"), false);
+        assert_eq!(p.args, vec![OsString::from("-l"), OsString::from("-c")]);
+        assert!(!p.interactive);
+        assert_eq!(p.source_rc, None, "asked for login, got login");
+        assert!(!script(&p, "npm ci", None).contains(".zshrc"));
     }
 
     /// A `$SHELL` with no interactive setup to reproduce is not worth the
@@ -835,7 +815,7 @@ mod tests {
     #[cfg(not(windows))]
     fn an_unknown_login_shell_falls_back_to_plain_sh() {
         for sh in ["/usr/sbin/nologin", "/bin/dash", ""] {
-            let p = flags_for(OsStr::new(sh), true, true);
+            let p = flags_for(OsStr::new(sh), true);
             assert_eq!(p.program, OsString::from("sh"), "{sh}");
             assert!(!p.reads_rc && !p.interactive, "{sh}");
         }
