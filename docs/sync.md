@@ -107,20 +107,43 @@ the recipe" bug, and it is why a `run` step starts **your** shell:
   mise and the `.nvmrc` switchers get their chance to notice where they are.
 
 With no terminal in sight — a script, a git hook, CI, output on its way into a
-pipe — an interactive shell has nothing to be interactive on, so a login shell
-runs instead, and it sources your interactive rc itself (`~/.zshrc`, or
-`$ZDOTDIR/.zshrc`; `~/.bashrc` for bash) before it `cd`s in. A login shell alone
-would not: zsh reads `~/.zshrc` only when it is interactive, and bash skips
-`~/.bashrc` outright — and on macOS `/etc/zprofile` runs `path_helper`, which
-pushes the rbenv shims we inherited *behind* `/usr/bin`. That combination is how
-`bundle install` ends up as `/usr/bin/bundle` on the system Ruby, failing with
+pipe — the step gets a terminal of its own to be interactive on, so all of the
+above stays true. This matters more than it sounds: a shell will not simply take
+your word for it. `bash -i` on a pipe opens by printing `no job control in this
+shell`, `zsh -i` complains twice about `zle`, and the rc files ask the question
+directly and believe the answer — the stock Debian `~/.bashrc` opens with
+
+```sh
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+```
+
+and returns before a single line of rbenv, nvm or asdf setup has run. On a
+terminal there is nothing to argue about: the shell is interactive because it is.
+
+Two shells still will not reach the interactive rc even then, and for those the
+rc is sourced explicitly before the `cd`: bash started as a login shell, which
+is what macOS terminals do, reads `~/.bash_profile` and never `~/.bashrc`; and
+on Windows, where there is no terminal to hand out, a login shell stands in and
+zsh would read `~/.zshrc` only when interactive. Left alone, that is how
+`bundle install` ends up as `/usr/bin/bundle` on the system Ruby — on macOS
+`/etc/zprofile` runs `path_helper` and pushes the shims you inherited *behind*
+`/usr/bin` — failing with
 
 ```
 Could not find 'bundler' (2.5.6) required by your Gemfile.lock.
 ```
 
-while the same line typed in the same directory works. Whatever the rc prints on
-its way through is dropped, so it cannot get mixed into the step's own output.
+while the same line typed in the same directory works.
+
+Whatever your shell says on its way in and out — an rc that echoes something, a
+message of the day, a login shell's parting word from `~/.zlogout` — is kept out
+of the step's output, which is the command's and nothing else. Nothing reads
+from the step's stdin either: a command that stops to ask a question gets
+end-of-file at once and carries on with its default, rather than waiting out the
+timeout for an answer nobody is there to give.
 
 Per step, `shell` says otherwise:
 

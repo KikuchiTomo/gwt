@@ -10,3 +10,6 @@ anyhow.workspace = true
 thiserror.workspace = true
 toml_edit = "0.22"
 which.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

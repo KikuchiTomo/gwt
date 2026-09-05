@@ -1173,3 +1173,170 @@ fn an_activation_from_another_project_does_not_follow_the_command_in() {
         "another project's bundle followed the command into this worktree"
     );
 }
+
+/// The bug this whole mechanism exists for, in the form it actually reaches
+/// people: a toolchain that is only set up for an *interactive* shell.
+///
+/// Every rc file that wires up rbenv, nvm, asdf or mise sits behind a check
+/// like the one below — the stock Debian `~/.bashrc` opens with exactly it —
+/// and a shell with no terminal answers that check honestly and returns before
+/// setting anything up. `bundle` is then whatever `/usr/bin` has, the gems are
+/// the wrong ones, and the same line typed into the same directory works fine.
+///
+/// So there has to be a terminal, even with nobody watching: the step runs on a
+/// pty of its own. Nothing here says "pty" — the test asks the only question
+/// that matters, which is whether the toolchain arrived.
+#[test]
+#[cfg(unix)]
+fn an_interactive_only_rc_still_sets_up_the_toolchain_with_no_terminal_in_sight() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return;
+    }
+    let (_origin, layout) = fixture("run-interactive-rc");
+
+    let bin = layout.root.join("shims");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("fake-bundle");
+    std::fs::write(&shim, "#!/bin/sh\necho the-right-bundle\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(
+        &rc,
+        format!(
+            // Verbatim from the stock Debian ~/.bashrc, which is where this
+            // whole class of failure comes from.
+            "case $- in\n    *i*) ;;\n      *) return;;\nesac\nexport PATH=\"{}:$PATH\"\n",
+            bin.display()
+        ),
+    )
+    .unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            // Both halves of the answer: the toolchain the rc was supposed to
+            // set up, and the terminal that is the reason it ran at all. Only
+            // the `echo` is ever redirected — `[ -t 1 ]` inside a redirected
+            // group would be asking about the file, not about the terminal.
+            cmd: "fake-bundle > ran.txt 2>&1\nif [ -t 1 ]; then echo on-a-terminal >> ran.txt; else echo no-terminal >> ran.txt; fi"
+                .into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(30),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    let ran = std::fs::read_to_string(wt.join("ran.txt")).unwrap_or_default();
+    let lines: Vec<&str> = ran.lines().map(str::trim).collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("the-right-bundle"),
+        "the rc returned early, so the shell never believed it was interactive"
+    );
+    // `-i` on the command line is enough to fool the check above, and nothing
+    // else. A `$SHELL` that gets its flags from the platform cannot be handed
+    // one, and an rc that asks the terminal directly is not fooled at all — so
+    // the terminal has to be real.
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("on-a-terminal"),
+        "the step ran with no terminal, which is what makes an rc give up"
+    );
+}
+
+/// What the step printed, and not a word of what the shell printed around it.
+///
+/// An rc file is entitled to say things — which architecture it detected, an
+/// MOTD, a version manager announcing itself — and a login shell says goodbye
+/// on the way out. On a pty all of it lands in the one stream the step's output
+/// comes back on, so a log that should read `built ok` opens with somebody's
+/// shell greeting instead.
+#[test]
+#[cfg(unix)]
+fn the_shells_own_chatter_stays_out_of_the_steps_output() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return;
+    }
+    let (_origin, layout) = fixture("run-quiet");
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(&rc, "echo NOISE-FROM-THE-RC\necho NOISE-ON-STDERR >&2\n").unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            cmd: "echo the-only-line".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            timeout: std::time::Duration::from_secs(30),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut report = |ev: sync::Event| {
+        if let sync::Event::Output(line) = ev {
+            seen.push(line.to_string());
+        }
+    };
+    ops::add(&layout, "feature", "feat", &mut report).unwrap();
+    assert_eq!(
+        seen,
+        vec!["the-only-line".to_string()],
+        "the shell's startup and shutdown are not the step's output"
+    );
+}
+
+/// A step that asks a question with nobody there to answer must not sit on the
+/// timeout waiting for one. On a terminal it would wait; here end-of-file
+/// arrives at once and the command carries on with its default, which is what
+/// it would do in any script.
+#[test]
+#[cfg(unix)]
+fn a_command_that_reads_stdin_is_answered_with_end_of_file() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        return;
+    }
+    let (_origin, layout) = fixture("run-stdin");
+    let rc = layout.root.join("rc.bash");
+    std::fs::write(&rc, "\n").unwrap();
+
+    ops::sync_add(
+        &layout,
+        Step::Run(RunStep {
+            cmd: "read -r answer; echo \"[${answer-}]\" > ran.txt".into(),
+            when: vec![Phase::Create],
+            only_if: None,
+            // Short, so a wait for an answer that never comes fails the test
+            // rather than merely slowing it down.
+            timeout: std::time::Duration::from_secs(20),
+            dir: None,
+            shell: Shell::Named(format!("{} --rcfile {} -i", bash.display(), rc.display())),
+        }),
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let wt = ops::add(&layout, "feature", "feat", &mut sync::noop).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the step waited for an answer instead of reading end-of-file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("ran.txt"))
+            .unwrap_or_default()
+            .trim(),
+        "[]"
+    );
+}

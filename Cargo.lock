@@ -254,6 +254,7 @@ name = "gwt-core"
 version = "0.8.3"
 dependencies = [
  "anyhow",
+ "libc",
  "thiserror",
  "toml_edit",
  "which",

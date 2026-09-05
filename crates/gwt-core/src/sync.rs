@@ -1088,10 +1088,27 @@ fn apply_run(
         });
     }
 
-    // A command that is getting the terminal can have an interactive shell;
-    // one whose output we are about to capture line by line cannot.
+    // What this step's shell looks like when it has a terminal — which is the
+    // only way it reads the rc files that set up rbenv and friends.
+    let want = shell::plan(&s.shell, true);
     let on_screen = screen_is_free() && terminal_is_ours();
-    let mut cmd = shell_command(&s.shell, &s.cmd, &layout.root, &dir, on_screen);
+    // Not getting the real terminal, but needing one: open a terminal of its
+    // own. See [`crate::pty`] — this is what makes the interactive shell above
+    // available to a script, a git hook, CI, or the manager holding the screen.
+    let pty = match on_screen || !want.interactive {
+        true => None,
+        false => open_pty(),
+    };
+    let plan = match on_screen || pty.is_some() {
+        true => want,
+        // No terminal to be had, so fall back to the login shell that sources
+        // the interactive rc itself.
+        false => shell::plan(&s.shell, false),
+    };
+    // Only the pty path can tell the shell's own noise from the command's, so
+    // it is the only one that fences the output.
+    let fence = pty.as_ref().map(|_| shell::Fence::new());
+    let mut cmd = shell_command(&plan, &s.cmd, &layout.root, &dir, fence.as_ref());
     cmd.env("GWT_ROOT", &layout.root)
         .env("GWT_WORKTREE", worktree_dir)
         .env("GWT_WORKTREE_NAME", worktree_name(worktree_dir))
@@ -1102,6 +1119,10 @@ fn apply_run(
 
     if screen_is_free() {
         return run_on_screen(cmd, s);
+    }
+    #[cfg(unix)]
+    if let (Some(pty), Some(fence)) = (pty, fence) {
+        return run_on_pty(cmd, s, pty, fence, report);
     }
 
     let started = Instant::now();
@@ -1163,14 +1184,19 @@ fn apply_run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    if timed_out {
+    // Both pipes closing is not the shell exiting, so this wait is bounded by
+    // the same deadline as everything else.
+    let status = match timed_out {
+        false => wait_by(&mut child, deadline)?,
+        true => None,
+    };
+    let Some(status) = status else {
         let _ = child.kill();
         let _ = child.wait();
         return Ok(Outcome::Failed {
             detail: format!("timed out after {}", format_duration(s.timeout)),
         });
-    }
-    let status = child.wait()?;
+    };
     // Anything still queued when the pipes closed is part of the output.
     while let Ok(line) = rx.try_recv() {
         report(Event::Output(&line));
@@ -1181,9 +1207,176 @@ fn apply_run(
     })
 }
 
+/// Wait for a finished-looking child, but never longer than the step's own
+/// deadline.
+///
+/// Reading the last of a command's output is not the same as the shell being
+/// gone, and the gap between the two is not always short: the command's closing
+/// marker is printed before the shell has run its `exit`, and a login shell has
+/// a logout file to get through after that. A plain `wait()` there is
+/// open-ended — the one place a hung step could still outlast the timeout that
+/// exists to stop it.
+fn wait_by(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 enum Pipe {
     Out(std::process::ChildStdout),
     Err(std::process::ChildStderr),
+}
+
+/// Open a terminal for a step to run on, if this platform has one to give.
+#[cfg(unix)]
+fn open_pty() -> Option<crate::pty::Pty> {
+    crate::pty::open().ok()
+}
+
+#[cfg(not(unix))]
+fn open_pty() -> Option<()> {
+    None
+}
+
+/// Run the command on a pty: a real interactive shell, with its output read
+/// back rather than shown.
+///
+/// The shape is the pipe path's, with three differences that all come from the
+/// far end being a terminal instead of two pipes. There is one stream, not two,
+/// because that is what a terminal is. The bytes are terminal bytes, so
+/// [`crate::pty::Lines`] turns them back into lines. And the shell is a session
+/// leader — `setsid` is how it took the terminal — so a timeout can end the
+/// whole session rather than the shell that was waiting on it.
+#[cfg(unix)]
+fn run_on_pty(
+    mut cmd: Command,
+    s: &RunStep,
+    pty: crate::pty::Pty,
+    fence: shell::Fence,
+    report: Reporter,
+) -> Result<Outcome> {
+    use crate::pty;
+
+    if let Err(e) = pty.attach(&mut cmd) {
+        return Ok(Outcome::Failed {
+            detail: e.to_string(),
+        });
+    }
+    let started = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Outcome::Failed {
+                detail: e.to_string(),
+            })
+        }
+    };
+    let pid = child.id();
+    let (mut reader, control) = match pty.split() {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Outcome::Failed {
+                detail: e.to_string(),
+            });
+        }
+    };
+
+    // The read has to happen off this thread: a pty has no end-of-file until
+    // the last writer goes, and a command that has stopped making progress
+    // would otherwise take the timeout with it.
+    //
+    // And it has to keep reading to the very end, long after the closing marker
+    // has said there is nothing left worth reporting. A terminal drains before
+    // it is let go, so a shell exiting with nobody reading its pty stops
+    // half-way out — the child sits in the kernel's exit path forever, and the
+    // wait for it never returns. `Lines` throws away what arrives after the
+    // marker; the reading itself is what lets the shell finish.
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut lines = pty::Lines::new(fence);
+        let mut buf = [0u8; 8192];
+        let mut send = |l: &str| {
+            let _ = tx.send(l.to_string());
+        };
+        loop {
+            match pty::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => lines.feed(&buf[..n], &mut send),
+            }
+        }
+        lines.finish(&mut send);
+    });
+
+    // A shell that has exited is not the same as output that has all arrived:
+    // the reader is a thread behind, and the terminal can outlive the shell.
+    // So once the shell is gone we stop on the reader, or on a moment's silence.
+    const DRAIN: Duration = Duration::from_millis(250);
+    let deadline = started + s.timeout;
+    let mut timed_out = false;
+    let mut gone: Option<Instant> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(line) => {
+                report(Event::Output(&line));
+                // Still talking, so the silence has not started yet.
+                gone = gone.map(|_| Instant::now());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => match gone {
+                None => {
+                    if child.try_wait()?.is_some() {
+                        gone = Some(Instant::now());
+                    }
+                }
+                Some(at) if at.elapsed() >= DRAIN => break,
+                Some(_) => {}
+            },
+            // The reader saw the closing marker, or the terminal closed: either
+            // way there is nothing further to report.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // The reader can finish before the shell does, so the wait for it is still
+    // the step's timeout and not an open-ended one.
+    let status = match timed_out {
+        false => wait_by(&mut child, deadline)?,
+        true => None,
+    };
+    let Some(status) = status else {
+        // Everything the step started shares the shell's session, so this
+        // reaches the compiler it was blocked on and not just the shell.
+        control.kill_group(pid);
+        let _ = child.kill();
+        // Bounded, because this is the path for a step that was already not
+        // behaving; a reap that hangs here would replace one stuck step with a
+        // stuck gwt.
+        let _ = wait_by(&mut child, Instant::now() + DRAIN);
+        return Ok(Outcome::Failed {
+            detail: format!("timed out after {}", format_duration(s.timeout)),
+        });
+    };
+    while let Ok(line) = rx.try_recv() {
+        report(Event::Output(&line));
+    }
+    Ok(Outcome::Ran {
+        code: status.code().unwrap_or(-1),
+        secs: started.elapsed().as_secs(),
+    })
 }
 
 /// Run the command with the terminal itself, not a pair of pipes.
@@ -1258,13 +1451,18 @@ fn stderr_stdio() -> Stdio {
 /// set up rbenv and friends, the `cd` that lets a `chpwd` hook notice where we
 /// are, and the environment left pinned to whichever project gwt was launched
 /// from. [`crate::shell`] explains why each of those matters.
-fn shell_command(shell: &Shell, cmd: &str, root: &Path, dir: &Path, on_screen: bool) -> Command {
-    let plan = shell::plan(shell, on_screen);
+fn shell_command(
+    plan: &shell::Plan,
+    cmd: &str,
+    root: &Path,
+    dir: &Path,
+    fence: Option<&shell::Fence>,
+) -> Command {
     let mut c = Command::new(&plan.program);
-    c.args(&plan.args).arg(shell::script(&plan, cmd));
+    c.args(&plan.args).arg(shell::script(plan, cmd, fence));
     // The prologue `cd`s in from outside so the hook fires; without one, the
     // working directory is simply where we start.
-    c.current_dir(shell::start_dir(&plan, root, dir))
+    c.current_dir(shell::start_dir(plan, root, dir))
         .env(shell::STEP_DIR_VAR, dir)
         // A marker for an rc file that wants to keep its heavier startup for
         // the terminals a human is actually looking at.
@@ -1423,7 +1621,13 @@ timeout = "3m"
     /// The plain `sh -c` form, so these tests measure the waiting and not
     /// whatever shell the machine running them happens to prefer.
     fn posix_command(cmd: &str) -> Command {
-        shell_command(&Shell::Posix, cmd, Path::new("."), Path::new("."), false)
+        shell_command(
+            &shell::plan(&Shell::Posix, false),
+            cmd,
+            Path::new("."),
+            Path::new("."),
+            None,
+        )
     }
 
     fn run_step(cmd: &str, timeout: Duration) -> RunStep {

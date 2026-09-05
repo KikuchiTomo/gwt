@@ -6,6 +6,8 @@ pub mod git;
 pub mod i18n;
 pub mod layout;
 pub mod ops;
+#[cfg(unix)]
+pub mod pty;
 pub mod relativize;
 pub mod repo;
 pub mod shell;

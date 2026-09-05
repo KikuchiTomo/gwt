@@ -22,6 +22,7 @@ crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 which = "6"
 unicode-width = "0.1"
+libc = "0.2"
 
 gwt-core = { path = "crates/gwt-core" }
 gwt-tui  = { path = "crates/gwt-tui" }
